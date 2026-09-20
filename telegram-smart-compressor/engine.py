@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.2.0"
+ENGINE_BUNDLE_VERSION = "5.2.1"
 APP_NAME = "Smart Compressor"
 WORKSPACE_TITLE = "📦 Smart Compressor"
 BASE_DIR = Path("/content/drive/MyDrive/Telegram_Extreme_Compressor")
@@ -181,8 +181,6 @@ def normalize_state(state):
 
 
 def migrate_old_state(channel, state):
-    if any(state.get(key) for key in ("processed_source_ids", "output_ids", "command_ids")):
-        return state
     if not OLD_STATE_PATH.exists():
         return state
 
@@ -191,16 +189,30 @@ def migrate_old_state(channel, state):
     if not old_channel:
         return state
 
+    sources = set(int(x) for x in state.get("processed_source_ids", []))
+    outputs = set(int(x) for x in state.get("output_ids", []))
+
     if isinstance(old_channel, list):
-        state["processed_source_ids"] = [int(x) for x in old_channel]
+        sources.update(int(x) for x in old_channel)
     elif isinstance(old_channel, dict):
-        state["processed_source_ids"] = [int(x) for x in old_channel.get("sources", [])]
-        state["output_ids"] = [int(x) for x in old_channel.get("outputs", [])]
+        sources.update(int(x) for x in old_channel.get("sources", []))
+        outputs.update(int(x) for x in old_channel.get("outputs", []))
 
-    save_json(STATE_PATH, state)
-    print("✅ تم نقل سجل الملفات القديمة تلقائيًا بدون إعادة ضغطها.")
+    before = (
+        len(state.get("processed_source_ids", [])),
+        len(state.get("output_ids", [])),
+    )
+    state["processed_source_ids"] = sorted(sources)
+    state["output_ids"] = sorted(outputs)
+    after = (
+        len(state["processed_source_ids"]),
+        len(state["output_ids"]),
+    )
+
+    if after != before:
+        save_json(STATE_PATH, state)
+        print("✅ تم دمج سجل الملفات القديمة تلقائيًا بدون إعادة ضغطها.")
     return state
-
 
 def ffprobe(path: Path) -> MediaInfo:
     proc = run_quiet(
@@ -413,32 +425,41 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
 
     if profile == "VIDEO_FAST":
         vf = video_filter(info, 1280, 720, 18)
-        if nvenc:
-            codec = [
-                "-c:v", "h264_nvenc", "-preset", "p3",
-                "-rc", "vbr", "-cq", "31", "-b:v", "0",
-            ]
-        else:
-            codec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "31"]
+        gpu_codec = [
+            "-c:v", "h264_nvenc", "-preset", "p3",
+            "-rc", "vbr", "-cq", "31", "-b:v", "0",
+        ]
+        cpu_codec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "31"]
     else:
         vf = video_filter(info, 1280, 720, 15)
-        if nvenc:
-            codec = [
-                "-c:v", "h264_nvenc", "-preset", "p4",
-                "-rc", "vbr", "-cq", "30", "-b:v", "0",
-            ]
-        else:
-            codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "29"]
+        gpu_codec = [
+            "-c:v", "h264_nvenc", "-preset", "p4",
+            "-rc", "vbr", "-cq", "30", "-b:v", "0",
+        ]
+        cpu_codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "29"]
 
-    cmd = [
-        "ffmpeg", "-y", "-i", str(src), "-vf", vf,
-        *codec,
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "48k", "-ac", "1",
-        "-movflags", "+faststart",
-        str(dst),
-    ]
-    run_ffmpeg(cmd, info.duration, "ضغط الفيديو")
+    def build_cmd(codec):
+        return [
+            "ffmpeg", "-y", "-i", str(src), "-vf", vf,
+            *codec,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "48k", "-ac", "1",
+            "-movflags", "+faststart",
+            str(dst),
+        ]
+
+    if nvenc:
+        try:
+            run_ffmpeg(build_cmd(gpu_codec), info.duration, "ضغط الفيديو")
+            return
+        except AppError:
+            print("⚠️ تعذر استخدام كارت الشاشة لهذا الملف — سيتم التحويل إلى CPU تلقائيًا.")
+            try:
+                dst.unlink()
+            except FileNotFoundError:
+                pass
+
+    run_ffmpeg(build_cmd(cpu_codec), info.duration, "ضغط الفيديو")
 
 
 def parse_rerun_command(text: str):
@@ -548,8 +569,16 @@ async def ensure_workspace(client, config):
 
     if channel is None:
         async for dialog in client.iter_dialogs():
-            if (dialog.name or "").strip() == WORKSPACE_TITLE:
-                channel = dialog.entity
+            if (dialog.name or "").strip() != WORKSPACE_TITLE:
+                continue
+            entity = dialog.entity
+            rights = getattr(entity, "admin_rights", None)
+            can_post = bool(
+                getattr(entity, "creator", False)
+                or (rights and getattr(rights, "post_messages", False))
+            )
+            if can_post:
+                channel = entity
                 break
 
     if channel is None:
@@ -559,6 +588,7 @@ async def ensure_workspace(client, config):
             functions.channels.CreateChannelRequest(
                 title=WORKSPACE_TITLE,
                 about="مساحة خاصة لضغط ملفات الصوت والفيديو عبر Google Colab.",
+                broadcast=True,
                 megagroup=False,
             )
         )
@@ -624,6 +654,17 @@ async def collect_queue(client, channel, state):
     by_id = {m.id: m for m in messages}
     jobs = []
     rerun_source_ids = set()
+
+    # Self-heal state if Colab stopped after Telegram accepted an output
+    # but before the local state file was saved.
+    for msg in messages:
+        if message_media_kind(msg) and looks_like_generated_output(msg):
+            outputs.add(int(msg.id))
+            if getattr(msg, "reply_to_msg_id", None):
+                processed.add(int(msg.reply_to_msg_id))
+
+    state["processed_source_ids"] = sorted(processed)
+    state["output_ids"] = sorted(outputs)
 
     for msg in reversed(messages):
         if msg.id in commands_done or not getattr(msg, "message", None) or not getattr(msg, "reply_to_msg_id", None):
@@ -800,26 +841,43 @@ async def process_job(client, channel, state, job, nvenc: bool, index: int, tota
         print(f"✅ تم. التوفير: {human_size(saved)}")
         return {
             "ok": True,
+            "skipped": False,
             "original": src.stat().st_size,
             "final": dst.stat().st_size,
         }
 
     except AppError as exc:
+        skipped = exc.code == "E430"
+
+        if skipped and not job["rerun"] and msg.id not in state["processed_source_ids"]:
+            state["processed_source_ids"].append(int(msg.id))
         if command_msg and command_msg.id not in state["command_ids"]:
             state["command_ids"].append(int(command_msg.id))
-            save_json(STATE_PATH, state)
+
+        save_json(STATE_PATH, state)
+
         try:
             await client.send_message(
                 channel,
-                f"⚠️ {exc.code}\n{exc.message}",
+                f"ℹ️ {exc.code}\n{exc.message}" if skipped else f"⚠️ {exc.code}\n{exc.message}",
                 reply_to=msg.id,
             )
         except Exception:
             pass
-        print(f"⚠️ {exc.code} — {exc.message}")
+
+        print(
+            f"ℹ️ {exc.code} — {exc.message}"
+            if skipped
+            else f"⚠️ {exc.code} — {exc.message}"
+        )
         if exc.details:
             ERROR_LOG.write_text(exc.details, encoding="utf-8")
-        return {"ok": False, "original": 0, "final": 0}
+        return {
+            "ok": False,
+            "skipped": skipped,
+            "original": 0,
+            "final": 0,
+        }
 
     except Exception as exc:
         details = traceback.format_exc()
@@ -833,7 +891,7 @@ async def process_job(client, channel, state, job, nvenc: bool, index: int, tota
         except Exception:
             pass
         print("❌ E900 — حصل خطأ غير متوقع. تم حفظ التفاصيل في Google Drive.")
-        return {"ok": False, "original": 0, "final": 0}
+        return {"ok": False, "skipped": False, "original": 0, "final": 0}
 
     finally:
         for path in (src,):
@@ -860,8 +918,16 @@ async def app():
     persistent_session = BASE_DIR / "telegram_user.session"
     local_session_base = "/content/telegram_user"
     local_session_file = Path(local_session_base + ".session")
-    if persistent_session.exists() and not local_session_file.exists():
+    local_journal_file = Path(local_session_base + ".session-journal")
+
+    if persistent_session.exists():
         shutil.copy2(persistent_session, local_session_file)
+    else:
+        for stale in (local_session_file, local_journal_file):
+            try:
+                stale.unlink()
+            except FileNotFoundError:
+                pass
 
     print()
     print("🔐 تسجيل الدخول إلى Telegram...")
@@ -927,7 +993,8 @@ async def app():
             results.append(result)
 
         ok = sum(1 for r in results if r["ok"])
-        failed = len(results) - ok
+        skipped = sum(1 for r in results if r.get("skipped"))
+        failed = len(results) - ok - skipped
         original = sum(r["original"] for r in results)
         final = sum(r["final"] for r in results)
         saved_pct = ((original - final) / original * 100) if original else 0
@@ -937,6 +1004,7 @@ async def app():
         summary = (
             "✅ انتهت الدفعة\n\n"
             f"تم بنجاح: {ok}\n"
+            f"تم تخطيه: {skipped}\n"
             f"فشل: {failed}\n"
             f"الحجم قبل: {human_size(original)}\n"
             f"الحجم بعد: {human_size(final)}\n"
