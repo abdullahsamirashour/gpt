@@ -1,15 +1,15 @@
 {
-  "version": "5.1.0-beta",
+  "version": "5.1.0",
   "engine": "5.1.0-beta",
-  "channel": "beta",
+  "channel": "stable",
   "updated": "2026-09-20",
   "notes": [
-    "Removed the broken gzip/base64 bundle and replaced it with readable Python.",
-    "Arabic RTL Colab UI rewritten for cleaner reading and no mixed-direction labels.",
-    "First run creates and remembers a private Smart Compressor Telegram channel.",
-    "Normal runs process all new media automatically; LAST_N is gone.",
-    "Rerun replies supported: 🔁, 🔁 أصغر, 🔁 صوت, 🔁 80.",
-    "Friendly error codes and Drive error log instead of long Python tracebacks.",
-    "Batch summary is posted back to Telegram."
+    "أزيل نظام gzip/base64 الذي تسبب في BadGzipFile، والمحرك الآن Python مقروء مباشرة.",
+    "واجهة Colab عربية RTL أبسط ومنظمة.",
+    "إنشاء قناة Smart Compressor الخاصة بالمستخدم تلقائيًا وحفظها للاستخدام التالي.",
+    "معالجة كل الملفات الجديدة تلقائيًا بدون LAST_N.",
+    "إعادة المعالجة عبر الردود: 🔁، 🔁 أصغر، 🔁 صوت، 🔁 80.",
+    "أخطاء مختصرة بأكواد واضحة بدل traceback طويل.",
+    "ملخص الدفعة يُرسل إلى Telegram."
   ]
 }
