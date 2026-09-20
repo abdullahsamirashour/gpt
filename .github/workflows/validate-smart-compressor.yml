@@ -2,7 +2,7 @@ name: Validate Smart Compressor
 
 on:
   push:
-    branches: [beta]
+    branches: [beta, main]
     paths:
       - 'telegram-smart-compressor/**'
       - '.github/workflows/validate-smart-compressor.yml'
@@ -13,27 +13,200 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+
+      - name: Install runtime test dependencies
+        run: |
+          python -m pip install -q telethon==1.45.0 cryptg nest_asyncio
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+
       - name: Compile engine
         run: python -m py_compile telegram-smart-compressor/engine.py
-      - name: Validate notebooks
+
+      - name: Validate Colab notebooks
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
-          for path in [
-              Path("telegram-smart-compressor/launcher.ipynb"),
+
+          candidates = [
               Path("telegram-smart-compressor/launcher-beta.ipynb"),
-          ]:
+              Path("telegram-smart-compressor/Smart_Compressor.ipynb"),
+              Path("telegram-smart-compressor/launcher.ipynb"),
+          ]
+
+          found = 0
+          for path in candidates:
               if not path.exists():
                   continue
-              nb=json.loads(path.read_text(encoding="utf-8"))
+
+              found += 1
+              nb = json.loads(path.read_text(encoding="utf-8"))
               assert nb["nbformat"] == 4
-              for cell in nb["cells"]:
-                  if cell.get("cell_type") == "code":
-                      src="".join(cell.get("source", []))
-                      compile(src, str(path), "exec")
-              print("OK", path)
+              code_cells = [c for c in nb["cells"] if c.get("cell_type") == "code"]
+              markdown_cells = [c for c in nb["cells"] if c.get("cell_type") == "markdown"]
+              assert code_cells and markdown_cells
+
+              code_cell = code_cells[0]
+              code = "".join(code_cell.get("source", []))
+              md = "".join(markdown_cells[0].get("source", []))
+
+              assert code_cell.get("metadata", {}).get("cellView") == "form"
+              assert "#@title" in code
+              assert code.count("#@param") >= 2
+              assert "\\n" not in md
+              assert "re.search(r'ENGINE_BUNDLE_VERSION" not in code
+              compile(code, str(path), "exec")
+              print("OK notebook:", path)
+
+          assert found >= 1
+          PY
+
+      - name: Engine logic and FFmpeg smoke tests
+        env:
+          TSC_TEST_MODE: '1'
+        run: |
+          python - <<'PY'
+          import asyncio
+          import importlib.util
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          path = Path("telegram-smart-compressor/engine.py")
+          spec = importlib.util.spec_from_file_location("tsc_engine", path)
+          engine = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = engine
+          spec.loader.exec_module(engine)
+
+          assert engine.ENGINE_BUNDLE_VERSION.startswith("5.2.")
+
+          assert engine.parse_rerun_command("🔁") == {"profile": None, "target_mb": None}
+          assert engine.parse_rerun_command("🔁 أصغر")["profile"] == "VIDEO_SMALLEST"
+          assert engine.parse_rerun_command("🔁 صوت")["profile"] == "AUDIO_TINY"
+          assert engine.parse_rerun_command("🔁 سريع")["profile"] == "VIDEO_FAST"
+          assert engine.parse_rerun_command("🔁 80") == {"profile": "VIDEO_TARGET_SIZE", "target_mb": 80}
+
+          class Obj:
+              def __init__(self, **kwargs):
+                  self.__dict__.update(kwargs)
+
+          class Msg:
+              def __init__(self, mid, kind=None, text="", reply=None):
+                  self.id = mid
+                  self.message = text
+                  self.reply_to_msg_id = reply
+                  self.media = object() if kind else None
+                  if kind:
+                      mime = "video/mp4" if kind == "video" else "audio/mpeg"
+                      self.file = Obj(mime_type=mime, name=f"f{mid}", ext=".mp4" if kind == "video" else ".mp3")
+                      self.video = object() if kind == "video" else None
+                      self.audio = object() if kind == "audio" else None
+                      self.voice = None
+                  else:
+                      self.file = None
+                      self.video = None
+                      self.audio = None
+                      self.voice = None
+
+          class FakeClient:
+              def __init__(self, messages):
+                  self.messages = sorted(messages, key=lambda m: m.id, reverse=True)
+                  self.by_id = {m.id: m for m in messages}
+
+              async def get_messages(self, _channel, limit=None, ids=None):
+                  if ids is not None:
+                      return self.by_id.get(ids)
+                  return self.messages[:limit] if limit else self.messages
+
+          async def queue_test():
+              messages = [
+                  Msg(1, "video"),
+                  Msg(2, "video", text="✅ v1 • فيديو متوازن"),
+                  Msg(3, text="🔁 أصغر", reply=2),
+                  Msg(4, "audio"),
+                  Msg(5, text="🔁", reply=4),
+                  Msg(6, "video", text="✅ v2 • فيديو متوازن"),
+                  Msg(7, "video"),
+              ]
+              state = {
+                  "processed_source_ids": [1],
+                  "output_ids": [2],
+                  "command_ids": [],
+                  "lineage": {},
+              }
+              jobs = await engine.collect_queue(FakeClient(messages), object(), state)
+              compact = [(j["source"].id, j["rerun"], j["profile"]) for j in jobs]
+              assert compact == [
+                  (2, True, "VIDEO_SMALLEST"),
+                  (4, True, None),
+                  (7, False, None),
+              ], compact
+
+          asyncio.run(queue_test())
+
+          # Telethon API objects used by the engine still match the pinned version.
+          from telethon import functions, types
+          functions.channels.CreateChannelRequest(title="x", about="x", megagroup=False)
+          functions.messages.ToggleDialogPinRequest(
+              pinned=True,
+              peer=types.InputDialogPeer(peer=types.InputPeerSelf()),
+          )
+          types.DocumentAttributeAudio(duration=1, voice=False, title="x", performer="")
+          types.DocumentAttributeVideo(duration=1, w=320, h=240, supports_streaming=True)
+
+          # Critical Colab case: run() must work even when an event loop is already running.
+          ran = {"value": False}
+          async def dummy_app():
+              ran["value"] = True
+          engine.app = dummy_app
+          engine.ensure_dependencies = lambda: None
+
+          async def outer():
+              engine.run()
+              assert ran["value"] is True
+          asyncio.run(outer())
+
+          # Actual FFmpeg encode smoke tests.
+          with tempfile.TemporaryDirectory() as td:
+              td = Path(td)
+              src = td / "source.mp4"
+              subprocess.run(
+                  [
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24",
+                      "-f", "lavfi", "-i", "sine=frequency=700:sample_rate=44100",
+                      "-t", "2",
+                      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+                      "-c:a", "aac", "-b:a", "96k",
+                      str(src),
+                  ],
+                  check=True,
+              )
+
+              info = engine.ffprobe(src)
+              assert info.has_video and info.has_audio and info.duration > 1.5
+
+              audio_out = td / "audio.ogg"
+              engine.encode_audio(src, audio_out, info)
+              assert audio_out.exists() and audio_out.stat().st_size > 0
+              audio_info = engine.ffprobe(audio_out)
+              assert audio_info.has_audio and not audio_info.has_video
+
+              video_out = td / "video.mp4"
+              engine.encode_video(src, video_out, info, "VIDEO_BALANCED", None, False)
+              assert video_out.exists() and video_out.stat().st_size > 0
+              video_info = engine.ffprobe(video_out)
+              assert video_info.has_video
+              assert video_info.width <= 640 and video_info.height <= 360
+
+          print("ALL SMART COMPRESSOR TESTS PASSED")
           PY
