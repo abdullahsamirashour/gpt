@@ -75,6 +75,7 @@ jobs:
           python - <<'PY'
           import asyncio
           import importlib.util
+          import json
           import os
           import subprocess
           import sys
@@ -136,6 +137,8 @@ jobs:
                   Msg(5, text="🔁", reply=4),
                   Msg(6, "video", text="✅ v2 • فيديو متوازن"),
                   Msg(7, "video"),
+                  Msg(8, "video"),
+                  Msg(9, "video", text="✅ v1 • فيديو متوازن", reply=8),
               ]
               state = {
                   "processed_source_ids": [1],
@@ -150,12 +153,35 @@ jobs:
                   (4, True, None),
                   (7, False, None),
               ], compact
+              assert 8 in state["processed_source_ids"]
+              assert 9 in state["output_ids"]
 
           asyncio.run(queue_test())
 
+          # v4 state must merge into an existing v5 state instead of replacing it.
+          with tempfile.TemporaryDirectory() as td:
+              td = Path(td)
+              engine.OLD_STATE_PATH = td / "processed_v4.json"
+              engine.STATE_PATH = td / "state_v5.json"
+              engine.OLD_STATE_PATH.write_text(
+                  json.dumps({"123": {"sources": [1, 2], "outputs": [9]}}),
+                  encoding="utf-8",
+              )
+              state = {
+                  "processed_source_ids": [3],
+                  "output_ids": [10],
+                  "command_ids": [20],
+                  "lineage": {},
+              }
+              migrated = engine.migrate_old_state(Obj(id=123), state)
+              assert migrated["processed_source_ids"] == [1, 2, 3]
+              assert migrated["output_ids"] == [9, 10]
+              assert migrated["command_ids"] == [20]
+
           # Telethon API objects used by the engine still match the pinned version.
           from telethon import functions, types
-          functions.channels.CreateChannelRequest(title="x", about="x", megagroup=False)
+          req = functions.channels.CreateChannelRequest(title="x", about="x", broadcast=True, megagroup=False)
+          assert req.broadcast is True
           functions.messages.ToggleDialogPinRequest(
               pinned=True,
               peer=types.InputDialogPeer(peer=types.InputPeerSelf()),
@@ -174,6 +200,37 @@ jobs:
               engine.run()
               assert ran["value"] is True
           asyncio.run(outer())
+
+          # NVENC failures must fall back to CPU instead of failing the file.
+          original_run_ffmpeg = engine.run_ffmpeg
+          codec_calls = []
+          def fake_run_ffmpeg(cmd, duration, label):
+              codec_calls.append(cmd)
+              if "h264_nvenc" in cmd:
+                  raise engine.AppError("E420", "synthetic NVENC failure")
+          engine.run_ffmpeg = fake_run_ffmpeg
+          try:
+              engine.encode_video(
+                  Path("/tmp/fake-input.mp4"),
+                  Path("/tmp/fake-output.mp4"),
+                  engine.MediaInfo(
+                      duration=2.0,
+                      size=1000,
+                      width=640,
+                      height=360,
+                      fps=24.0,
+                      has_video=True,
+                      has_audio=True,
+                  ),
+                  "VIDEO_BALANCED",
+                  None,
+                  True,
+              )
+              assert len(codec_calls) == 2
+              assert "h264_nvenc" in codec_calls[0]
+              assert "libx264" in codec_calls[1]
+          finally:
+              engine.run_ffmpeg = original_run_ffmpeg
 
           # Actual FFmpeg encode smoke tests.
           with tempfile.TemporaryDirectory() as td:
