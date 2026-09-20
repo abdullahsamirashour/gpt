@@ -1,5 +1,9 @@
 # Telegram Smart Compressor
 
+[Open Stable in Colab](https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/launcher.ipynb)
+
+[Open Beta in Colab](https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/beta/telegram-smart-compressor/launcher-beta.ipynb)
+
 One-click Google Colab workflow for compressing Telegram audio and educational videos.
 
 ## UX
