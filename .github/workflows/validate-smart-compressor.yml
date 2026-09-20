@@ -1,0 +1,39 @@
+name: Validate Smart Compressor
+
+on:
+  push:
+    branches: [beta]
+    paths:
+      - 'telegram-smart-compressor/**'
+      - '.github/workflows/validate-smart-compressor.yml'
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Compile engine
+        run: python -m py_compile telegram-smart-compressor/engine.py
+      - name: Validate notebooks
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          for path in [
+              Path("telegram-smart-compressor/launcher.ipynb"),
+              Path("telegram-smart-compressor/launcher-beta.ipynb"),
+          ]:
+              if not path.exists():
+                  continue
+              nb=json.loads(path.read_text(encoding="utf-8"))
+              assert nb["nbformat"] == 4
+              for cell in nb["cells"]:
+                  if cell.get("cell_type") == "code":
+                      src="".join(cell.get("source", []))
+                      compile(src, str(path), "exec")
+              print("OK", path)
+          PY
