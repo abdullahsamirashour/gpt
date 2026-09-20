@@ -253,7 +253,7 @@ def detect_nvenc() -> bool:
 
 
 def run_ffmpeg(cmd, duration: float, label: str):
-    full = [*cmd[:1], "-hide_banner", "-loglevel", "error", *cmd[1:], "-progress", "pipe:1", "-nostats"]
+    full = [cmd[0], "-hide_banner", "-loglevel", "error", *cmd[1:-1], "-progress", "pipe:1", "-nostats", cmd[-1]]
     proc = subprocess.Popen(
         full,
         stdout=subprocess.PIPE,
