@@ -20,16 +20,17 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.1.0"
+ENGINE_BUNDLE_VERSION = "5.2.0"
 APP_NAME = "Smart Compressor"
 WORKSPACE_TITLE = "📦 Smart Compressor"
 BASE_DIR = Path("/content/drive/MyDrive/Telegram_Extreme_Compressor")
 TMP_DIR = Path("/content/telegram_smart_compressor_tmp")
 CONFIG_PATH = BASE_DIR / "config.json"
 STATE_PATH = BASE_DIR / "state_v5.json"
+OLD_STATE_PATH = BASE_DIR / "processed_v4.json"
 ERROR_LOG = BASE_DIR / "last_error.log"
 SESSION_PATH = BASE_DIR / "telegram_user"
-SCAN_LIMIT = 1000
+SCAN_LIMIT = 3000
 
 PROFILE_FROM_UI = {
     "تلقائي — مناسب لمعظم الاستخدامات": "SMART_AUTO",
@@ -76,17 +77,27 @@ def run_quiet(args, check=True):
 
 
 def ensure_dependencies():
-    packages = ["telethon>=1.36,<2", "cryptg", "nest_asyncio"]
+    packages = ["telethon==1.45.0", "cryptg", "nest_asyncio"]
+    needs_install = False
     try:
         import telethon  # noqa
         import cryptg  # noqa
         import nest_asyncio  # noqa
+        if getattr(telethon, "__version__", "") != "1.45.0":
+            needs_install = True
     except Exception:
+        needs_install = True
+
+    if needs_install:
         print("🔧 تجهيز الأدوات المطلوبة لأول مرة...")
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", *packages],
+            [sys.executable, "-m", "pip", "install", "-q", "--upgrade", *packages],
             check=True,
         )
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        subprocess.run(["apt-get", "-qq", "update"], check=True)
+        subprocess.run(["apt-get", "-qq", "install", "-y", "ffmpeg"], check=True)
 
 
 def mount_drive():
@@ -167,6 +178,28 @@ def normalize_state(state):
     if not isinstance(base.get("lineage"), dict):
         base["lineage"] = {}
     return base
+
+
+def migrate_old_state(channel, state):
+    if any(state.get(key) for key in ("processed_source_ids", "output_ids", "command_ids")):
+        return state
+    if not OLD_STATE_PATH.exists():
+        return state
+
+    old = load_json(OLD_STATE_PATH, {})
+    old_channel = old.get(str(getattr(channel, "id", "")))
+    if not old_channel:
+        return state
+
+    if isinstance(old_channel, list):
+        state["processed_source_ids"] = [int(x) for x in old_channel]
+    elif isinstance(old_channel, dict):
+        state["processed_source_ids"] = [int(x) for x in old_channel.get("sources", [])]
+        state["output_ids"] = [int(x) for x in old_channel.get("outputs", [])]
+
+    save_json(STATE_PATH, state)
+    print("✅ تم نقل سجل الملفات القديمة تلقائيًا بدون إعادة ضغطها.")
+    return state
 
 
 def ffprobe(path: Path) -> MediaInfo:
@@ -253,7 +286,7 @@ def detect_nvenc() -> bool:
 
 
 def run_ffmpeg(cmd, duration: float, label: str):
-    full = [cmd[0], "-hide_banner", "-loglevel", "error", *cmd[1:-1], "-progress", "pipe:1", "-nostats", cmd[-1]]
+    full = [cmd[0], "-y", "-nostdin", "-hide_banner", "-loglevel", "error", *cmd[1:-1], "-progress", "pipe:1", "-nostats", cmd[-1]]
     proc = subprocess.Popen(
         full,
         stdout=subprocess.PIPE,
@@ -341,7 +374,7 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
         target_mb = int(target_mb or 100)
         if info.duration <= 0:
             raise AppError("E413", "تعذر معرفة مدة الفيديو لحساب الحجم المطلوب.")
-        audio_k = 40
+        audio_k = 40 if info.has_audio else 0
         total_kbps = (target_mb * 1024 * 1024 * 8 / info.duration) / 1000
         video_k = int(total_kbps * 0.96 - audio_k)
         if video_k < 80:
@@ -412,6 +445,7 @@ def parse_rerun_command(text: str):
     text = (text or "").strip()
     if not text.startswith("🔁"):
         return None
+
     rest = text[1:].strip()
     if not rest:
         return {"profile": None, "target_mb": None}
@@ -419,19 +453,37 @@ def parse_rerun_command(text: str):
         return {"profile": "AUDIO_TINY", "target_mb": None}
     if "أصغر" in rest or "اصغر" in rest:
         return {"profile": "VIDEO_SMALLEST", "target_mb": None}
+    if "سريع" in rest:
+        return {"profile": "VIDEO_FAST", "target_mb": None}
+    if "متوازن" in rest:
+        return {"profile": "VIDEO_BALANCED", "target_mb": None}
+
     match = re.search(r"(\d{1,5})", rest)
     if match:
         return {"profile": "VIDEO_TARGET_SIZE", "target_mb": int(match.group(1))}
     return {"profile": None, "target_mb": None}
 
 
+def message_media_kind(msg):
+    file_obj = getattr(msg, "file", None)
+    mime = (getattr(file_obj, "mime_type", None) or "").lower()
+    if getattr(msg, "video", None) or mime.startswith("video/"):
+        return "video"
+    if getattr(msg, "voice", None) or getattr(msg, "audio", None) or mime.startswith("audio/"):
+        return "audio"
+    return None
+
+
+def looks_like_generated_output(msg):
+    text = (getattr(msg, "message", "") or "").strip()
+    return bool(re.match(r"^✅\s*v\d+\s*•", text))
+
+
 def resolve_profile(msg, explicit=None):
     if explicit:
         return explicit
     if PROFILE == "SMART_AUTO":
-        if getattr(msg, "video", None):
-            return "VIDEO_BALANCED"
-        return "AUDIO_TINY"
+        return "VIDEO_BALANCED" if message_media_kind(msg) == "video" else "AUDIO_TINY"
     return PROFILE
 
 
@@ -475,46 +527,78 @@ def make_progress(label):
 async def ensure_workspace(client, config):
     from telethon import functions, types
 
+    channel = None
+    created = False
+
     saved_id = config.get("workspace_id")
     if saved_id:
         try:
-            entity = await client.get_entity(types.PeerChannel(int(saved_id)))
-            return entity, False
+            channel = await client.get_entity(types.PeerChannel(int(saved_id)))
         except Exception:
             config.pop("workspace_id", None)
-            save_json(CONFIG_PATH, config)
 
-    print()
-    print("📦 إنشاء مساحة العمل الخاصة بك...")
-    result = await client(
-        functions.channels.CreateChannelRequest(
-            title=WORKSPACE_TITLE,
-            about="مساحة خاصة لضغط ملفات الصوت والفيديو عبر Google Colab.",
-            megagroup=False,
+    if channel is None:
+        old_ref = str(config.get("channel", "") or "").strip()
+        if old_ref:
+            try:
+                ref = int(old_ref) if re.fullmatch(r"-?\d+", old_ref) else old_ref
+                channel = await client.get_entity(ref)
+            except Exception:
+                channel = None
+
+    if channel is None:
+        async for dialog in client.iter_dialogs():
+            if (dialog.name or "").strip() == WORKSPACE_TITLE:
+                channel = dialog.entity
+                break
+
+    if channel is None:
+        print()
+        print("📦 إنشاء مساحة العمل الخاصة بك...")
+        result = await client(
+            functions.channels.CreateChannelRequest(
+                title=WORKSPACE_TITLE,
+                about="مساحة خاصة لضغط ملفات الصوت والفيديو عبر Google Colab.",
+                megagroup=False,
+            )
         )
-    )
-    channel = result.chats[0]
+        channel = result.chats[0]
+        created = True
+
     config["workspace_id"] = int(channel.id)
     save_json(CONFIG_PATH, config)
 
-    instructions = (
-        "📦 Smart Compressor\n\n"
-        "الاستخدام العادي:\n"
-        "1) ابعت أي ملف صوت أو فيديو هنا.\n"
-        "2) افتح ملف Colab واضغط تشغيل.\n"
-        "3) النتيجة هتظهر هنا تلقائيًا.\n\n"
-        "إعادة معالجة نتيجة قديمة:\n"
-        "🔁  = نفس الإعداد الحالي\n"
-        "🔁 أصغر  = ضغط فيديو أقوى\n"
-        "🔁 صوت  = استخراج صوت صغير جدًا\n"
-        "🔁 80  = محاولة الوصول إلى 80 MB تقريبًا\n\n"
-        "ملاحظة: النتائج التي يصنعها البرنامج لا يعيد ضغطها تلقائيًا."
-    )
-    msg = await client.send_message(channel, instructions)
+    instruction = None
+    instruction_id = config.get("workspace_instruction_id")
+    if instruction_id:
+        try:
+            instruction = await client.get_messages(channel, ids=int(instruction_id))
+        except Exception:
+            instruction = None
+
+    if not instruction:
+        instructions = (
+            "📦 Smart Compressor\n\n"
+            "الاستخدام العادي:\n"
+            "1) ابعت أي ملف صوت أو فيديو هنا.\n"
+            "2) افتح ملف Colab واضغط تشغيل.\n"
+            "3) النتيجة هتظهر هنا تلقائيًا.\n\n"
+            "إعادة معالجة نتيجة قديمة:\n"
+            "🔁  = نفس الإعداد الحالي\n"
+            "🔁 أصغر  = ضغط فيديو أقوى\n"
+            "🔁 صوت  = استخراج صوت صغير جدًا\n"
+            "🔁 80  = محاولة الوصول إلى 80 MB تقريبًا\n\n"
+            "النتائج التي يصنعها البرنامج لا يعيد ضغطها تلقائيًا."
+        )
+        instruction = await client.send_message(channel, instructions)
+        config["workspace_instruction_id"] = int(instruction.id)
+        save_json(CONFIG_PATH, config)
+
     try:
-        await client.pin_message(channel, msg.id, notify=False)
+        await client.pin_message(channel, instruction, notify=False)
     except Exception:
         pass
+
     try:
         input_peer = await client.get_input_entity(channel)
         await client(
@@ -526,74 +610,82 @@ async def ensure_workspace(client, config):
     except Exception:
         pass
 
-    print("✅ تم إنشاء قناة «📦 Smart Compressor» وحفظها للاستخدام القادم.")
-    return channel, True
+    if created:
+        print("✅ تم إنشاء قناة «📦 Smart Compressor» وحفظها للاستخدام القادم.")
+    return channel, created
 
 
 async def collect_queue(client, channel, state):
-    processed = set(state["processed_source_ids"])
-    outputs = set(state["output_ids"])
-    commands_done = set(state["command_ids"])
+    processed = set(int(x) for x in state["processed_source_ids"])
+    outputs = set(int(x) for x in state["output_ids"])
+    commands_done = set(int(x) for x in state["command_ids"])
 
     messages = await client.get_messages(channel, limit=SCAN_LIMIT)
     by_id = {m.id: m for m in messages}
     jobs = []
-    queued_keys = set()
+    rerun_source_ids = set()
 
     for msg in reversed(messages):
-        if msg.id in commands_done or not msg.message or not msg.reply_to_msg_id:
+        if msg.id in commands_done or not getattr(msg, "message", None) or not getattr(msg, "reply_to_msg_id", None):
             continue
+
         command = parse_rerun_command(msg.message)
         if command is None:
             continue
+
         target = by_id.get(msg.reply_to_msg_id)
         if target is None:
             try:
                 target = await client.get_messages(channel, ids=msg.reply_to_msg_id)
             except Exception:
                 target = None
-        if not target or not target.media:
-            state["command_ids"].append(msg.id)
+
+        if not target or not message_media_kind(target):
+            if msg.id not in state["command_ids"]:
+                state["command_ids"].append(int(msg.id))
             continue
-        key = ("rerun", msg.id)
-        if key not in queued_keys:
-            jobs.append(
-                {
-                    "source": target,
-                    "command": msg,
-                    "profile": command["profile"],
-                    "target_mb": command["target_mb"],
-                    "rerun": True,
-                }
-            )
-            queued_keys.add(key)
+
+        jobs.append(
+            {
+                "source": target,
+                "command": msg,
+                "profile": command["profile"],
+                "target_mb": command["target_mb"],
+                "rerun": True,
+            }
+        )
+        rerun_source_ids.add(int(target.id))
 
     for msg in reversed(messages):
-        if not msg.media:
+        if not message_media_kind(msg):
             continue
-        if msg.id in outputs or msg.id in processed:
+        if msg.id in outputs or msg.id in processed or msg.id in rerun_source_ids:
             continue
-        key = ("new", msg.id)
-        if key not in queued_keys:
-            jobs.append(
-                {
-                    "source": msg,
-                    "command": None,
-                    "profile": None,
-                    "target_mb": None,
-                    "rerun": False,
-                }
-            )
-            queued_keys.add(key)
+        if looks_like_generated_output(msg):
+            continue
+
+        jobs.append(
+            {
+                "source": msg,
+                "command": None,
+                "profile": None,
+                "target_mb": None,
+                "rerun": False,
+            }
+        )
 
     return jobs
 
 
 async def process_job(client, channel, state, job, nvenc: bool, index: int, total: int):
-    from telethon.tl.types import DocumentAttributeAudio
+    from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
 
     msg = job["source"]
     command_msg = job["command"]
+
+    parent_lineage = state.get("lineage", {}).get(str(msg.id), {})
+    root_id = int(parent_lineage.get("root_id", msg.id))
+    version = int(parent_lineage.get("version", 0)) + 1
 
     original_name = getattr(getattr(msg, "file", None), "name", None)
     ext = getattr(getattr(msg, "file", None), "ext", None) or ""
@@ -645,8 +737,10 @@ async def process_job(client, channel, state, job, nvenc: bool, index: int, tota
             sent = await client.send_file(
                 channel,
                 str(dst),
-                caption=f"✅ {title}\n{human_size(src.stat().st_size)} → {human_size(dst.stat().st_size)}",
+                caption=f"✅ v{version} • صوت صغير جدًا\n{title}\n{human_size(src.stat().st_size)} → {human_size(dst.stat().st_size)}",
                 attributes=attrs,
+                mime_type="audio/ogg",
+                voice_note=False,
                 force_document=False,
                 reply_to=msg.id,
                 progress_callback=make_progress("رفع"),
@@ -667,27 +761,29 @@ async def process_job(client, channel, state, job, nvenc: bool, index: int, tota
             if dst.stat().st_size >= src.stat().st_size * 0.98:
                 raise AppError("E430", "الملف مضغوط بالفعل تقريبًا، وإعادة الضغط لن توفر مساحة مفيدة.")
 
+            out_info = ffprobe(dst)
             sent = await client.send_file(
                 channel,
                 str(dst),
-                caption=f"✅ {Path(name).stem}\n{human_size(src.stat().st_size)} → {human_size(dst.stat().st_size)}",
+                caption=f"✅ v{version} • {labels.get(profile, profile)}\n{Path(name).stem}\n{human_size(src.stat().st_size)} → {human_size(dst.stat().st_size)}",
                 force_document=False,
+                mime_type="video/mp4",
                 supports_streaming=True,
+                attributes=[
+                    DocumentAttributeVideo(
+                        duration=max(0, int(out_info.duration)),
+                        w=max(1, int(out_info.width)),
+                        h=max(1, int(out_info.height)),
+                        supports_streaming=True,
+                    )
+                ],
                 reply_to=msg.id,
                 progress_callback=make_progress("رفع"),
             )
 
-        root_id = str(msg.id)
-        parent_lineage = state.get("lineage", {}).get(str(msg.id))
-        if parent_lineage:
-            root_id = str(parent_lineage.get("root_id", msg.id))
-            version = int(parent_lineage.get("version", 1)) + 1
-        else:
-            version = 1
-
         state["output_ids"].append(int(sent.id))
         state["lineage"][str(sent.id)] = {
-            "root_id": int(root_id),
+            "root_id": root_id,
             "parent_id": int(msg.id),
             "version": version,
             "profile": profile,
@@ -754,34 +850,49 @@ async def process_job(client, channel, state, job, nvenc: bool, index: int, tota
 
 
 async def app():
-    ensure_dependencies()
     mount_drive()
-
-    import nest_asyncio
-    nest_asyncio.apply()
 
     from telethon import TelegramClient
 
     config = first_time_setup(load_config())
     state = normalize_state(load_json(STATE_PATH, default_state()))
 
+    persistent_session = BASE_DIR / "telegram_user.session"
+    local_session_base = "/content/telegram_user"
+    local_session_file = Path(local_session_base + ".session")
+    if persistent_session.exists() and not local_session_file.exists():
+        shutil.copy2(persistent_session, local_session_file)
+
     print()
     print("🔐 تسجيل الدخول إلى Telegram...")
     client = TelegramClient(
-        str(SESSION_PATH),
+        local_session_base,
         int(config["api_id"]),
         config["api_hash"],
+        connection_retries=5,
+        request_retries=5,
     )
 
     try:
-        await client.start(phone=config["phone"])
-    except Exception as exc:
-        raise AppError("E120", "تعذر تسجيل الدخول إلى Telegram. راجع رقم الهاتف وبيانات API.", str(exc))
+        try:
+            await client.start(phone=config["phone"])
+        except Exception as exc:
+            raise AppError(
+                "E120",
+                "تعذر تسجيل الدخول إلى Telegram. راجع رقم الهاتف وبيانات API.",
+                str(exc),
+            )
 
-    channel = None
-    try:
-        channel, created = await ensure_workspace(client, config)
+        channel, _created = await ensure_workspace(client, config)
+        state = migrate_old_state(channel, state)
         print(f"✅ مساحة العمل جاهزة: {WORKSPACE_TITLE}")
+
+        try:
+            client.session.save()
+        except Exception:
+            pass
+        if local_session_file.exists():
+            shutil.copy2(local_session_file, persistent_session)
 
         nvenc = detect_nvenc()
         if nvenc:
@@ -790,6 +901,7 @@ async def app():
             print("💻 سيتم استخدام المعالج في ضغط الفيديو.")
 
         jobs = await collect_queue(client, channel, state)
+        save_json(STATE_PATH, state)
 
         if not jobs:
             print()
@@ -838,14 +950,26 @@ async def app():
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     finally:
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        finally:
+            if local_session_file.exists():
+                try:
+                    shutil.copy2(local_session_file, persistent_session)
+                except Exception:
+                    pass
 
 
 def run():
     print(f"✅ المحرك {ENGINE_BUNDLE_VERSION}")
     try:
+        ensure_dependencies()
+        import nest_asyncio
+        nest_asyncio.apply()
+
         loop = asyncio.get_event_loop()
         loop.run_until_complete(app())
+
     except AppError as exc:
         if exc.details:
             try:
@@ -857,6 +981,11 @@ def run():
         print(f"❌ {exc.code}")
         print(exc.message)
         print("إذا استمرت المشكلة، أرسل كود الخطأ فقط.")
+
+    except KeyboardInterrupt:
+        print()
+        print("⏹️ تم إيقاف التشغيل. الملفات الأصلية لم تتأثر.")
+
     except Exception:
         details = traceback.format_exc()
         try:
@@ -866,8 +995,9 @@ def run():
             pass
         print()
         print("❌ E999")
-        print("حصل خطأ غير متوقع. تم حفظ التفاصيل في Google Drive بدل عرض رسالة تقنية طويلة.")
+        print("حصل خطأ غير متوقع. تم حفظ التفاصيل في Google Drive.")
         print("إذا استمرت المشكلة، أرسل كود الخطأ E999.")
 
 
-run()
+if os.environ.get("TSC_TEST_MODE") != "1":
+    run()
