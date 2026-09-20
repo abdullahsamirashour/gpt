@@ -1,11 +1,12 @@
 {
-  "version": "4.0.3",
+  "version": "4.0.4",
   "channel": "stable",
   "engine": "engine.py",
   "updated": "2026-09-20",
   "notes": [
-    "Print the loaded engine version at startup so Colab cache issues are immediately visible.",
-    "Top-level await fix from v4.0.2 remains active.",
+    "Fix SyntaxError caused by a literal \\\\n sequence in engine.py.",
+    "Engine now loads cleanly and prints its version.",
+    "Top-level await handling from v4.0.2 remains active.",
     "No launcher replacement is required."
   ]
 }
