@@ -1,10 +1,11 @@
 {
-  "version": "4.0.0",
+  "version": "4.0.1",
   "channel": "stable",
   "engine": "engine.py",
   "updated": "2026-09-20",
   "notes": [
-    "Initial GitHub-powered engine extracted from Telegram Smart Media Compressor V4.",
-    "Permanent Colab launcher pulls the latest engine on every run."
+    "Fix permanent launcher settings injection.",
+    "Launcher values now override engine defaults correctly.",
+    "Blank TARGET_SIZE_MB can safely fall back to 100 inside the engine."
   ]
 }
