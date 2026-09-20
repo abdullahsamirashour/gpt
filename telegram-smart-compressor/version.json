@@ -1,16 +1,16 @@
 {
-  "version": "5.0.0-beta",
+  "version": "5.0.0",
   "engine": "5.0.0",
-  "channel": "beta",
+  "channel": "stable",
   "updated": "2026-09-20",
   "notes": [
+    "Share-safe v5 UX release.",
     "Auto-creates and remembers a private Smart Compressor Telegram channel.",
-    "Pins simple usage instructions and best-effort pins the workspace chat.",
     "Processes all new media automatically; LAST_N removed from normal UX.",
-    "MODE + GOAL replaced by one PROFILE selector.",
-    "Supports explicit reprocessing with reply commands: 🔁, 🔁 أصغر, 🔁 صوت, 🔁 80.",
-    "Tracks output lineage/versions to avoid loops and allow re-use.",
-    "Sends a batch summary back to Telegram.",
-    "Friendly error codes replace large raw tracebacks for normal failures."
+    "Uses one PROFILE selector instead of MODE + GOAL.",
+    "Supports explicit reprocessing with 🔁 reply commands.",
+    "Tracks output lineage to prevent loops and allow repeated processing.",
+    "Sends batch summaries back to Telegram.",
+    "Stable launcher tracks main; beta launcher tracks beta."
   ]
 }
