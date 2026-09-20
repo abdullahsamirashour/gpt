@@ -1,12 +1,16 @@
 {
-  "version": "4.0.4",
-  "channel": "stable",
-  "engine": "engine.py",
+  "version": "5.0.0-beta",
+  "engine": "5.0.0",
+  "channel": "beta",
   "updated": "2026-09-20",
   "notes": [
-    "Fix SyntaxError caused by a literal \\\\n sequence in engine.py.",
-    "Engine now loads cleanly and prints its version.",
-    "Top-level await handling from v4.0.2 remains active.",
-    "No launcher replacement is required."
+    "Auto-creates and remembers a private Smart Compressor Telegram channel.",
+    "Pins simple usage instructions and best-effort pins the workspace chat.",
+    "Processes all new media automatically; LAST_N removed from normal UX.",
+    "MODE + GOAL replaced by one PROFILE selector.",
+    "Supports explicit reprocessing with reply commands: 🔁, 🔁 أصغر, 🔁 صوت, 🔁 80.",
+    "Tracks output lineage/versions to avoid loops and allow re-use.",
+    "Sends a batch summary back to Telegram.",
+    "Friendly error codes replace large raw tracebacks for normal failures."
   ]
 }
