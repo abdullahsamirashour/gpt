@@ -1,11 +1,873 @@
-# Telegram Smart Compressor bundled engine.
-# Source bundle contains no user credentials or Telegram session data.
-import base64, gzip, hashlib
-ENGINE_BUNDLE_VERSION = "5.0.0"
-ENGINE_SOURCE_SHA256 = "5a43003dc3393fdeaa37e59e6871d53aeb10ec98373a01bcf512033c890a6587"
-_payload = """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"""
-_source = gzip.decompress(base64.b64decode(_payload))
-if hashlib.sha256(_source).hexdigest() != ENGINE_SOURCE_SHA256:
-    raise RuntimeError("Engine integrity check failed")
-print(f"✅ GitHub Engine {ENGINE_BUNDLE_VERSION} loaded")
-exec(compile(_source.decode("utf-8"), "telegram_smart_compressor_engine.py", "exec"), globals(), globals())
+# -*- coding: utf-8 -*-
+"""
+Telegram Smart Compressor
+Readable Colab engine. No embedded payloads and no user secrets in this file.
+"""
+from __future__ import annotations
+
+import asyncio
+import getpass
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
+
+ENGINE_BUNDLE_VERSION = "5.1.0-beta"
+APP_NAME = "Smart Compressor"
+WORKSPACE_TITLE = "📦 Smart Compressor"
+BASE_DIR = Path("/content/drive/MyDrive/Telegram_Extreme_Compressor")
+TMP_DIR = Path("/content/telegram_smart_compressor_tmp")
+CONFIG_PATH = BASE_DIR / "config.json"
+STATE_PATH = BASE_DIR / "state_v5.json"
+ERROR_LOG = BASE_DIR / "last_error.log"
+SESSION_PATH = BASE_DIR / "telegram_user"
+SCAN_LIMIT = 1000
+
+PROFILE_FROM_UI = {
+    "تلقائي — مناسب لمعظم الاستخدامات": "SMART_AUTO",
+    "صوت صغير جدًا": "AUDIO_TINY",
+    "فيديو متوازن": "VIDEO_BALANCED",
+    "فيديو سريع": "VIDEO_FAST",
+    "أصغر حجم للفيديو": "VIDEO_SMALLEST",
+    "حجم فيديو محدد": "VIDEO_TARGET_SIZE",
+}
+PROFILE = PROFILE_FROM_UI.get(
+    os.environ.get("TSC_PROFILE", "SMART_AUTO"),
+    os.environ.get("TSC_PROFILE", "SMART_AUTO"),
+)
+TARGET_SIZE_TEXT = os.environ.get("TSC_TARGET_SIZE_MB", "").strip()
+
+
+class AppError(Exception):
+    def __init__(self, code: str, message: str, details: str = ""):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details
+
+
+@dataclass
+class MediaInfo:
+    duration: float = 0.0
+    size: int = 0
+    width: int = 0
+    height: int = 0
+    fps: float = 0.0
+    has_video: bool = False
+    has_audio: bool = False
+
+
+def run_quiet(args, check=True):
+    return subprocess.run(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=check,
+    )
+
+
+def ensure_dependencies():
+    packages = ["telethon>=1.36,<2", "cryptg", "nest_asyncio"]
+    try:
+        import telethon  # noqa
+        import cryptg  # noqa
+        import nest_asyncio  # noqa
+    except Exception:
+        print("🔧 تجهيز الأدوات المطلوبة لأول مرة...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", *packages],
+            check=True,
+        )
+
+
+def mount_drive():
+    try:
+        from google.colab import drive
+    except Exception as exc:
+        raise AppError("E101", "هذا الملف مخصص للعمل داخل Google Colab.", str(exc))
+    print("☁️ توصيل Google Drive...")
+    drive.mount("/content/drive", force_remount=False)
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save_json(path: Path, value):
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_config():
+    return load_json(CONFIG_PATH, {})
+
+
+def first_time_setup(config):
+    if config.get("api_id") and config.get("api_hash") and config.get("phone"):
+        return config
+
+    print()
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("👋 إعداد أول مرة")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("تحتاج بيانات Telegram API الخاصة بك مرة واحدة فقط.")
+    print("يمكنك الحصول عليها من my.telegram.org ثم Apps.")
+    print()
+
+    api_id_raw = input("اكتب API ID: ").strip()
+    api_hash = getpass.getpass("اكتب API Hash: ").strip()
+    phone = input("اكتب رقم الهاتف مع كود الدولة، مثال +2010...: ").strip()
+
+    if not api_id_raw.isdigit() or not api_hash or not phone:
+        raise AppError("E110", "بيانات Telegram غير مكتملة أو غير صحيحة.")
+
+    config.update(
+        api_id=int(api_id_raw),
+        api_hash=api_hash,
+        phone=phone,
+    )
+    save_json(CONFIG_PATH, config)
+    print("✅ تم حفظ بيانات الإعداد في Google Drive الخاص بك.")
+    return config
+
+
+def default_state():
+    return {
+        "processed_source_ids": [],
+        "output_ids": [],
+        "command_ids": [],
+        "lineage": {},
+    }
+
+
+def normalize_state(state):
+    base = default_state()
+    if isinstance(state, dict):
+        base.update(state)
+    for key in ("processed_source_ids", "output_ids", "command_ids"):
+        base[key] = [int(x) for x in base.get(key, []) if str(x).lstrip("-").isdigit()]
+    if not isinstance(base.get("lineage"), dict):
+        base["lineage"] = {}
+    return base
+
+
+def ffprobe(path: Path) -> MediaInfo:
+    proc = run_quiet(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration,size",
+            "-show_entries",
+            "stream=codec_type,width,height,r_frame_rate",
+            "-of",
+            "json",
+            str(path),
+        ]
+    )
+    data = json.loads(proc.stdout or "{}")
+    fmt = data.get("format", {})
+    info = MediaInfo(
+        duration=float(fmt.get("duration") or 0),
+        size=int(float(fmt.get("size") or path.stat().st_size)),
+    )
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video":
+            info.has_video = True
+            info.width = int(stream.get("width") or 0)
+            info.height = int(stream.get("height") or 0)
+            rate = stream.get("r_frame_rate") or "0/1"
+            try:
+                info.fps = float(Fraction(rate))
+            except Exception:
+                info.fps = 0.0
+        elif stream.get("codec_type") == "audio":
+            info.has_audio = True
+    return info
+
+
+def human_size(size: int) -> str:
+    size = max(0, int(size or 0))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def clean_name(name: str, fallback: str) -> str:
+    name = (name or fallback).strip()
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+    return name[:180] or fallback
+
+
+def detect_nvenc() -> bool:
+    if shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        run_quiet(["nvidia-smi"], check=True)
+        test = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=size=32x32:rate=1",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "h264_nvenc",
+                "-f",
+                "null",
+                "-",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+        return test.returncode == 0
+    except Exception:
+        return False
+
+
+def run_ffmpeg(cmd, duration: float, label: str):
+    full = [*cmd[:1], "-hide_banner", "-loglevel", "error", *cmd[1:], "-progress", "pipe:1", "-nostats"]
+    proc = subprocess.Popen(
+        full,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    last_percent = -10
+    lines = []
+    if proc.stdout:
+        for raw in proc.stdout:
+            line = raw.strip()
+            lines.append(line)
+            if line.startswith("out_time_ms=") and duration > 0:
+                try:
+                    seconds = int(line.split("=", 1)[1]) / 1_000_000
+                    percent = min(100, int(seconds / duration * 100))
+                    if percent >= last_percent + 10:
+                        last_percent = percent
+                        print(f"   {label}: {percent}%")
+                except Exception:
+                    pass
+    code = proc.wait()
+    if code != 0:
+        tail = "\n".join(lines[-30:])
+        raise AppError("E420", "فشل ضغط الملف.", tail)
+
+
+def encode_audio(src: Path, dst: Path, info: MediaInfo):
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src),
+        "-vn",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "8k",
+        "-ac",
+        "1",
+        "-ar",
+        "12000",
+        "-application",
+        "voip",
+        "-frame_duration",
+        "60",
+        "-compression_level",
+        "0",
+        "-vbr",
+        "on",
+        str(dst),
+    ]
+    run_ffmpeg(cmd, info.duration, "ضغط الصوت")
+
+
+def video_filter(info: MediaInfo, max_w: int, max_h: int, fps_cap: int) -> str:
+    source_fps = info.fps if info.fps > 0 else float(fps_cap)
+    fps = max(1.0, min(source_fps, float(fps_cap)))
+    return (
+        f"scale='min({max_w},iw)':'min({max_h},ih)':"
+        f"force_original_aspect_ratio=decrease:force_divisible_by=2,"
+        f"fps={fps:.3f}"
+    )
+
+
+def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb: int | None, nvenc: bool):
+    if not info.has_video:
+        raise AppError("E411", "هذا الملف لا يحتوي على فيديو.")
+
+    if profile == "VIDEO_SMALLEST":
+        vf = video_filter(info, 960, 540, 12)
+        cmd = [
+            "ffmpeg", "-y", "-i", str(src), "-vf", vf,
+            "-c:v", "libx264", "-preset", "slow", "-crf", "31",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "40k", "-ac", "1",
+            "-movflags", "+faststart",
+            str(dst),
+        ]
+        run_ffmpeg(cmd, info.duration, "ضغط الفيديو")
+        return
+
+    if profile == "VIDEO_TARGET_SIZE":
+        target_mb = int(target_mb or 100)
+        if info.duration <= 0:
+            raise AppError("E413", "تعذر معرفة مدة الفيديو لحساب الحجم المطلوب.")
+        audio_k = 40
+        total_kbps = (target_mb * 1024 * 1024 * 8 / info.duration) / 1000
+        video_k = int(total_kbps * 0.96 - audio_k)
+        if video_k < 80:
+            recommended = math.ceil(info.duration * (80 + audio_k) * 1000 / 8 / 1024 / 1024 / 0.96)
+            raise AppError(
+                "E414",
+                f"الحجم المطلوب صغير جدًا لهذا الفيديو. جرّب حوالي {recommended} MB أو أكثر.",
+            )
+        vf = video_filter(info, 1280, 720, 15)
+        passlog = str(TMP_DIR / f"pass_{int(time.time() * 1000)}")
+        first = [
+            "ffmpeg", "-y", "-i", str(src), "-vf", vf,
+            "-an", "-c:v", "libx264", "-preset", "veryfast",
+            "-b:v", f"{video_k}k", "-pass", "1", "-passlogfile", passlog,
+            "-f", "mp4", os.devnull,
+        ]
+        second = [
+            "ffmpeg", "-y", "-i", str(src), "-vf", vf,
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-b:v", f"{video_k}k", "-pass", "2", "-passlogfile", passlog,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", f"{audio_k}k", "-ac", "1",
+            "-movflags", "+faststart",
+            str(dst),
+        ]
+        try:
+            run_ffmpeg(first, info.duration, "تحليل الفيديو")
+            run_ffmpeg(second, info.duration, "ضغط الفيديو")
+        finally:
+            for p in TMP_DIR.glob(Path(passlog).name + "*"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+        return
+
+    if profile == "VIDEO_FAST":
+        vf = video_filter(info, 1280, 720, 18)
+        if nvenc:
+            codec = [
+                "-c:v", "h264_nvenc", "-preset", "p3",
+                "-rc", "vbr", "-cq", "31", "-b:v", "0",
+            ]
+        else:
+            codec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "31"]
+    else:
+        vf = video_filter(info, 1280, 720, 15)
+        if nvenc:
+            codec = [
+                "-c:v", "h264_nvenc", "-preset", "p4",
+                "-rc", "vbr", "-cq", "30", "-b:v", "0",
+            ]
+        else:
+            codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "29"]
+
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src), "-vf", vf,
+        *codec,
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "48k", "-ac", "1",
+        "-movflags", "+faststart",
+        str(dst),
+    ]
+    run_ffmpeg(cmd, info.duration, "ضغط الفيديو")
+
+
+def parse_rerun_command(text: str):
+    text = (text or "").strip()
+    if not text.startswith("🔁"):
+        return None
+    rest = text[1:].strip()
+    if not rest:
+        return {"profile": None, "target_mb": None}
+    if "صوت" in rest:
+        return {"profile": "AUDIO_TINY", "target_mb": None}
+    if "أصغر" in rest or "اصغر" in rest:
+        return {"profile": "VIDEO_SMALLEST", "target_mb": None}
+    match = re.search(r"(\d{1,5})", rest)
+    if match:
+        return {"profile": "VIDEO_TARGET_SIZE", "target_mb": int(match.group(1))}
+    return {"profile": None, "target_mb": None}
+
+
+def resolve_profile(msg, explicit=None):
+    if explicit:
+        return explicit
+    if PROFILE == "SMART_AUTO":
+        if getattr(msg, "video", None):
+            return "VIDEO_BALANCED"
+        return "AUDIO_TINY"
+    return PROFILE
+
+
+def target_size_from_ui():
+    if not TARGET_SIZE_TEXT:
+        return 100
+    if not TARGET_SIZE_TEXT.isdigit():
+        raise AppError("E210", "الحجم المستهدف يجب أن يكون رقمًا صحيحًا بالميجابايت.")
+    value = int(TARGET_SIZE_TEXT)
+    if value <= 0:
+        raise AppError("E210", "الحجم المستهدف يجب أن يكون أكبر من صفر.")
+    return value
+
+
+async def progress_download(current, total, started, label):
+    now = time.time()
+    if not hasattr(progress_download, "_last"):
+        progress_download._last = 0
+    if now - progress_download._last < 2 and current < total:
+        return
+    progress_download._last = now
+    pct = (current / total * 100) if total else 0
+    speed = current / max(now - started, 0.1) / 1024 / 1024
+    print(f"   {label}: {pct:5.1f}% — {speed:.1f} MB/s")
+
+
+def make_progress(label):
+    started = time.time()
+    last = {"t": 0.0}
+    def callback(current, total):
+        now = time.time()
+        if now - last["t"] < 2 and current < total:
+            return
+        last["t"] = now
+        pct = (current / total * 100) if total else 0
+        speed = current / max(now - started, 0.1) / 1024 / 1024
+        print(f"   {label}: {pct:5.1f}% — {speed:.1f} MB/s")
+    return callback
+
+
+async def ensure_workspace(client, config):
+    from telethon import functions, types
+
+    saved_id = config.get("workspace_id")
+    if saved_id:
+        try:
+            entity = await client.get_entity(types.PeerChannel(int(saved_id)))
+            return entity, False
+        except Exception:
+            config.pop("workspace_id", None)
+            save_json(CONFIG_PATH, config)
+
+    print()
+    print("📦 إنشاء مساحة العمل الخاصة بك...")
+    result = await client(
+        functions.channels.CreateChannelRequest(
+            title=WORKSPACE_TITLE,
+            about="مساحة خاصة لضغط ملفات الصوت والفيديو عبر Google Colab.",
+            megagroup=False,
+        )
+    )
+    channel = result.chats[0]
+    config["workspace_id"] = int(channel.id)
+    save_json(CONFIG_PATH, config)
+
+    instructions = (
+        "📦 Smart Compressor\n\n"
+        "الاستخدام العادي:\n"
+        "1) ابعت أي ملف صوت أو فيديو هنا.\n"
+        "2) افتح ملف Colab واضغط تشغيل.\n"
+        "3) النتيجة هتظهر هنا تلقائيًا.\n\n"
+        "إعادة معالجة نتيجة قديمة:\n"
+        "🔁  = نفس الإعداد الحالي\n"
+        "🔁 أصغر  = ضغط فيديو أقوى\n"
+        "🔁 صوت  = استخراج صوت صغير جدًا\n"
+        "🔁 80  = محاولة الوصول إلى 80 MB تقريبًا\n\n"
+        "ملاحظة: النتائج التي يصنعها البرنامج لا يعيد ضغطها تلقائيًا."
+    )
+    msg = await client.send_message(channel, instructions)
+    try:
+        await client.pin_message(channel, msg.id, notify=False)
+    except Exception:
+        pass
+    try:
+        input_peer = await client.get_input_entity(channel)
+        await client(
+            functions.messages.ToggleDialogPinRequest(
+                pinned=True,
+                peer=types.InputDialogPeer(peer=input_peer),
+            )
+        )
+    except Exception:
+        pass
+
+    print("✅ تم إنشاء قناة «📦 Smart Compressor» وحفظها للاستخدام القادم.")
+    return channel, True
+
+
+async def collect_queue(client, channel, state):
+    processed = set(state["processed_source_ids"])
+    outputs = set(state["output_ids"])
+    commands_done = set(state["command_ids"])
+
+    messages = await client.get_messages(channel, limit=SCAN_LIMIT)
+    by_id = {m.id: m for m in messages}
+    jobs = []
+    queued_keys = set()
+
+    for msg in reversed(messages):
+        if msg.id in commands_done or not msg.message or not msg.reply_to_msg_id:
+            continue
+        command = parse_rerun_command(msg.message)
+        if command is None:
+            continue
+        target = by_id.get(msg.reply_to_msg_id)
+        if target is None:
+            try:
+                target = await client.get_messages(channel, ids=msg.reply_to_msg_id)
+            except Exception:
+                target = None
+        if not target or not target.media:
+            state["command_ids"].append(msg.id)
+            continue
+        key = ("rerun", msg.id)
+        if key not in queued_keys:
+            jobs.append(
+                {
+                    "source": target,
+                    "command": msg,
+                    "profile": command["profile"],
+                    "target_mb": command["target_mb"],
+                    "rerun": True,
+                }
+            )
+            queued_keys.add(key)
+
+    for msg in reversed(messages):
+        if not msg.media:
+            continue
+        if msg.id in outputs or msg.id in processed:
+            continue
+        key = ("new", msg.id)
+        if key not in queued_keys:
+            jobs.append(
+                {
+                    "source": msg,
+                    "command": None,
+                    "profile": None,
+                    "target_mb": None,
+                    "rerun": False,
+                }
+            )
+            queued_keys.add(key)
+
+    return jobs
+
+
+async def process_job(client, channel, state, job, nvenc: bool, index: int, total: int):
+    from telethon.tl.types import DocumentAttributeAudio
+
+    msg = job["source"]
+    command_msg = job["command"]
+
+    original_name = getattr(getattr(msg, "file", None), "name", None)
+    ext = getattr(getattr(msg, "file", None), "ext", None) or ""
+    name = clean_name(original_name, f"telegram_{msg.id}{ext}")
+    src = TMP_DIR / f"{msg.id}_{int(time.time() * 1000)}_{name}"
+
+    print()
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"📄 ملف {index} من {total}")
+    print(f"الاسم: {name}")
+
+    try:
+        downloaded = await client.download_media(
+            msg,
+            file=str(src),
+            progress_callback=make_progress("تنزيل"),
+        )
+        if not downloaded:
+            raise AppError("E401", "تعذر تنزيل الملف من Telegram.")
+        src = Path(downloaded)
+        info = ffprobe(src)
+
+        profile = resolve_profile(msg, job["profile"])
+        target_mb = job["target_mb"]
+        if profile == "VIDEO_TARGET_SIZE" and target_mb is None:
+            target_mb = target_size_from_ui()
+
+        if profile.startswith("VIDEO_") and not info.has_video:
+            print("ℹ️ الملف صوتي، لذلك سيتم استخدام ضغط الصوت بدل إعداد الفيديو.")
+            profile = "AUDIO_TINY"
+
+        if profile == "AUDIO_TINY":
+            dst = TMP_DIR / f"{src.stem}_compressed.ogg"
+            print("🎧 المعالجة: صوت صغير جدًا")
+            encode_audio(src, dst, info)
+            out_info = ffprobe(dst)
+            if dst.stat().st_size >= src.stat().st_size * 0.98:
+                raise AppError("E430", "الملف مضغوط بالفعل تقريبًا، وإعادة الضغط لن توفر مساحة مفيدة.")
+
+            title = Path(name).stem[:60]
+            attrs = [
+                DocumentAttributeAudio(
+                    duration=max(0, int(out_info.duration)),
+                    voice=False,
+                    title=title,
+                    performer="",
+                )
+            ]
+            sent = await client.send_file(
+                channel,
+                str(dst),
+                caption=f"✅ {title}\n{human_size(src.stat().st_size)} → {human_size(dst.stat().st_size)}",
+                attributes=attrs,
+                force_document=False,
+                reply_to=msg.id,
+                progress_callback=make_progress("رفع"),
+            )
+        else:
+            dst = TMP_DIR / f"{src.stem}_compressed.mp4"
+            labels = {
+                "VIDEO_BALANCED": "فيديو متوازن",
+                "VIDEO_FAST": "فيديو سريع",
+                "VIDEO_SMALLEST": "أصغر حجم للفيديو",
+                "VIDEO_TARGET_SIZE": f"حجم مستهدف: {target_mb} MB",
+            }
+            print(f"🎬 المعالجة: {labels.get(profile, profile)}")
+            if profile in ("VIDEO_BALANCED", "VIDEO_FAST") and nvenc:
+                print("⚡ سيتم استخدام كارت الشاشة في ترميز الفيديو.")
+            encode_video(src, dst, info, profile, target_mb, nvenc)
+
+            if dst.stat().st_size >= src.stat().st_size * 0.98:
+                raise AppError("E430", "الملف مضغوط بالفعل تقريبًا، وإعادة الضغط لن توفر مساحة مفيدة.")
+
+            sent = await client.send_file(
+                channel,
+                str(dst),
+                caption=f"✅ {Path(name).stem}\n{human_size(src.stat().st_size)} → {human_size(dst.stat().st_size)}",
+                force_document=False,
+                supports_streaming=True,
+                reply_to=msg.id,
+                progress_callback=make_progress("رفع"),
+            )
+
+        root_id = str(msg.id)
+        parent_lineage = state.get("lineage", {}).get(str(msg.id))
+        if parent_lineage:
+            root_id = str(parent_lineage.get("root_id", msg.id))
+            version = int(parent_lineage.get("version", 1)) + 1
+        else:
+            version = 1
+
+        state["output_ids"].append(int(sent.id))
+        state["lineage"][str(sent.id)] = {
+            "root_id": int(root_id),
+            "parent_id": int(msg.id),
+            "version": version,
+            "profile": profile,
+            "created_at": int(time.time()),
+        }
+
+        if not job["rerun"]:
+            state["processed_source_ids"].append(int(msg.id))
+        if command_msg:
+            state["command_ids"].append(int(command_msg.id))
+
+        save_json(STATE_PATH, state)
+        saved = max(0, src.stat().st_size - dst.stat().st_size)
+        print(f"✅ تم. التوفير: {human_size(saved)}")
+        return {
+            "ok": True,
+            "original": src.stat().st_size,
+            "final": dst.stat().st_size,
+        }
+
+    except AppError as exc:
+        if command_msg and command_msg.id not in state["command_ids"]:
+            state["command_ids"].append(int(command_msg.id))
+            save_json(STATE_PATH, state)
+        try:
+            await client.send_message(
+                channel,
+                f"⚠️ {exc.code}\n{exc.message}",
+                reply_to=msg.id,
+            )
+        except Exception:
+            pass
+        print(f"⚠️ {exc.code} — {exc.message}")
+        if exc.details:
+            ERROR_LOG.write_text(exc.details, encoding="utf-8")
+        return {"ok": False, "original": 0, "final": 0}
+
+    except Exception as exc:
+        details = traceback.format_exc()
+        ERROR_LOG.write_text(details, encoding="utf-8")
+        try:
+            await client.send_message(
+                channel,
+                "❌ E900\nحصل خطأ غير متوقع أثناء معالجة الملف. الملف الأصلي لم يتأثر.",
+                reply_to=msg.id,
+            )
+        except Exception:
+            pass
+        print("❌ E900 — حصل خطأ غير متوقع. تم حفظ التفاصيل في Google Drive.")
+        return {"ok": False, "original": 0, "final": 0}
+
+    finally:
+        for path in (src,):
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
+        for path in TMP_DIR.glob(f"{src.stem}_compressed.*"):
+            try:
+                path.unlink()
+            except Exception:
+                pass
+
+
+async def app():
+    ensure_dependencies()
+    mount_drive()
+
+    import nest_asyncio
+    nest_asyncio.apply()
+
+    from telethon import TelegramClient
+
+    config = first_time_setup(load_config())
+    state = normalize_state(load_json(STATE_PATH, default_state()))
+
+    print()
+    print("🔐 تسجيل الدخول إلى Telegram...")
+    client = TelegramClient(
+        str(SESSION_PATH),
+        int(config["api_id"]),
+        config["api_hash"],
+    )
+
+    try:
+        await client.start(phone=config["phone"])
+    except Exception as exc:
+        raise AppError("E120", "تعذر تسجيل الدخول إلى Telegram. راجع رقم الهاتف وبيانات API.", str(exc))
+
+    channel = None
+    try:
+        channel, created = await ensure_workspace(client, config)
+        print(f"✅ مساحة العمل جاهزة: {WORKSPACE_TITLE}")
+
+        nvenc = detect_nvenc()
+        if nvenc:
+            print("⚡ تم اكتشاف كارت شاشة مناسب لتسريع الفيديو.")
+        else:
+            print("💻 سيتم استخدام المعالج في ضغط الفيديو.")
+
+        jobs = await collect_queue(client, channel, state)
+
+        if not jobs:
+            print()
+            print("✅ لا توجد ملفات جديدة تحتاج معالجة.")
+            print("ابعت ملفًا في قناة «📦 Smart Compressor» ثم شغّل الخلية مرة أخرى.")
+            return
+
+        print()
+        print(f"📥 الملفات المنتظرة: {len(jobs)}")
+        started = time.time()
+        results = []
+
+        for idx, job in enumerate(jobs, 1):
+            result = await process_job(
+                client,
+                channel,
+                state,
+                job,
+                nvenc=nvenc,
+                index=idx,
+                total=len(jobs),
+            )
+            results.append(result)
+
+        ok = sum(1 for r in results if r["ok"])
+        failed = len(results) - ok
+        original = sum(r["original"] for r in results)
+        final = sum(r["final"] for r in results)
+        saved_pct = ((original - final) / original * 100) if original else 0
+        elapsed = int(time.time() - started)
+        minutes, seconds = divmod(elapsed, 60)
+
+        summary = (
+            "✅ انتهت الدفعة\n\n"
+            f"تم بنجاح: {ok}\n"
+            f"فشل: {failed}\n"
+            f"الحجم قبل: {human_size(original)}\n"
+            f"الحجم بعد: {human_size(final)}\n"
+            f"التوفير: {saved_pct:.1f}%\n"
+            f"الوقت: {minutes} دقيقة و {seconds} ثانية"
+        )
+        await client.send_message(channel, summary)
+        print()
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(summary)
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    finally:
+        await client.disconnect()
+
+
+def run():
+    print(f"✅ المحرك {ENGINE_BUNDLE_VERSION}")
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(app())
+    except AppError as exc:
+        if exc.details:
+            try:
+                BASE_DIR.mkdir(parents=True, exist_ok=True)
+                ERROR_LOG.write_text(exc.details, encoding="utf-8")
+            except Exception:
+                pass
+        print()
+        print(f"❌ {exc.code}")
+        print(exc.message)
+        print("إذا استمرت المشكلة، أرسل كود الخطأ فقط.")
+    except Exception:
+        details = traceback.format_exc()
+        try:
+            BASE_DIR.mkdir(parents=True, exist_ok=True)
+            ERROR_LOG.write_text(details, encoding="utf-8")
+        except Exception:
+            pass
+        print()
+        print("❌ E999")
+        print("حصل خطأ غير متوقع. تم حفظ التفاصيل في Google Drive بدل عرض رسالة تقنية طويلة.")
+        print("إذا استمرت المشكلة، أرسل كود الخطأ E999.")
+
+
+run()
