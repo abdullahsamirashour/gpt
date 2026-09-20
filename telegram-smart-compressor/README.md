@@ -1,6 +1,6 @@
 # Telegram Smart Compressor
 
-[Open Stable in Colab](https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/launcher.ipynb)
+[Open Stable in Colab](https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/Smart_Compressor.ipynb)
 
 [Open Beta in Colab](https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/beta/telegram-smart-compressor/launcher-beta.ipynb)
 
