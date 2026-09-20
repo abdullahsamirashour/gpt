@@ -1,16 +1,15 @@
 {
-  "version": "5.0.0",
-  "engine": "5.0.0",
-  "channel": "stable",
+  "version": "5.1.0-beta",
+  "engine": "5.1.0-beta",
+  "channel": "beta",
   "updated": "2026-09-20",
   "notes": [
-    "Share-safe v5 UX release.",
-    "Auto-creates and remembers a private Smart Compressor Telegram channel.",
-    "Processes all new media automatically; LAST_N removed from normal UX.",
-    "Uses one PROFILE selector instead of MODE + GOAL.",
-    "Supports explicit reprocessing with 🔁 reply commands.",
-    "Tracks output lineage to prevent loops and allow repeated processing.",
-    "Sends batch summaries back to Telegram.",
-    "Stable launcher tracks main; beta launcher tracks beta."
+    "Removed the broken gzip/base64 bundle and replaced it with readable Python.",
+    "Arabic RTL Colab UI rewritten for cleaner reading and no mixed-direction labels.",
+    "First run creates and remembers a private Smart Compressor Telegram channel.",
+    "Normal runs process all new media automatically; LAST_N is gone.",
+    "Rerun replies supported: 🔁, 🔁 أصغر, 🔁 صوت, 🔁 80.",
+    "Friendly error codes and Drive error log instead of long Python tracebacks.",
+    "Batch summary is posted back to Telegram."
   ]
 }
