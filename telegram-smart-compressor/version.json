@@ -1,11 +1,11 @@
 {
-  "version": "4.0.2",
+  "version": "4.0.3",
   "channel": "stable",
   "engine": "engine.py",
   "updated": "2026-09-20",
   "notes": [
-    "Fix Colab SyntaxError caused by top-level await inside the GitHub engine.",
-    "Engine now compiles notebook-style async code with PyCF_ALLOW_TOP_LEVEL_AWAIT and runs it safely inside Colab.",
-    "No launcher replacement is required for this fix."
+    "Print the loaded engine version at startup so Colab cache issues are immediately visible.",
+    "Top-level await fix from v4.0.2 remains active.",
+    "No launcher replacement is required."
   ]
 }
