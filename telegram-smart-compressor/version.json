@@ -1,0 +1,10 @@
+{
+  "version": "4.0.0",
+  "channel": "stable",
+  "engine": "engine.py",
+  "updated": "2026-09-20",
+  "notes": [
+    "Initial GitHub-powered engine extracted from Telegram Smart Media Compressor V4.",
+    "Permanent Colab launcher pulls the latest engine on every run."
+  ]
+}
