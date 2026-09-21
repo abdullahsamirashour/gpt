@@ -39,3 +39,12 @@
 ## الخصوصية
 
 بيانات Telegram والجلسة وحالة الملفات تحفظ في Google Drive الخاص بكل مستخدم ولا تُرفع إلى GitHub.
+
+
+## 🧪 Encoder Benchmark
+
+للمقارنة بين طرق الضغط فقط، استخدم النوت بوك المنفصلة:
+
+[فتح Encoder Benchmark في Colab](https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/Encoder_Benchmark.ipynb)
+
+النوت بوك لا تغيّر القناة ولا محرك الضغط الأساسي. تعرض تلقائيًا اسم المعالج، عدد الـphysical cores والـlogical threads، الرام، نوع الـGPU إن وجد، ثم تختبر بدائل CPU/GPU وتحفظ تقريرًا مفصلًا في Google Drive.
