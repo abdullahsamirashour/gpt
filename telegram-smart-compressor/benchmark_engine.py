@@ -703,7 +703,7 @@ def candidate_specs(info: VideoInfo, hw, mode, target_mb):
         },
     ]
 
-    if hw["nvenc_available"]:
+    if hw.get("gpu"):
         specs.append({
             "id": "gpu_nvenc_cpu_filters_p4",
             "label": "FFmpeg NVENC p4 + CPU filters",
@@ -715,7 +715,7 @@ def candidate_specs(info: VideoInfo, hw, mode, target_mb):
             "scale": "default",
             "notes": "مسار GPU التقليدي للمقارنة",
         })
-        if hw["scale_cuda_available"]:
+        if True:
             for preset in ("p4", "p3", "p2", "p1"):
                 specs.append({
                     "id": f"gpu_full_{preset}",
@@ -899,18 +899,98 @@ def ffmpeg_cmd(spec, src, out, start, dur, info, pass_num=None, passlog=None):
     return cmd
 
 
-def run_process_timed(cmd):
+def sample_gpu_stats():
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,utilization.encoder,memory.used,clocks.sm",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        parts = [x.strip() for x in proc.stdout.strip().splitlines()[0].split(",")]
+        def num(value):
+            value = value.replace("%", "").strip()
+            if value.lower() in {"n/a", "[n/a]", ""}:
+                return None
+            try:
+                return float(value)
+            except Exception:
+                return None
+        return {
+            "gpu_pct": num(parts[0]) if len(parts) > 0 else None,
+            "encoder_pct": num(parts[1]) if len(parts) > 1 else None,
+            "vram_mb": num(parts[2]) if len(parts) > 2 else None,
+            "clock_mhz": num(parts[3]) if len(parts) > 3 else None,
+        }
+    except Exception:
+        return None
+
+
+def run_process_monitored(cmd, monitor_gpu=False):
+    import psutil
+
     started = time.time()
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
+
+    cpu_samples = []
+    gpu_samples = []
+    psutil.cpu_percent(interval=None)
+    last_gpu = 0.0
+
+    while proc.poll() is None:
+        time.sleep(0.20)
+        try:
+            cpu_samples.append(float(psutil.cpu_percent(interval=None)))
+        except Exception:
+            pass
+        now = time.time()
+        if monitor_gpu and now - last_gpu >= 0.55:
+            sample = sample_gpu_stats()
+            if sample:
+                gpu_samples.append(sample)
+            last_gpu = now
+
+    stdout, stderr = proc.communicate()
     elapsed = time.time() - started
     if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or proc.stdout or "unknown error")[-2500:])
-    return elapsed
+        raise RuntimeError((stderr or stdout or "unknown error")[-2500:])
+
+    def avg(values):
+        values = [v for v in values if v is not None]
+        return (sum(values) / len(values)) if values else None
+
+    result = {
+        "elapsed": elapsed,
+        "cpu_avg_pct": avg(cpu_samples),
+        "cpu_peak_pct": max(cpu_samples) if cpu_samples else None,
+        "gpu_avg_pct": avg([s.get("gpu_pct") for s in gpu_samples]),
+        "gpu_encoder_avg_pct": avg([s.get("encoder_pct") for s in gpu_samples]),
+        "gpu_vram_peak_mb": max(
+            [s.get("vram_mb") for s in gpu_samples if s.get("vram_mb") is not None],
+            default=None,
+        ),
+        "gpu_clock_avg_mhz": avg([s.get("clock_mhz") for s in gpu_samples]),
+    }
+    return result
+
+
+def run_process_timed(cmd):
+    return run_process_monitored(cmd, monitor_gpu=False)["elapsed"]
+
 
 
 def output_fps(path):
