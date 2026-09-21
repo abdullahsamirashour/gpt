@@ -1139,52 +1139,172 @@ def nvencc_cmd(spec, nvencc_path, src, out, start, dur, info):
     ]
 
 
-def run_single_candidate(spec, src, info, segments, work_dir, nvencc_path, keep_outputs):
-    total_encode = 0.0
-    total_sample = 0.0
-    total_bytes = 0
-    ssims = []
-    outputs = []
+def merge_metrics(items):
+    if not items:
+        return {
+            "elapsed": 0.0,
+            "cpu_avg_pct": None,
+            "cpu_peak_pct": None,
+            "gpu_avg_pct": None,
+            "gpu_encoder_avg_pct": None,
+            "gpu_vram_peak_mb": None,
+            "gpu_clock_avg_mhz": None,
+        }
 
-    for idx, (start, dur) in enumerate(segments, 1):
-        out = work_dir / f"{spec['id']}_seg{idx}.mp4"
-        if out.exists():
-            out.unlink()
+    def mean_key(key):
+        vals = [m.get(key) for m in items if m.get(key) is not None]
+        return (sum(vals) / len(vals)) if vals else None
 
-        if spec["backend"] == "nvencc":
-            cmd = nvencc_cmd(spec, nvencc_path, src, out, start, dur, info)
-            elapsed = run_process_timed(cmd)
-        elif spec["backend"] == "ffmpeg_target_2pass":
-            passlog = work_dir / f"pass_{spec['id']}_{idx}"
-            first = ffmpeg_cmd(spec, src, out, start, dur, info, pass_num=1, passlog=passlog)
-            second = ffmpeg_cmd(spec, src, out, start, dur, info, pass_num=2, passlog=passlog)
-            elapsed = run_process_timed(first) + run_process_timed(second)
+    return {
+        "elapsed": sum(float(m.get("elapsed") or 0.0) for m in items),
+        "cpu_avg_pct": mean_key("cpu_avg_pct"),
+        "cpu_peak_pct": max(
+            [m.get("cpu_peak_pct") for m in items if m.get("cpu_peak_pct") is not None],
+            default=None,
+        ),
+        "gpu_avg_pct": mean_key("gpu_avg_pct"),
+        "gpu_encoder_avg_pct": mean_key("gpu_encoder_avg_pct"),
+        "gpu_vram_peak_mb": max(
+            [m.get("gpu_vram_peak_mb") for m in items if m.get("gpu_vram_peak_mb") is not None],
+            default=None,
+        ),
+        "gpu_clock_avg_mhz": mean_key("gpu_clock_avg_mhz"),
+    }
+
+
+def run_candidate_segment(spec, src, info, start, dur, out, work_dir, nvencc_path):
+    monitor_gpu = spec["backend"] in {"ffmpeg_nvenc_cpu", "ffmpeg_nvenc_full", "nvencc"}
+
+    if spec["backend"] == "nvencc":
+        cmd = nvencc_cmd(spec, nvencc_path, src, out, start, dur, info)
+        return run_process_monitored(cmd, monitor_gpu=monitor_gpu)
+
+    if spec["backend"] == "ffmpeg_target_2pass":
+        passlog = work_dir / f"pass_{spec['id']}_{out.stem}"
+        first = ffmpeg_cmd(spec, src, out, start, dur, info, pass_num=1, passlog=passlog)
+        second = ffmpeg_cmd(spec, src, out, start, dur, info, pass_num=2, passlog=passlog)
+        metrics = []
+        try:
+            metrics.append(run_process_monitored(first, monitor_gpu=False))
+            metrics.append(run_process_monitored(second, monitor_gpu=False))
+        finally:
             for p in work_dir.glob(passlog.name + "*"):
                 try:
                     p.unlink()
                 except Exception:
                     pass
-        else:
-            cmd = ffmpeg_cmd(spec, src, out, start, dur, info)
-            elapsed = run_process_timed(cmd)
+        return merge_metrics(metrics)
 
-        if not out.exists() or out.stat().st_size <= 0:
-            raise RuntimeError("لم يتم إنشاء ملف ناتج صالح.")
+    cmd = ffmpeg_cmd(spec, src, out, start, dur, info)
+    return run_process_monitored(cmd, monitor_gpu=monitor_gpu)
 
-        total_encode += elapsed
-        total_sample += dur
-        total_bytes += out.stat().st_size
-        metric = compute_ssim(src, start, dur, out)
-        if metric is not None:
-            ssims.append(metric)
-        outputs.append((start, dur, out))
 
-    speed_x = total_sample / total_encode if total_encode > 0 else 0.0
+def warmup_candidate(spec, src, info, segments, work_dir, nvencc_path):
+    if spec["backend"] == "ffmpeg_target_2pass":
+        return
+
+    start, dur = segments[0]
+    warm_dur = min(2.0, max(0.8, dur))
+    out = work_dir / f"warmup_{spec['id']}.mp4"
+    try:
+        if out.exists():
+            out.unlink()
+        run_candidate_segment(
+            spec,
+            src,
+            info,
+            start,
+            warm_dur,
+            out,
+            work_dir,
+            nvencc_path,
+        )
+    finally:
+        try:
+            out.unlink()
+        except Exception:
+            pass
+
+
+def run_single_candidate(
+    spec,
+    src,
+    info,
+    segments,
+    work_dir,
+    nvencc_path,
+    keep_outputs,
+    repeats=3,
+    warmup=True,
+):
+    repeats = max(1, int(repeats or 1))
+    total_sample = sum(float(d) for _, d in segments)
+
+    if warmup:
+        warmup_candidate(spec, src, info, segments, work_dir, nvencc_path)
+
+    repeat_times = []
+    repeat_bytes = []
+    process_metrics = []
+    ssims = []
+    outputs = []
+
+    for rep in range(repeats):
+        rep_elapsed = 0.0
+        rep_bytes = 0
+
+        for idx, (start, dur) in enumerate(segments, 1):
+            out = work_dir / f"{spec['id']}_r{rep + 1}_seg{idx}.mp4"
+            if out.exists():
+                out.unlink()
+
+            metrics = run_candidate_segment(
+                spec,
+                src,
+                info,
+                start,
+                dur,
+                out,
+                work_dir,
+                nvencc_path,
+            )
+            process_metrics.append(metrics)
+
+            if not out.exists() or out.stat().st_size <= 0:
+                raise RuntimeError("لم يتم إنشاء ملف ناتج صالح.")
+
+            rep_elapsed += float(metrics.get("elapsed") or 0.0)
+            rep_bytes += out.stat().st_size
+
+            if rep == 0:
+                metric = compute_ssim(src, start, dur, out)
+                if metric is not None:
+                    ssims.append(metric)
+                outputs.append((start, dur, out))
+            else:
+                try:
+                    out.unlink()
+                except Exception:
+                    pass
+
+        repeat_times.append(rep_elapsed)
+        repeat_bytes.append(rep_bytes)
+
+    median_encode = statistics.median(repeat_times)
+    median_bytes = statistics.median(repeat_bytes)
+    speed_x = total_sample / median_encode if median_encode > 0 else 0.0
     full_encode_s = info.duration / speed_x if speed_x > 0 else None
-    # Add production-like 48 kbps audio to the sample-based full size estimate.
-    video_full_bytes = (total_bytes / total_sample) * info.duration if total_sample > 0 else 0
+
+    video_full_bytes = (median_bytes / total_sample) * info.duration if total_sample > 0 else 0
     audio_full_bytes = (48_000 / 8) * info.duration if info.has_audio else 0
     estimated_mb = (video_full_bytes + audio_full_bytes) / (1024 ** 2)
+
+    merged = merge_metrics(process_metrics)
+    timing_cv = None
+    if len(repeat_times) > 1:
+        avg_t = statistics.mean(repeat_times)
+        if avg_t > 0:
+            timing_cv = statistics.pstdev(repeat_times) / avg_t * 100
 
     result = {
         "id": spec["id"],
@@ -1194,22 +1314,29 @@ def run_single_candidate(spec, src, info, segments, work_dir, nvencc_path, keep_
         "preset": spec.get("preset", ""),
         "fps": round(float(spec.get("fps") or 0), 2),
         "sample_seconds": round(total_sample, 2),
-        "encode_seconds": round(total_encode, 3),
+        "repeats": repeats,
+        "encode_seconds": round(median_encode, 3),
+        "repeat_encode_seconds": [round(x, 3) for x in repeat_times],
+        "timing_cv_pct": round(timing_cv, 2) if timing_cv is not None else None,
         "speed_x": round(speed_x, 3),
         "estimated_full_encode_seconds": round(full_encode_s, 2) if full_encode_s else None,
         "estimated_full_encode": human_time(full_encode_s) if full_encode_s else None,
         "estimated_output_mb": round(estimated_mb, 2),
         "ssim": round(sum(ssims) / len(ssims), 6) if ssims else None,
         "vmaf": None,
+        "cpu_avg_pct": round(merged["cpu_avg_pct"], 1) if merged["cpu_avg_pct"] is not None else None,
+        "cpu_peak_pct": round(merged["cpu_peak_pct"], 1) if merged["cpu_peak_pct"] is not None else None,
+        "gpu_avg_pct": round(merged["gpu_avg_pct"], 1) if merged["gpu_avg_pct"] is not None else None,
+        "gpu_encoder_avg_pct": round(merged["gpu_encoder_avg_pct"], 1) if merged["gpu_encoder_avg_pct"] is not None else None,
+        "gpu_vram_peak_mb": round(merged["gpu_vram_peak_mb"], 1) if merged["gpu_vram_peak_mb"] is not None else None,
+        "gpu_clock_avg_mhz": round(merged["gpu_clock_avg_mhz"], 1) if merged["gpu_clock_avg_mhz"] is not None else None,
         "status": "ok",
         "notes": spec.get("notes", ""),
         "_outputs": outputs,
     }
 
-    if not keep_outputs:
-        # Delay cleanup until optional VMAF shortlist is calculated.
-        pass
     return result
+
 
 
 def cleanup_result_outputs(result):
