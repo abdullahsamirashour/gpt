@@ -95,7 +95,6 @@ def ensure_dependencies():
 def mount_drive():
     from google.colab import drive
 
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
     try:
         drive.mount("/content/drive")
     except Exception:
@@ -878,7 +877,6 @@ def nvencc_cmd(spec, nvencc_path, src, out, start, dur, info):
         "-u", spec.get("preset", "p3"),
         "--qvbr", str(spec.get("qvbr", 30)),
         "--output-res", f"{target_w}x{target_h},preserve_aspect_ratio=decrease",
-        "--audio-copy", "0",
     ]
 
 
