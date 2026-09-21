@@ -329,7 +329,7 @@ jobs:
           req = functions.channels.CreateChannelRequest(title="x", about="x", broadcast=True, megagroup=False)
           assert req.broadcast is True
           functions.channels.EditTitleRequest(channel=types.InputChannelEmpty(), title="🗜️ اضغطها | Media Lite")
-          functions.channels.EditAboutRequest(channel=types.InputChannelEmpty(), about="x")
+          functions.messages.EditChatAboutRequest(peer=types.InputPeerSelf(), about="x")
           uploaded_photo_file = types.InputFile(
               id=1,
               parts=1,
