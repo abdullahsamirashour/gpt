@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import html
 import json
 import logging
 import math
@@ -21,9 +22,14 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.2.4-beta"
-APP_NAME = "Smart Compressor"
-WORKSPACE_TITLE = "📦 Smart Compressor"
+ENGINE_BUNDLE_VERSION = "5.3.0-beta"
+APP_NAME = "ضغط المحاضرات"
+WORKSPACE_TITLE = "🎓 ضغط المحاضرات"
+WORKSPACE_ALIASES = {WORKSPACE_TITLE, "📦 Smart Compressor", "Smart Compressor"}
+COLAB_URL = "https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/Smart_Compressor.ipynb"
+TURBO_THRESHOLD = 8 * 1024 * 1024
+TURBO_CONNECTIONS = 4
+TURBO_PART_KB = 512
 BASE_DIR = Path("/content/drive/MyDrive/Telegram_Extreme_Compressor")
 TMP_DIR = Path("/content/telegram_smart_compressor_tmp")
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -78,12 +84,18 @@ def run_quiet(args, check=True):
 
 
 def ensure_dependencies():
-    packages = ["telethon==1.45.0", "cryptg", "nest_asyncio"]
+    packages = [
+        "telethon==1.45.0",
+        "cryptg",
+        "nest_asyncio",
+        "aiofasttelethonhelper==0.1.3",
+    ]
     needs_install = False
     try:
         import telethon  # noqa
         import cryptg  # noqa
         import nest_asyncio  # noqa
+        import aiofasttelethonhelper  # noqa
         if getattr(telethon, "__version__", "") != "1.45.0":
             needs_install = True
     except Exception:
@@ -99,6 +111,7 @@ def ensure_dependencies():
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         subprocess.run(["apt-get", "-qq", "update"], check=True)
         subprocess.run(["apt-get", "-qq", "install", "-y", "ffmpeg"], check=True)
+
 
 
 def mount_drive():
@@ -259,6 +272,7 @@ def normalize_state(state):
     return base
 
 
+
 def migrate_old_state(channel, state):
     if not OLD_STATE_PATH.exists():
         return state
@@ -376,6 +390,100 @@ def detect_nvenc() -> bool:
         return False
 
 
+def _format_duration(seconds):
+    seconds = max(0, int(seconds or 0))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{sec:02d}"
+    return f"{minutes}:{sec:02d}"
+
+
+class LiveProgress:
+    def __init__(self, label, icon, mode="bytes"):
+        self.label = label
+        self.icon = icon
+        self.mode = mode
+        self.started = time.time()
+        self.last_time = self.started
+        self.last_current = 0.0
+        self.speed = 0.0
+        self.last_render = 0.0
+        self.handle = None
+        self.terminal_started = False
+
+    def _text(self, current, total, speed_override=None):
+        total = float(total or 0)
+        current = float(current or 0)
+        pct = min(100.0, current / total * 100) if total > 0 else 0.0
+
+        if self.mode == "time":
+            speed_x = speed_override if speed_override and speed_override > 0 else self.speed
+            eta = (total - current) / speed_x if total > current and speed_x > 0 else 0
+            detail = f"{_format_duration(current)} / {_format_duration(total)}"
+            speed_text = f"{speed_x:.1f}x" if speed_x > 0 else "..."
+        else:
+            eta = (total - current) / self.speed if total > current and self.speed > 0 else 0
+            detail = f"{human_size(int(current))} / {human_size(int(total))}"
+            speed_text = f"{self.speed / 1024 / 1024:.1f} MB/s" if self.speed > 0 else "..."
+
+        eta_text = _format_duration(eta) if eta > 0 else "..."
+        return pct, detail, speed_text, eta_text
+
+    def update(self, current, total, speed_override=None, force=False):
+        now = time.time()
+        current = float(current or 0)
+        total = float(total or 0)
+
+        dt = max(now - self.last_time, 1e-6)
+        delta = max(0.0, current - self.last_current)
+        if delta > 0:
+            instant = delta / dt
+            self.speed = instant if self.speed <= 0 else (0.25 * instant + 0.75 * self.speed)
+
+        self.last_time = now
+        self.last_current = current
+
+        if not force and now - self.last_render < 0.5 and (not total or current < total):
+            return
+        self.last_render = now
+
+        pct, detail, speed_text, eta_text = self._text(current, total, speed_override)
+        line = f"{self.icon} {self.label} — {pct:.1f}% • {detail} • {speed_text} • باقي {eta_text}"
+
+        try:
+            from IPython.display import HTML, display
+            card = HTML(
+                f'<div dir="rtl" style="max-width:760px;padding:8px 12px;margin:4px 0;'
+                f'border:1px solid #d0d7de;border-radius:10px;background:#f8fafc;'
+                f'font-family:Arial,sans-serif">'
+                f'<div style="margin-bottom:6px">{html.escape(line)}</div>'
+                f'<progress value="{pct:.2f}" max="100" style="width:100%;height:12px"></progress>'
+                f'</div>'
+            )
+            if self.handle is None:
+                self.handle = display(card, display_id=True)
+            elif self.handle is not None:
+                self.handle.update(card)
+        except Exception:
+            print("\r" + line + " " * 8, end="", flush=True)
+            self.terminal_started = True
+
+    def callback(self, *args, **kwargs):
+        current = kwargs.get("done")
+        total = kwargs.get("total")
+        if current is None and args:
+            current = args[0]
+        if total is None and len(args) > 1:
+            total = args[1]
+        self.update(current or 0, total or 0)
+
+    def finish(self, total, speed_override=None):
+        self.update(total, total, speed_override=speed_override, force=True)
+        if self.terminal_started:
+            print()
+
+
 def run_ffmpeg(cmd, duration: float, label: str):
     full = [cmd[0], "-y", "-nostdin", "-hide_banner", "-loglevel", "error", *cmd[1:-1], "-progress", "pipe:1", "-nostats", cmd[-1]]
     proc = subprocess.Popen(
@@ -385,25 +493,90 @@ def run_ffmpeg(cmd, duration: float, label: str):
         text=True,
         bufsize=1,
     )
-    last_percent = -10
+    progress = LiveProgress(label, "🎬", mode="time")
     lines = []
+    current_seconds = 0.0
+    speed_x = None
+
     if proc.stdout:
         for raw in proc.stdout:
             line = raw.strip()
             lines.append(line)
+
+            if line.startswith("speed="):
+                raw_speed = line.split("=", 1)[1].rstrip("x").strip()
+                try:
+                    speed_x = float(raw_speed)
+                except Exception:
+                    speed_x = None
+
             if line.startswith("out_time_ms=") and duration > 0:
                 try:
-                    seconds = int(line.split("=", 1)[1]) / 1_000_000
-                    percent = min(100, int(seconds / duration * 100))
-                    if percent >= last_percent + 10:
-                        last_percent = percent
-                        print(f"   {label}: {percent}%")
+                    current_seconds = int(line.split("=", 1)[1]) / 1_000_000
+                    progress.update(current_seconds, duration, speed_override=speed_x)
                 except Exception:
                     pass
+
     code = proc.wait()
     if code != 0:
         tail = "\n".join(lines[-30:])
         raise AppError("E420", "فشل ضغط الملف.", tail)
+
+    progress.finish(duration, speed_override=speed_x)
+
+
+async def download_media_fast(client, msg, path: Path):
+    size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
+    progress = LiveProgress("تنزيل", "⬇️")
+
+    if size >= TURBO_THRESHOLD and getattr(msg, "document", None):
+        downloader = None
+        try:
+            import aiofiles
+            from aiofasttelethonhelper.core.transfer import ParallelTransferrer
+            from telethon.utils import get_input_location
+
+            dc_id, location = get_input_location(msg.document)
+            downloader = ParallelTransferrer(client, dc_id)
+            chunks = downloader.download(
+                location,
+                size,
+                part_size_kb=TURBO_PART_KB,
+                connection_count=TURBO_CONNECTIONS,
+            )
+
+            print(f"⚡ تنزيل سريع — {TURBO_CONNECTIONS} اتصالات")
+            async with aiofiles.open(str(path), "wb") as out:
+                done = 0
+                async for chunk in chunks:
+                    await out.write(chunk)
+                    done += len(chunk)
+                    progress.update(done, size)
+
+            progress.finish(size)
+            return str(path), "turbo"
+
+        except Exception:
+            try:
+                if downloader is not None and getattr(downloader, "senders", None):
+                    await downloader._cleanup()
+            except Exception:
+                pass
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            print("↪️ تعذر التنزيل السريع؛ هنكمل تلقائيًا بالطريقة العادية.")
+
+    downloaded = await client.download_media(
+        msg,
+        file=str(path),
+        progress_callback=progress.callback,
+    )
+    if downloaded:
+        progress.finish(size or Path(downloaded).stat().st_size)
+    return downloaded, "normal"
+
 
 
 def encode_audio(src: Path, dst: Path, info: MediaInfo):
@@ -444,6 +617,49 @@ def video_filter(info: MediaInfo, max_w: int, max_h: int, fps_cap: int) -> str:
     )
 
 
+def classify_video_complexity(src: Path, info: MediaInfo) -> str:
+    if info.duration <= 8:
+        return "NORMAL"
+
+    points = [max(0.0, info.duration * 0.20), max(0.0, info.duration * 0.65)]
+    rates = []
+
+    print("🧠 تحليل سريع لطبيعة المحاضرة...")
+    for i, start in enumerate(points, 1):
+        sample = TMP_DIR / f"sample_{src.stem}_{i}_{int(time.time() * 1000)}.mp4"
+        sample_len = min(4.0, max(1.0, info.duration - start))
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", f"{start:.2f}", "-i", str(src),
+            "-t", f"{sample_len:.2f}",
+            "-an",
+            "-vf", "scale='min(640,iw)':'min(360,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,fps=8",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+            "-pix_fmt", "yuv420p",
+            str(sample),
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            if proc.returncode == 0 and sample.exists() and sample_len > 0:
+                kbps = sample.stat().st_size * 8 / sample_len / 1000
+                rates.append(kbps)
+        finally:
+            try:
+                sample.unlink()
+            except FileNotFoundError:
+                pass
+
+    if not rates:
+        return "NORMAL"
+
+    average = sum(rates) / len(rates)
+    if average < 220:
+        return "STATIC"
+    if average < 420:
+        return "NORMAL"
+    return "DETAIL"
+
+
 def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb: int | None, nvenc: bool):
     if not info.has_video:
         raise AppError("E411", "هذا الملف لا يحتوي على فيديو.")
@@ -459,7 +675,7 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
             str(dst),
         ]
         run_ffmpeg(cmd, info.duration, "ضغط الفيديو")
-        return
+        return "SMALLEST"
 
     if profile == "VIDEO_TARGET_SIZE":
         target_mb = int(target_mb or 100)
@@ -492,7 +708,7 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
             str(dst),
         ]
         try:
-            run_ffmpeg(first, info.duration, "تحليل الفيديو")
+            run_ffmpeg(first, info.duration, "تحليل الحجم")
             run_ffmpeg(second, info.duration, "ضغط الفيديو")
         finally:
             for p in TMP_DIR.glob(Path(passlog).name + "*"):
@@ -500,22 +716,35 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
                     p.unlink()
                 except Exception:
                     pass
-        return
+        return "TARGET"
 
     if profile == "VIDEO_FAST":
-        vf = video_filter(info, 1280, 720, 18)
+        complexity = "FAST"
+        fps_cap = 18
         gpu_codec = [
             "-c:v", "h264_nvenc", "-preset", "p3",
             "-rc", "vbr", "-cq", "31", "-b:v", "0",
         ]
         cpu_codec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "31"]
     else:
-        vf = video_filter(info, 1280, 720, 15)
+        complexity = classify_video_complexity(src, info)
+        if complexity == "STATIC":
+            fps_cap, gpu_cq, cpu_crf = 12, 31, 30
+            print("📄 المحتوى ثابت غالبًا — هنقلل الفريمات بدون ما نضيّع وضوح الشرائح.")
+        elif complexity == "DETAIL":
+            fps_cap, gpu_cq, cpu_crf = 18, 28, 27
+            print("🔎 المحتوى فيه تفاصيل — هنحافظ على جودة أعلى.")
+        else:
+            fps_cap, gpu_cq, cpu_crf = 15, 30, 29
+            print("🎓 محتوى محاضرة عادي — إعداد متوازن.")
+
         gpu_codec = [
             "-c:v", "h264_nvenc", "-preset", "p4",
-            "-rc", "vbr", "-cq", "30", "-b:v", "0",
+            "-rc", "vbr", "-cq", str(gpu_cq), "-b:v", "0",
         ]
-        cpu_codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "29"]
+        cpu_codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(cpu_crf)]
+
+    vf = video_filter(info, 1280, 720, fps_cap)
 
     def build_cmd(codec):
         return [
@@ -530,38 +759,54 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
     if nvenc:
         try:
             run_ffmpeg(build_cmd(gpu_codec), info.duration, "ضغط الفيديو")
-            return
+            return complexity
         except AppError:
-            print("⚠️ تعذر استخدام كارت الشاشة لهذا الملف — سيتم التحويل إلى CPU تلقائيًا.")
+            print("↪️ كارت الشاشة ما نفعش مع الملف ده؛ هنكمل تلقائيًا على CPU.")
             try:
                 dst.unlink()
             except FileNotFoundError:
                 pass
 
     run_ffmpeg(build_cmd(cpu_codec), info.duration, "ضغط الفيديو")
+    return complexity
+
 
 
 def parse_rerun_command(text: str):
     text = (text or "").strip()
-    if not text.startswith("🔁"):
-        return None
+    normalized = text.replace("ـ", "").strip()
 
-    rest = text[1:].strip()
-    if not rest:
+    same = {"1", "إعادة", "اعادة", "🔁"}
+    smaller = {"2", "أصغر", "اصغر", "🔁 أصغر", "🔁 اصغر"}
+    audio = {"3", "صوت", "🔁 صوت"}
+
+    if normalized in same:
         return {"profile": None, "target_mb": None}
-    if "صوت" in rest:
-        return {"profile": "AUDIO_TINY", "target_mb": None}
-    if "أصغر" in rest or "اصغر" in rest:
+    if normalized in smaller:
         return {"profile": "VIDEO_SMALLEST", "target_mb": None}
-    if "سريع" in rest:
-        return {"profile": "VIDEO_FAST", "target_mb": None}
-    if "متوازن" in rest:
-        return {"profile": "VIDEO_BALANCED", "target_mb": None}
+    if normalized in audio:
+        return {"profile": "AUDIO_TINY", "target_mb": None}
 
-    match = re.search(r"(\d{1,5})", rest)
+    match = re.fullmatch(r"(\d{1,5})(?:\s*(?:mb|مب|ميجا))?", normalized, flags=re.IGNORECASE)
     if match:
-        return {"profile": "VIDEO_TARGET_SIZE", "target_mb": int(match.group(1))}
-    return {"profile": None, "target_mb": None}
+        value = int(match.group(1))
+        if value > 3:
+            return {"profile": "VIDEO_TARGET_SIZE", "target_mb": value}
+
+    # Backward compatibility with older verbose commands.
+    if normalized.startswith("🔁"):
+        rest = normalized[1:].strip()
+        if "صوت" in rest:
+            return {"profile": "AUDIO_TINY", "target_mb": None}
+        if "أصغر" in rest or "اصغر" in rest:
+            return {"profile": "VIDEO_SMALLEST", "target_mb": None}
+        match = re.search(r"(\d{1,5})", rest)
+        if match:
+            return {"profile": "VIDEO_TARGET_SIZE", "target_mb": int(match.group(1))}
+        return {"profile": None, "target_mb": None}
+
+    return None
+
 
 
 def message_media_kind(msg):
@@ -576,7 +821,7 @@ def message_media_kind(msg):
 
 def looks_like_generated_output(msg):
     text = (getattr(msg, "message", "") or "").strip()
-    return bool(re.match(r"^✅\s*v\d+\s*•", text))
+    return bool(re.match(r"^✅\s*(?:v\d+\s*•|تم\s*•)", text))
 
 
 def resolve_profile(msg, explicit=None):
@@ -598,30 +843,53 @@ def target_size_from_ui():
     return value
 
 
-async def progress_download(current, total, started, label):
-    now = time.time()
-    if not hasattr(progress_download, "_last"):
-        progress_download._last = 0
-    if now - progress_download._last < 2 and current < total:
-        return
-    progress_download._last = now
-    pct = (current / total * 100) if total else 0
-    speed = current / max(now - started, 0.1) / 1024 / 1024
-    print(f"   {label}: {pct:5.1f}% — {speed:.1f} MB/s")
+async def show_recent_operations(client, channel):
+    messages = await client.get_messages(channel, limit=120)
+    recent = [
+        msg for msg in messages
+        if message_media_kind(msg) and looks_like_generated_output(msg)
+    ][:5]
+
+    try:
+        from IPython.display import HTML, display
+
+        if recent:
+            items = []
+            for msg in recent:
+                lines = [line.strip() for line in (msg.message or "").splitlines() if line.strip()]
+                title = lines[1] if len(lines) > 1 else f"عملية #{msg.id}"
+                stats = lines[2] if len(lines) > 2 else ""
+                items.append(
+                    f'<div style="padding:5px 0;border-bottom:1px solid #e5e7eb">'
+                    f'<b>{html.escape(title[:90])}</b>'
+                    f'{f"<br><span style=\"color:#4b5563\">{html.escape(stats[:120])}</span>" if stats else ""}'
+                    f'</div>'
+                )
+            history = "".join(items)
+        else:
+            history = '<div style="color:#6b7280">لسه مفيش عمليات سابقة.</div>'
+
+        display(HTML(
+            '<div dir="rtl" style="max-width:760px;padding:14px 16px;border:1px solid #d0d7de;'
+            'border-radius:12px;background:#f8fafc;font-family:Arial,sans-serif;line-height:1.8">'
+            '<b>✅ مفيش ملفات جديدة</b><br>'
+            '<span style="color:#4b5563">آخر العمليات:</span>'
+            f'{history}'
+            '<div style="margin-top:10px"><b>عايز تعالج نتيجة تاني؟</b> '
+            'رد عليها بـ <code>1</code> لنفس الإعداد، <code>2</code> لأصغر حجم، '
+            '<code>3</code> للصوت فقط، أو اكتب الحجم مثل <code>80</code>.</div>'
+            '</div>'
+        ))
+    except Exception:
+        print("✅ مفيش ملفات جديدة.")
+        if recent:
+            print("آخر العمليات:")
+            for msg in recent:
+                lines = [line.strip() for line in (msg.message or "").splitlines() if line.strip()]
+                print("•", " — ".join(lines[1:3])[:140])
+        print("لإعادة نتيجة: رد بـ 1 أو 2 أو 3، أو رقم الحجم مثل 80.")
 
 
-def make_progress(label):
-    started = time.time()
-    last = {"t": 0.0}
-    def callback(current, total):
-        now = time.time()
-        if now - last["t"] < 2 and current < total:
-            return
-        last["t"] = now
-        pct = (current / total * 100) if total else 0
-        speed = current / max(now - started, 0.1) / 1024 / 1024
-        print(f"   {label}: {pct:5.1f}% — {speed:.1f} MB/s")
-    return callback
 
 
 async def ensure_workspace(client, config):
@@ -629,7 +897,7 @@ async def ensure_workspace(client, config):
 
     async def find_existing_workspace():
         async for dialog in client.iter_dialogs():
-            if (dialog.name or "").strip() != WORKSPACE_TITLE:
+            if (dialog.name or "").strip() not in WORKSPACE_ALIASES:
                 continue
             entity = dialog.entity
             rights = getattr(entity, "admin_rights", None)
@@ -665,7 +933,7 @@ async def ensure_workspace(client, config):
 
     if channel is None:
         print()
-        print("📦 إنشاء مساحة العمل الخاصة بك...")
+        print("🎓 إنشاء مساحة ضغط المحاضرات...")
 
         last_error = None
         for attempt, delay in enumerate((0, 3, 7, 15), 1):
@@ -677,7 +945,7 @@ async def ensure_workspace(client, config):
                 result = await client(
                     functions.channels.CreateChannelRequest(
                         title=WORKSPACE_TITLE,
-                        about="مساحة خاصة لضغط ملفات الصوت والفيديو عبر Google Colab.",
+                        about="مساحة خاصة لضغط صوت وفيديو المحاضرات عبر Google Colab.",
                         broadcast=True,
                         megagroup=False,
                     )
@@ -688,9 +956,6 @@ async def ensure_workspace(client, config):
 
             except Exception as exc:
                 last_error = exc
-
-                # أحيانًا Telegram ينشئ القناة ثم يفشل الرد نفسه.
-                # نتأكد قبل أي retry حتى لا ننشئ قنوات مكررة.
                 try:
                     channel = await find_existing_workspace()
                 except Exception:
@@ -703,13 +968,11 @@ async def ensure_workspace(client, config):
                 seconds = int(getattr(exc, "seconds", 0) or 0)
                 if seconds:
                     if seconds <= 60 and attempt < 4:
-                        wait_for = max(seconds, 1)
-                        print(f"⏳ Telegram طلب الانتظار {wait_for} ثانية...")
-                        await asyncio.sleep(wait_for)
+                        await asyncio.sleep(max(seconds, 1))
                         continue
                     raise AppError(
                         "E131",
-                        f"Telegram طلب الانتظار {seconds} ثانية قبل إنشاء القناة. جرّب التشغيل بعد انتهاء المدة.",
+                        f"Telegram طلب الانتظار {seconds} ثانية قبل إنشاء القناة. جرّب بعد انتهاء المدة.",
                         repr(exc),
                     )
 
@@ -720,41 +983,55 @@ async def ensure_workspace(client, config):
                 if error_name == "ChannelsTooMuchError" or "CHANNELS_TOO_MUCH" in error_upper:
                     raise AppError(
                         "E132",
-                        "حساب Telegram وصل لحد القنوات أو المجموعات المسموح بها. قلّل عدد القنوات/المجموعات في الحساب ثم شغّل الأداة مرة أخرى.",
+                        "حساب Telegram وصل لحد القنوات أو المجموعات المسموح بها.",
                         repr(exc),
                     )
 
                 if error_name == "UserRestrictedError" or "USER_RESTRICTED" in error_upper:
                     raise AppError(
                         "E133",
-                        "Telegram مانع الحساب حاليًا من إنشاء قنوات أو مجموعات. راجع حالة الحساب من @SpamBot داخل Telegram ثم جرّب مرة أخرى.",
+                        "Telegram مانع الحساب حاليًا من إنشاء قنوات أو مجموعات. راجع @SpamBot.",
                         repr(exc),
                     )
 
                 transient = error_name in {
-                    "RpcCallFailError",
-                    "ServerError",
-                    "TimedOutError",
-                    "TimeoutError",
+                    "RpcCallFailError", "ServerError", "TimedOutError", "TimeoutError"
                 } or "internal issues" in error_text.lower() or "try again later" in error_text.lower()
 
                 if not transient:
                     safe_reason = re.sub(r"[^A-Za-z0-9_ -]", "", error_name)[:80] or "TelegramError"
                     raise AppError(
                         "E134",
-                        f"Telegram رفض إنشاء القناة تلقائيًا. نوع الخطأ: {safe_reason}. لو تقدر تنشئ قناة خاصة باسم «📦 Smart Compressor» يدويًا، اعملها ثم شغّل الأداة مرة أخرى.",
+                        f"Telegram رفض إنشاء القناة تلقائيًا ({safe_reason}).",
                         repr(exc),
                     )
 
         if channel is None:
             raise AppError(
                 "E130",
-                "Telegram واجه مشكلة مؤقتة أثناء إنشاء القناة. تسجيل الدخول محفوظ؛ شغّل الخلية مرة أخرى بعد دقيقة.",
+                "Telegram واجه مشكلة مؤقتة أثناء إنشاء القناة. تسجيل الدخول محفوظ؛ جرّب بعد دقيقة.",
                 repr(last_error),
             )
 
+    # Rename only our exact old default title; never overwrite a user's custom title.
+    if (getattr(channel, "title", "") or "").strip() in {"📦 Smart Compressor", "Smart Compressor"}:
+        try:
+            await client(functions.channels.EditTitleRequest(channel=channel, title=WORKSPACE_TITLE))
+            channel = await client.get_entity(channel)
+        except Exception:
+            pass
+
     config["workspace_id"] = int(channel.id)
     save_json(CONFIG_PATH, config)
+
+    instructions = (
+        "🎓 <b>ضغط المحاضرات</b>\n\n"
+        "ابعت ملف صوت أو فيديو هنا، وبعدها افتح Colab واضغط تشغيل.\n\n"
+        f'<a href="{COLAB_URL}">▶ افتح Colab</a>\n\n'
+        "<b>إعادة نتيجة قديمة</b> — اعمل Reply عليها برقم:\n"
+        "<code>1</code> نفس الإعداد  •  <code>2</code> أصغر  •  <code>3</code> صوت فقط\n"
+        "لحجم محدد: اكتب الرقم مباشرة، مثال <code>80</code>."
+    )
 
     instruction = None
     instruction_id = config.get("workspace_instruction_id")
@@ -764,21 +1041,24 @@ async def ensure_workspace(client, config):
         except Exception:
             instruction = None
 
-    if not instruction:
-        instructions = (
-            "📦 Smart Compressor\n\n"
-            "الاستخدام العادي:\n"
-            "1) ابعت أي ملف صوت أو فيديو هنا.\n"
-            "2) افتح ملف Colab واضغط تشغيل.\n"
-            "3) النتيجة هتظهر هنا تلقائيًا.\n\n"
-            "إعادة معالجة نتيجة قديمة:\n"
-            "🔁  = نفس الإعداد الحالي\n"
-            "🔁 أصغر  = ضغط فيديو أقوى\n"
-            "🔁 صوت  = استخراج صوت صغير جدًا\n"
-            "🔁 80  = محاولة الوصول إلى 80 MB تقريبًا\n\n"
-            "النتائج التي يصنعها البرنامج لا يعيد ضغطها تلقائيًا."
+    if instruction:
+        try:
+            instruction = await client.edit_message(
+                channel,
+                instruction,
+                instructions,
+                parse_mode="html",
+                link_preview=False,
+            )
+        except Exception:
+            pass
+    else:
+        instruction = await client.send_message(
+            channel,
+            instructions,
+            parse_mode="html",
+            link_preview=False,
         )
-        instruction = await client.send_message(channel, instructions)
         config["workspace_instruction_id"] = int(instruction.id)
         save_json(CONFIG_PATH, config)
 
@@ -799,8 +1079,10 @@ async def ensure_workspace(client, config):
         pass
 
     if created:
-        print("✅ تم إنشاء قناة «📦 Smart Compressor» وحفظها للاستخدام القادم.")
+        print(f"✅ تم إنشاء قناة «{WORKSPACE_TITLE}» وحفظها للاستخدام القادم.")
     return channel, created
+
+
 
 
 async def collect_queue(client, channel, state):
@@ -813,8 +1095,6 @@ async def collect_queue(client, channel, state):
     jobs = []
     rerun_source_ids = set()
 
-    # Self-heal state if Colab stopped after Telegram accepted an output
-    # but before the local state file was saved.
     for msg in messages:
         if message_media_kind(msg) and looks_like_generated_output(msg):
             outputs.add(int(msg.id))
@@ -876,53 +1156,104 @@ async def collect_queue(client, channel, state):
     return jobs
 
 
-async def process_job(client, channel, state, job, nvenc: bool, index: int, total: int):
-    from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
-
+async def prepare_job(client, job, index: int, total: int):
     msg = job["source"]
-    command_msg = job["command"]
-
-    parent_lineage = state.get("lineage", {}).get(str(msg.id), {})
-    root_id = int(parent_lineage.get("root_id", msg.id))
-    version = int(parent_lineage.get("version", 0)) + 1
-
     original_name = getattr(getattr(msg, "file", None), "name", None)
     ext = getattr(getattr(msg, "file", None), "ext", None) or ""
     name = clean_name(original_name, f"telegram_{msg.id}{ext}")
     src = TMP_DIR / f"{msg.id}_{int(time.time() * 1000)}_{name}"
+    started_at = time.time()
 
     print()
-    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print(f"📄 ملف {index} من {total}")
-    print(f"الاسم: {name}")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"📄 ملف {index} من {total} — {name}")
 
     try:
-        downloaded = await client.download_media(
-            msg,
-            file=str(src),
-            progress_callback=make_progress("تنزيل"),
-        )
+        downloaded, mode = await download_media_fast(client, msg, src)
         if not downloaded:
             raise AppError("E401", "تعذر تنزيل الملف من Telegram.")
         src = Path(downloaded)
-        info = ffprobe(src)
+        return {
+            "job": job,
+            "msg": msg,
+            "name": name,
+            "src": src,
+            "info": ffprobe(src),
+            "started_at": started_at,
+            "download_mode": mode,
+            "error": None,
+        }
+    except AppError as exc:
+        try:
+            if src.exists():
+                src.unlink()
+        except Exception:
+            pass
+        return {"job": job, "msg": msg, "name": name, "src": src, "error": exc, "started_at": started_at}
+    except Exception as exc:
+        try:
+            if src.exists():
+                src.unlink()
+        except Exception:
+            pass
+        return {
+            "job": job,
+            "msg": msg,
+            "name": name,
+            "src": src,
+            "error": AppError("E401", "تعذر تنزيل الملف من Telegram.", traceback.format_exc()),
+            "started_at": started_at,
+        }
 
+
+
+
+async def process_job(client, channel, state, prepared, nvenc: bool, index: int, total: int):
+    from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
+
+    job = prepared["job"]
+    msg = prepared["msg"]
+    command_msg = job["command"]
+    src = Path(prepared["src"])
+    name = prepared["name"]
+    started_at = prepared.get("started_at", time.time())
+    dst = None
+
+    if prepared.get("error"):
+        exc = prepared["error"]
+        print(f"⚠️ {exc.code} — {exc.message}")
+        if exc.details:
+            ERROR_LOG.write_text(exc.details, encoding="utf-8")
+        try:
+            await client.send_message(channel, f"⚠️ {exc.code}\n{exc.message}", reply_to=msg.id)
+        except Exception:
+            pass
+        return {"ok": False, "skipped": False, "original": 0, "final": 0}
+
+    info = prepared["info"]
+    parent_lineage = state.get("lineage", {}).get(str(msg.id), {})
+    root_id = int(parent_lineage.get("root_id", msg.id))
+    version = int(parent_lineage.get("version", 0)) + 1
+
+    try:
         profile = resolve_profile(msg, job["profile"])
         target_mb = job["target_mb"]
         if profile == "VIDEO_TARGET_SIZE" and target_mb is None:
             target_mb = target_size_from_ui()
 
         if profile.startswith("VIDEO_") and not info.has_video:
-            print("ℹ️ الملف صوتي، لذلك سيتم استخدام ضغط الصوت بدل إعداد الفيديو.")
+            print("ℹ️ الملف صوتي؛ هنستخدم ضغط الصوت.")
             profile = "AUDIO_TINY"
 
         if profile == "AUDIO_TINY":
             dst = TMP_DIR / f"{src.stem}_compressed.ogg"
-            print("🎧 المعالجة: صوت صغير جدًا")
+            label = "صوت صغير جدًا"
+            print(f"🎧 {label}")
             encode_audio(src, dst, info)
             out_info = ffprobe(dst)
+
             if dst.stat().st_size >= src.stat().st_size * 0.98:
-                raise AppError("E430", "الملف مضغوط بالفعل تقريبًا، وإعادة الضغط لن توفر مساحة مفيدة.")
+                raise AppError("E430", "الملف مضغوط بالفعل تقريبًا؛ إعادة الضغط مش هتوفر مساحة مفيدة.")
 
             title = Path(name).stem[:60]
             attrs = [
@@ -933,38 +1264,68 @@ async def process_job(client, channel, state, job, nvenc: bool, index: int, tota
                     performer="",
                 )
             ]
+
+            original_size = src.stat().st_size
+            final_size = dst.stat().st_size
+            saved_pct = max(0.0, (original_size - final_size) / original_size * 100) if original_size else 0
+            elapsed = time.time() - started_at
+            caption = (
+                f"✅ تم • {label}\n"
+                f"{Path(name).stem}\n"
+                f"{human_size(original_size)} → {human_size(final_size)} • وفر {saved_pct:.0f}%\n"
+                f"⏱ {_format_duration(elapsed)}"
+            )
+
+            upload = LiveProgress("رفع", "⬆️")
             sent = await client.send_file(
                 channel,
                 str(dst),
-                caption=f"✅ v{version} • صوت صغير جدًا\n{title}\n{human_size(src.stat().st_size)} → {human_size(dst.stat().st_size)}",
+                caption=caption,
                 attributes=attrs,
                 mime_type="audio/ogg",
                 voice_note=False,
                 force_document=False,
                 reply_to=msg.id,
-                progress_callback=make_progress("رفع"),
+                progress_callback=upload.callback,
             )
+            upload.finish(final_size)
+
         else:
             dst = TMP_DIR / f"{src.stem}_compressed.mp4"
             labels = {
                 "VIDEO_BALANCED": "فيديو متوازن",
                 "VIDEO_FAST": "فيديو سريع",
-                "VIDEO_SMALLEST": "أصغر حجم للفيديو",
-                "VIDEO_TARGET_SIZE": f"حجم مستهدف: {target_mb} MB",
+                "VIDEO_SMALLEST": "أصغر حجم",
+                "VIDEO_TARGET_SIZE": f"حجم مستهدف {target_mb} MB",
             }
-            print(f"🎬 المعالجة: {labels.get(profile, profile)}")
+            label = labels.get(profile, profile)
+            print(f"🎬 {label}")
             if profile in ("VIDEO_BALANCED", "VIDEO_FAST") and nvenc:
-                print("⚡ سيتم استخدام كارت الشاشة في ترميز الفيديو.")
-            encode_video(src, dst, info, profile, target_mb, nvenc)
+                print("⚡ كارت الشاشة متاح للترميز.")
 
+            complexity = encode_video(src, dst, info, profile, target_mb, nvenc)
             if dst.stat().st_size >= src.stat().st_size * 0.98:
-                raise AppError("E430", "الملف مضغوط بالفعل تقريبًا، وإعادة الضغط لن توفر مساحة مفيدة.")
+                raise AppError("E430", "الملف مضغوط بالفعل تقريبًا؛ إعادة الضغط مش هتوفر مساحة مفيدة.")
 
             out_info = ffprobe(dst)
+            original_size = src.stat().st_size
+            final_size = dst.stat().st_size
+            saved_pct = max(0.0, (original_size - final_size) / original_size * 100) if original_size else 0
+            elapsed = time.time() - started_at
+            quality_hint = f"{out_info.height}p" if out_info.height else ""
+            caption = (
+                f"✅ تم • {label}\n"
+                f"{Path(name).stem}\n"
+                f"{human_size(original_size)} → {human_size(final_size)} • وفر {saved_pct:.0f}%\n"
+                f"⏱ {_format_duration(elapsed)}"
+                + (f" • {quality_hint}" if quality_hint else "")
+            )
+
+            upload = LiveProgress("رفع", "⬆️")
             sent = await client.send_file(
                 channel,
                 str(dst),
-                caption=f"✅ v{version} • {labels.get(profile, profile)}\n{Path(name).stem}\n{human_size(src.stat().st_size)} → {human_size(dst.stat().st_size)}",
+                caption=caption,
                 force_document=False,
                 mime_type="video/mp4",
                 supports_streaming=True,
@@ -977,8 +1338,9 @@ async def process_job(client, channel, state, job, nvenc: bool, index: int, tota
                     )
                 ],
                 reply_to=msg.id,
-                progress_callback=make_progress("رفع"),
+                progress_callback=upload.callback,
             )
+            upload.finish(final_size)
 
         state["output_ids"].append(int(sent.id))
         state["lineage"][str(sent.id)] = {
@@ -995,13 +1357,19 @@ async def process_job(client, channel, state, job, nvenc: bool, index: int, tota
             state["command_ids"].append(int(command_msg.id))
 
         save_json(STATE_PATH, state)
-        saved = max(0, src.stat().st_size - dst.stat().st_size)
-        print(f"✅ تم. التوفير: {human_size(saved)}")
+
+        if command_msg:
+            try:
+                await client.delete_messages(channel, [int(command_msg.id)])
+            except Exception:
+                pass
+
+        print(f"✅ تم — {human_size(original_size)} → {human_size(final_size)}")
         return {
             "ok": True,
             "skipped": False,
-            "original": src.stat().st_size,
-            "final": dst.stat().st_size,
+            "original": original_size,
+            "final": final_size,
         }
 
     except AppError as exc:
@@ -1011,58 +1379,51 @@ async def process_job(client, channel, state, job, nvenc: bool, index: int, tota
             state["processed_source_ids"].append(int(msg.id))
         if command_msg and command_msg.id not in state["command_ids"]:
             state["command_ids"].append(int(command_msg.id))
-
         save_json(STATE_PATH, state)
 
         try:
             await client.send_message(
                 channel,
-                f"ℹ️ {exc.code}\n{exc.message}" if skipped else f"⚠️ {exc.code}\n{exc.message}",
+                f"ℹ️ {exc.message}" if skipped else f"⚠️ {exc.code}\n{exc.message}",
                 reply_to=msg.id,
             )
         except Exception:
             pass
 
-        print(
-            f"ℹ️ {exc.code} — {exc.message}"
-            if skipped
-            else f"⚠️ {exc.code} — {exc.message}"
-        )
+        if command_msg and skipped:
+            try:
+                await client.delete_messages(channel, [int(command_msg.id)])
+            except Exception:
+                pass
+
+        print(f"{'ℹ️' if skipped else '⚠️'} {exc.code} — {exc.message}")
         if exc.details:
             ERROR_LOG.write_text(exc.details, encoding="utf-8")
-        return {
-            "ok": False,
-            "skipped": skipped,
-            "original": 0,
-            "final": 0,
-        }
+        return {"ok": False, "skipped": skipped, "original": 0, "final": 0}
 
-    except Exception as exc:
+    except Exception:
         details = traceback.format_exc()
         ERROR_LOG.write_text(details, encoding="utf-8")
         try:
             await client.send_message(
                 channel,
-                "❌ E900\nحصل خطأ غير متوقع أثناء معالجة الملف. الملف الأصلي لم يتأثر.",
+                "❌ حصل خطأ أثناء معالجة الملف. الملف الأصلي لم يتأثر.",
                 reply_to=msg.id,
             )
         except Exception:
             pass
-        print("❌ E900 — حصل خطأ غير متوقع. تم حفظ التفاصيل في Google Drive.")
+        print("❌ E900 — حصل خطأ غير متوقع. التفاصيل محفوظة في Google Drive.")
         return {"ok": False, "skipped": False, "original": 0, "final": 0}
 
     finally:
-        for path in (src,):
+        for path in (src, dst):
             try:
-                if path.exists():
-                    path.unlink()
+                if path and Path(path).exists():
+                    Path(path).unlink()
             except Exception:
                 pass
-        for path in TMP_DIR.glob(f"{src.stem}_compressed.*"):
-            try:
-                path.unlink()
-            except Exception:
-                pass
+
+
 
 
 async def app():
@@ -1111,7 +1472,7 @@ async def app():
 
         channel, _created = await ensure_workspace(client, config)
         state = migrate_old_state(channel, state)
-        print(f"✅ مساحة العمل جاهزة: {WORKSPACE_TITLE}")
+        print(f"✅ القناة جاهزة: {WORKSPACE_TITLE}")
 
         try:
             client.session.save()
@@ -1121,18 +1482,13 @@ async def app():
             shutil.copy2(local_session_file, persistent_session)
 
         nvenc = detect_nvenc()
-        if nvenc:
-            print("⚡ تم اكتشاف كارت شاشة مناسب لتسريع الفيديو.")
-        else:
-            print("💻 سيتم استخدام المعالج في ضغط الفيديو.")
+        print("⚡ GPU متاح." if nvenc else "💻 هنستخدم CPU للفيديو.")
 
         jobs = await collect_queue(client, channel, state)
         save_json(STATE_PATH, state)
 
         if not jobs:
-            print()
-            print("✅ لا توجد ملفات جديدة تحتاج معالجة.")
-            print("ابعت ملفًا في قناة «📦 Smart Compressor» ثم شغّل الخلية مرة أخرى.")
+            await show_recent_operations(client, channel)
             return
 
         print()
@@ -1140,12 +1496,22 @@ async def app():
         started = time.time()
         results = []
 
+        # Pipeline: while file N is being compressed/uploaded, file N+1 downloads.
+        current_download = asyncio.create_task(prepare_job(client, jobs[0], 1, len(jobs)))
+
         for idx, job in enumerate(jobs, 1):
+            prepared = await current_download
+
+            if idx < len(jobs):
+                current_download = asyncio.create_task(
+                    prepare_job(client, jobs[idx], idx + 1, len(jobs))
+                )
+
             result = await process_job(
                 client,
                 channel,
                 state,
-                job,
+                prepared,
                 nvenc=nvenc,
                 index=idx,
                 total=len(jobs),
@@ -1158,24 +1524,13 @@ async def app():
         original = sum(r["original"] for r in results)
         final = sum(r["final"] for r in results)
         saved_pct = ((original - final) / original * 100) if original else 0
-        elapsed = int(time.time() - started)
-        minutes, seconds = divmod(elapsed, 60)
+        elapsed = time.time() - started
 
-        summary = (
-            "✅ انتهت الدفعة\n\n"
-            f"تم بنجاح: {ok}\n"
-            f"تم تخطيه: {skipped}\n"
-            f"فشل: {failed}\n"
-            f"الحجم قبل: {human_size(original)}\n"
-            f"الحجم بعد: {human_size(final)}\n"
-            f"التوفير: {saved_pct:.1f}%\n"
-            f"الوقت: {minutes} دقيقة و {seconds} ثانية"
-        )
-        await client.send_message(channel, summary)
         print()
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        print(summary)
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(
+            f"✅ خلصنا — نجاح {ok} • تخطي {skipped} • فشل {failed}"
+            + (f" • وفر {saved_pct:.0f}% • {_format_duration(elapsed)}" if original else "")
+        )
 
     finally:
         try:
@@ -1186,6 +1541,7 @@ async def app():
                     shutil.copy2(local_session_file, persistent_session)
                 except Exception:
                     pass
+
 
 
 def run():
