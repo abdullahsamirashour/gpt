@@ -1593,9 +1593,13 @@ def display_results(results, hw, source_info, recs):
     desired = [
         "candidate", "group", "status", "speed_x", "speedup_vs_current",
         "estimated_full_encode", "estimated_output_mb", "size_vs_current",
-        "ssim", "ssim_delta", "vmaf", "fps", "notes"
+        "ssim", "ssim_delta", "vmaf", "fps", "fps_ratio_vs_current",
+        "repeats", "timing_cv_pct",
+        "cpu_avg_pct", "gpu_avg_pct", "gpu_encoder_avg_pct", "gpu_vram_peak_mb",
+        "confirm_speed_x", "confirm_estimated_full_encode", "confirm_ssim",
+        "notes"
     ]
-    cols = [c for c in desired if c in df.columns]
+    cols = [name for name in desired if name in df.columns]
     if "status" in df.columns:
         df = df.sort_values(
             by=["status", "speed_x"],
@@ -1614,20 +1618,43 @@ def display_results(results, hw, source_info, recs):
     ))
     display(df[cols])
 
-    fastest = recs.get("fastest_safe")
-    if fastest:
+    general = recs.get("fastest_general")
+    static = recs.get("fastest_static")
+
+    if general:
+        confirm = ""
+        if general.get("confirm_speed_x"):
+            confirm = (
+                f'<br>تأكيد المقطع الأطول: '
+                f'<bdi dir="ltr">{general["confirm_speed_x"]:.2f}x • '
+                f'{general.get("confirm_estimated_full_encode","")}</bdi>'
+            )
         display(HTML(
             '<div dir="rtl" style="max-width:900px;padding:14px 16px;margin:12px 0;'
             'border:1px solid #16a34a;border-radius:12px;background:#f0fdf4;'
             'font-family:Arial,sans-serif;line-height:1.8">'
-            '<b>🏁 أسرع نتيجة ضمن حدود محافظة</b><br>'
-            f'<b>{fastest["candidate"]}</b><br>'
-            f'السرعة: <bdi dir="ltr">{fastest["speed_x"]:.2f}x</bdi> — '
-            f'زمن الفيديو الكامل المتوقع: <bdi dir="ltr">{fastest["estimated_full_encode"]}</bdi><br>'
-            f'الحجم المتوقع: <bdi dir="ltr">{fastest["estimated_output_mb"]:.1f} MB</bdi> — '
-            f'SSIM: <bdi dir="ltr">{fastest["ssim"]:.5f}</bdi>'
+            '<b>🏁 أسرع مرشح عام بدون تقليل FPS</b><br>'
+            f'<b>{general["candidate"]}</b><br>'
+            f'السرعة: <bdi dir="ltr">{general["speed_x"]:.2f}x</bdi> — '
+            f'الزمن المتوقع: <bdi dir="ltr">{general["estimated_full_encode"]}</bdi><br>'
+            f'الحجم المتوقع: <bdi dir="ltr">{general["estimated_output_mb"]:.1f} MB</bdi> — '
+            f'SSIM: <bdi dir="ltr">{general["ssim"]:.5f}</bdi>'
+            f'{confirm}'
             '</div>'
         ))
+
+    if static and static.get("id") != (general or {}).get("id"):
+        display(HTML(
+            '<div dir="rtl" style="max-width:900px;padding:12px 16px;margin:10px 0;'
+            'border:1px solid #f59e0b;border-radius:12px;background:#fffbeb;'
+            'font-family:Arial,sans-serif;line-height:1.8">'
+            '<b>📊 مرشح للمحتوى الثابت/الشرائح فقط</b><br>'
+            f'<b>{static["candidate"]}</b> — '
+            f'<bdi dir="ltr">{static["speed_x"]:.2f}x • {static["estimated_full_encode"]}</bdi><br>'
+            'ده مش توصية عامة لأن تقليل FPS ممكن يؤثر على نعومة الحركة.'
+            '</div>'
+        ))
+
 
 
 def write_report(report_dir, hardware, source_meta, video_info, segments, results, recs, config):
@@ -1655,13 +1682,16 @@ def write_report(report_dir, hardware, source_meta, video_info, segments, result
             for k, v in recs.items()
         },
         "notes": {
-            "quality_metric": "SSIM for all successful single-stream candidates; VMAF only when libvmaf exists.",
+            "quality_metric": "SSIM is spatial quality only. Lower-FPS candidates are reported separately because SSIM alone does not measure motion smoothness fairly.",
+            "timing": "Candidates use a warm-up plus repeated timed runs; speed is based on the median repeat.",
+            "confirmation": "The baseline and best general/static candidates are rechecked on a longer segment in full/max modes.",
+            "gpu": "FFmpeg NVENC, source NVDEC, full CUDA pipeline and NVEncC are diagnosed independently; failures stay visible with their reasons.",
             "audio": "Video encoder benchmark excludes audio encode. Estimated full output adds 48 kbps audio when the source has audio.",
             "safety": "Benchmark notebook never edits the Telegram channel and never uploads benchmark outputs.",
             "sdk_probe": (
                 "PyNvVideoCodec detected"
                 if hardware.get("pynvvideocodec_available")
-                else "PyNvVideoCodec not installed; direct SDK path is recorded as future experiment, not ranked."
+                else "PyNvVideoCodec not installed; direct SDK path remains a future experiment and is not ranked."
             ),
         },
     }
@@ -1681,6 +1711,11 @@ def write_report(report_dir, hardware, source_meta, video_info, segments, result
         f"- Physical cores: {hardware['cpu_physical_cores']}",
         f"- Logical threads: {hardware['cpu_logical_threads']}",
         f"- GPU: {(hardware['gpu'] or {}).get('name', 'None')}",
+        f"- FFmpeg h264_nvenc listed: {hardware.get('ffmpeg_nvenc_encoder_listed')}",
+        f"- FFmpeg NVENC smoke: {hardware.get('ffmpeg_nvenc_smoke_ok')}",
+        f"- Source NVDEC: {hardware.get('source_nvdec_ok')}",
+        f"- Full GPU pipeline: {hardware.get('source_full_gpu_ok')}",
+        f"- NVEncC hardware check: {hardware.get('nvencc_hw_ok')}",
         f"- Source: {source_meta.get('source_name', '')}",
         f"- Duration: {video_info.duration:.2f}s",
         f"- Resolution: {video_info.width}x{video_info.height}",
@@ -1693,20 +1728,46 @@ def write_report(report_dir, hardware, source_meta, video_info, segments, result
         "## Recommendation",
         "",
     ]
-    fastest = recs.get("fastest_safe")
-    if fastest:
+
+    general = recs.get("fastest_general")
+    static = recs.get("fastest_static")
+    target = recs.get("fastest_target")
+
+    if general:
         lines += [
-            f"- Fastest conservative candidate: **{fastest['candidate']}**",
-            f"- Speed: {fastest['speed_x']:.2f}x",
-            f"- Estimated full encode: {fastest['estimated_full_encode']}",
-            f"- Estimated output: {fastest['estimated_output_mb']:.1f} MB",
-            f"- SSIM: {fastest['ssim']:.6f}",
+            f"- Fastest general candidate without lowering FPS: **{general['candidate']}**",
+            f"- Speed: {general['speed_x']:.2f}x",
+            f"- Estimated full encode: {general['estimated_full_encode']}",
+            f"- Estimated output: {general['estimated_output_mb']:.1f} MB",
+            f"- SSIM: {general['ssim']:.6f}",
         ]
+        if general.get("confirm_speed_x"):
+            lines += [
+                f"- Longer confirmation speed: {general['confirm_speed_x']:.2f}x",
+                f"- Longer confirmation estimate: {general.get('confirm_estimated_full_encode')}",
+            ]
     else:
-        lines.append("- No conservative winner could be selected automatically.")
+        lines.append("- No conservative general candidate could be selected automatically.")
+
+    if static:
+        lines += [
+            "",
+            f"- Static/slide-content candidate only: **{static['candidate']}**",
+            f"- Speed: {static['speed_x']:.2f}x",
+            "- Warning: reduced FPS is not treated as a general-quality win.",
+        ]
+
+    if target:
+        lines += [
+            "",
+            f"- Fastest target-size candidate: **{target['candidate']}**",
+            f"- Speed: {target['speed_x']:.2f}x",
+        ]
 
     (report_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
     return payload
+
+
 
 
 async def benchmark_main():
