@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import html
 import importlib.util
 import json
 import math
 import os
 import platform
+import random
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -22,7 +25,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-BENCH_VERSION = "1.0.0"
+BENCH_VERSION = "1.1.0"
 BASE_DIR = Path("/content/drive/MyDrive/Telegram_Extreme_Compressor")
 CONFIG_PATH = BASE_DIR / "config.json"
 SESSION_FILE = BASE_DIR / "telegram_user.session"
@@ -127,24 +130,68 @@ def ffmpeg_has_filter(name: str) -> bool:
         return False
 
 
-def detect_nvenc() -> bool:
-    if not shutil.which("nvidia-smi"):
-        return False
+def probe_command(cmd, timeout=20):
     try:
-        p = subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "color=size=64x64:rate=1",
-                "-frames:v", "1", "-c:v", "h264_nvenc",
-                "-f", "null", "-"
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=20,
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
         )
-        return p.returncode == 0
+        text = (proc.stderr or proc.stdout or "").strip()
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": int(proc.returncode),
+            "reason": text[-1200:] if text else "",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "returncode": None,
+            "reason": f"{type(exc).__name__}: {str(exc)[:1000]}",
+        }
+
+
+def ffmpeg_has_encoder(name: str) -> bool:
+    try:
+        text = run(["ffmpeg", "-hide_banner", "-encoders"]).stdout
+        return bool(re.search(rf"\\b{re.escape(name)}\\b", text))
     except Exception:
         return False
+
+
+def detect_nvenc_details():
+    listed = ffmpeg_has_encoder("h264_nvenc")
+    if not shutil.which("nvidia-smi"):
+        return {
+            "listed": listed,
+            "ok": False,
+            "reason": "nvidia-smi غير موجود؛ لا يوجد NVIDIA GPU متاح للـRuntime.",
+        }
+
+    probe = probe_command(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=size=128x72:rate=10",
+            "-t", "1",
+            "-an",
+            "-c:v", "h264_nvenc",
+            "-preset", "p3",
+            "-f", "null", "-",
+        ],
+        timeout=25,
+    )
+    return {
+        "listed": listed,
+        "ok": bool(probe["ok"]),
+        "reason": probe["reason"],
+    }
+
+
+def detect_nvenc() -> bool:
+    return bool(detect_nvenc_details()["ok"])
+
 
 
 def gpu_info():
@@ -188,7 +235,7 @@ def hardware_info():
     except Exception:
         lscpu_map = {}
 
-    nvenc = detect_nvenc()
+    nvenc = detect_nvenc_details()
     scale_cuda = ffmpeg_has_filter("scale_cuda")
     libvmaf = ffmpeg_has_filter("libvmaf")
 
@@ -209,14 +256,25 @@ def hardware_info():
         "threads_per_core": lscpu_map.get("Thread(s) per core", "?"),
         "ram_gb": round(ram_gb, 2),
         "gpu": gpu,
-        "nvenc_available": nvenc,
+        "ffmpeg_nvenc_encoder_listed": bool(nvenc["listed"]),
+        "ffmpeg_nvenc_smoke_ok": bool(nvenc["ok"]),
+        "ffmpeg_nvenc_smoke_reason": nvenc["reason"],
+        "nvenc_available": bool(nvenc["ok"]),
         "scale_cuda_available": scale_cuda,
         "libvmaf_available": libvmaf,
         "pynvvideocodec_available": importlib.util.find_spec("PyNvVideoCodec") is not None,
+        "source_nvdec_ok": None,
+        "source_nvdec_reason": "",
+        "source_full_gpu_ok": None,
+        "source_full_gpu_reason": "",
+        "nvencc_installed": False,
+        "nvencc_hw_ok": None,
+        "nvencc_hw_reason": "",
         "ffmpeg": ffmpeg_version(),
         "python": sys.version.split()[0],
         "platform": platform.platform(),
     }
+
 
 
 def show_hardware(info):
@@ -240,13 +298,49 @@ def show_hardware(info):
             f'{info["cpu_logical_threads"]} logical threads</bdi><br>'
             f'<b>GPU:</b> <bdi dir="ltr">{gpu_line}</bdi><br>'
             f'<b>RAM:</b> <bdi dir="ltr">{info["ram_gb"]:.1f} GB</bdi><br>'
-            f'<b>NVENC:</b> {"✅" if info["nvenc_available"] else "❌"} &nbsp; '
+            f'<b>FFmpeg h264_nvenc listed:</b> {"✅" if info["ffmpeg_nvenc_encoder_listed"] else "❌"} &nbsp; '
+            f'<b>NVENC smoke:</b> {"✅" if info["ffmpeg_nvenc_smoke_ok"] else "❌"} &nbsp; '
             f'<b>scale_cuda:</b> {"✅" if info["scale_cuda_available"] else "❌"} &nbsp; '
             f'<b>libvmaf:</b> {"✅" if info["libvmaf_available"] else "❌"}'
             '</div>'
         ))
     except Exception:
         print(json.dumps(info, ensure_ascii=False, indent=2))
+
+
+def show_gpu_diagnostics(info):
+    if not info.get("gpu"):
+        return
+    rows = [
+        ("FFmpeg h264_nvenc موجود", info.get("ffmpeg_nvenc_encoder_listed"), ""),
+        ("FFmpeg NVENC smoke", info.get("ffmpeg_nvenc_smoke_ok"), info.get("ffmpeg_nvenc_smoke_reason", "")),
+        ("NVDEC على فيديو المصدر", info.get("source_nvdec_ok"), info.get("source_nvdec_reason", "")),
+        ("Full GPU NVDEC→CUDA→NVENC", info.get("source_full_gpu_ok"), info.get("source_full_gpu_reason", "")),
+        ("NVEncC hardware check", info.get("nvencc_hw_ok"), info.get("nvencc_hw_reason", "")),
+    ]
+    try:
+        from IPython.display import HTML, display
+        html_rows = []
+        for label, ok, reason in rows:
+            mark = "✅" if ok is True else ("❌" if ok is False else "➖")
+            detail = ""
+            if ok is False and reason:
+                clean = html.escape(str(reason).replace("\n", " ")[:260])
+                detail = f'<br><span style="color:#6b7280;font-size:12px"><bdi dir="ltr">{clean}</bdi></span>'
+            html_rows.append(f'<div style="margin:5px 0">{mark} <b>{label}</b>{detail}</div>')
+        display(HTML(
+            '<div dir="rtl" style="max-width:900px;padding:12px 16px;margin:8px 0;'
+            'border:1px solid #d0d7de;border-radius:12px;background:#fff7ed;'
+            'font-family:Arial,sans-serif">'
+            '<b>🧰 تشخيص مسار الـGPU</b>'
+            + "".join(html_rows) +
+            '</div>'
+        ))
+    except Exception:
+        print("GPU diagnostics:")
+        for label, ok, reason in rows:
+            print(label, ok, reason[:300] if reason else "")
+
 
 
 def parse_rate(value):
@@ -294,6 +388,52 @@ def fit_dims(width, height, max_w=1280, max_h=720):
     w = max(2, int(width * ratio) // 2 * 2)
     h = max(2, int(height * ratio) // 2 * 2)
     return w, h
+
+
+
+def diagnose_source_gpu(src: Path, info: VideoInfo, hw):
+    if not hw.get("gpu"):
+        return hw
+
+    start = max(0.0, min(info.duration * 0.25, max(0.0, info.duration - 2.0)))
+    target_w, target_h = fit_dims(info.width, info.height)
+
+    nvdec_probe = probe_command(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-hwaccel", "cuda",
+            "-hwaccel_output_format", "cuda",
+            "-ss", f"{start:.3f}",
+            "-i", str(src),
+            "-t", "1.5",
+            "-an",
+            "-vf", "hwdownload,format=nv12",
+            "-f", "null", "-",
+        ],
+        timeout=30,
+    )
+    hw["source_nvdec_ok"] = bool(nvdec_probe["ok"])
+    hw["source_nvdec_reason"] = nvdec_probe["reason"]
+
+    full_probe = probe_command(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-hwaccel", "cuda",
+            "-hwaccel_output_format", "cuda",
+            "-ss", f"{start:.3f}",
+            "-i", str(src),
+            "-t", "1.5",
+            "-an",
+            "-vf", f"scale_cuda={target_w}:{target_h}",
+            "-c:v", "h264_nvenc",
+            "-preset", "p3",
+            "-f", "null", "-",
+        ],
+        timeout=30,
+    )
+    hw["source_full_gpu_ok"] = bool(full_probe["ok"])
+    hw["source_full_gpu_reason"] = full_probe["reason"]
+    return hw
 
 
 def human_time(seconds):
@@ -564,7 +704,7 @@ def candidate_specs(info: VideoInfo, hw, mode, target_mb):
         },
     ]
 
-    if hw["nvenc_available"]:
+    if hw.get("gpu"):
         specs.append({
             "id": "gpu_nvenc_cpu_filters_p4",
             "label": "FFmpeg NVENC p4 + CPU filters",
@@ -576,7 +716,7 @@ def candidate_specs(info: VideoInfo, hw, mode, target_mb):
             "scale": "default",
             "notes": "مسار GPU التقليدي للمقارنة",
         })
-        if hw["scale_cuda_available"]:
+        if True:
             for preset in ("p4", "p3", "p2", "p1"):
                 specs.append({
                     "id": f"gpu_full_{preset}",
@@ -622,13 +762,34 @@ def should_skip(spec, info, hw, nvencc_path):
     native_fits = info.width <= 1280 and info.height <= 720
     if spec.get("only_if_native") and not native_fits:
         return "المصدر أكبر من 720p؛ تخطي no-resize غير عادل."
-    if spec["backend"].startswith("ffmpeg_nvenc") and not hw["nvenc_available"]:
-        return "NVENC غير متاح في هذا الـRuntime."
-    if spec["backend"] == "ffmpeg_nvenc_full" and not hw["scale_cuda_available"]:
-        return "scale_cuda غير متاح في FFmpeg."
-    if spec["backend"] == "nvencc" and not nvencc_path:
-        return "NVEncC غير مثبت/غير متوافق."
+
+    backend = spec["backend"]
+    if backend == "ffmpeg_nvenc_cpu":
+        if not hw.get("gpu"):
+            return "لا يوجد NVIDIA GPU في الـRuntime."
+        if not hw.get("ffmpeg_nvenc_smoke_ok"):
+            reason = hw.get("ffmpeg_nvenc_smoke_reason") or "FFmpeg NVENC smoke test فشل."
+            return f"FFmpeg NVENC غير صالح: {reason[:260]}"
+
+    if backend == "ffmpeg_nvenc_full":
+        if not hw.get("gpu"):
+            return "لا يوجد NVIDIA GPU في الـRuntime."
+        if not hw.get("source_full_gpu_ok"):
+            reason = hw.get("source_full_gpu_reason") or "Full GPU source probe فشل."
+            return f"Full GPU pipeline غير صالح: {reason[:260]}"
+
+    if backend == "nvencc":
+        if not hw.get("gpu"):
+            return "لا يوجد NVIDIA GPU في الـRuntime."
+        if not nvencc_path:
+            reason = hw.get("nvencc_hw_reason") or "NVEncC غير مثبت."
+            return f"NVEncC غير متاح: {reason[:260]}"
+        if hw.get("nvencc_hw_ok") is False:
+            reason = hw.get("nvencc_hw_reason") or "NVEncC hardware check فشل."
+            return f"NVEncC hardware check فشل: {reason[:260]}"
+
     return None
+
 
 
 def cpu_filter(info, spec):
@@ -739,18 +900,102 @@ def ffmpeg_cmd(spec, src, out, start, dur, info, pass_num=None, passlog=None):
     return cmd
 
 
-def run_process_timed(cmd):
+def sample_gpu_stats():
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,utilization.encoder,memory.used,clocks.sm",
+                "--format=csv,noheader,nounits",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        parts = [x.strip() for x in proc.stdout.strip().splitlines()[0].split(",")]
+        def num(value):
+            value = value.replace("%", "").strip()
+            if value.lower() in {"n/a", "[n/a]", ""}:
+                return None
+            try:
+                return float(value)
+            except Exception:
+                return None
+        return {
+            "gpu_pct": num(parts[0]) if len(parts) > 0 else None,
+            "encoder_pct": num(parts[1]) if len(parts) > 1 else None,
+            "vram_mb": num(parts[2]) if len(parts) > 2 else None,
+            "clock_mhz": num(parts[3]) if len(parts) > 3 else None,
+        }
+    except Exception:
+        return None
+
+
+def run_process_monitored(cmd, monitor_gpu=False):
+    import psutil
+
     started = time.time()
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    elapsed = time.time() - started
+    cpu_samples = []
+    gpu_samples = []
+    psutil.cpu_percent(interval=None)
+    last_gpu = 0.0
+
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        while proc.poll() is None:
+            time.sleep(0.20)
+            try:
+                cpu_samples.append(float(psutil.cpu_percent(interval=None)))
+            except Exception:
+                pass
+            now = time.time()
+            if monitor_gpu and now - last_gpu >= 0.55:
+                sample = sample_gpu_stats()
+                if sample:
+                    gpu_samples.append(sample)
+                last_gpu = now
+
+        proc.wait()
+        elapsed = time.time() - started
+        log.seek(0)
+        output = log.read()
+
     if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or proc.stdout or "unknown error")[-2500:])
-    return elapsed
+        raise RuntimeError((output or "unknown error")[-2500:])
+
+    def avg(values):
+        values = [v for v in values if v is not None]
+        return (sum(values) / len(values)) if values else None
+
+    result = {
+        "elapsed": elapsed,
+        "cpu_avg_pct": avg(cpu_samples),
+        "cpu_peak_pct": max(cpu_samples) if cpu_samples else None,
+        "gpu_avg_pct": avg([s.get("gpu_pct") for s in gpu_samples]),
+        "gpu_encoder_avg_pct": avg([s.get("encoder_pct") for s in gpu_samples]),
+        "gpu_vram_peak_mb": max(
+            [s.get("vram_mb") for s in gpu_samples if s.get("vram_mb") is not None],
+            default=None,
+        ),
+        "gpu_clock_avg_mhz": avg([s.get("clock_mhz") for s in gpu_samples]),
+    }
+    return result
+
+
+def run_process_timed(cmd):
+    return run_process_monitored(cmd, monitor_gpu=False)["elapsed"]
+
 
 
 def output_fps(path):
@@ -814,11 +1059,16 @@ def compute_vmaf(src, start, dur, encoded):
 
 
 def install_nvencc(enabled, hw):
-    if not enabled or not hw["nvenc_available"]:
+    if not enabled or not hw.get("gpu"):
         return None
+
     existing = shutil.which("NVEncC") or shutil.which("nvencc")
     if existing:
-        return existing
+        hw["nvencc_installed"] = True
+        probe = probe_command([existing, "--check-hw", "0"], timeout=30)
+        hw["nvencc_hw_ok"] = bool(probe["ok"])
+        hw["nvencc_hw_reason"] = probe["reason"]
+        return existing if probe["ok"] else existing
 
     print(f"📦 تثبيت NVEncC {NVENCC_VERSION} للبنش مارك فقط...")
     deb = WORK_DIR / f"nvencc_{NVENCC_VERSION}_amd64.deb"
@@ -836,14 +1086,27 @@ def install_nvencc(enabled, hw):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        return shutil.which("NVEncC") or shutil.which("nvencc")
+        path = shutil.which("NVEncC") or shutil.which("nvencc")
+        hw["nvencc_installed"] = bool(path)
+        if path:
+            probe = probe_command([path, "--check-hw", "0"], timeout=30)
+            hw["nvencc_hw_ok"] = bool(probe["ok"])
+            hw["nvencc_hw_reason"] = probe["reason"]
+        else:
+            hw["nvencc_hw_ok"] = False
+            hw["nvencc_hw_reason"] = "تم تثبيت الحزمة لكن لم يتم العثور على NVEncC في PATH."
+        return path
     except Exception as exc:
+        hw["nvencc_installed"] = False
+        hw["nvencc_hw_ok"] = False
+        hw["nvencc_hw_reason"] = f"{type(exc).__name__}: {str(exc)[:1000]}"
         print(f"↪️ NVEncC لم يثبت: {type(exc).__name__}")
         return None
 
 
+
 def nvencc_specs(info, hw, nvencc_path, mode):
-    if not (nvencc_path and hw["nvenc_available"]):
+    if not hw.get("gpu"):
         return []
     base_fps = min(info.fps if info.fps > 0 else 15.0, 15.0)
     presets = ("p4", "p3", "p2", "p1")
@@ -864,6 +1127,7 @@ def nvencc_specs(info, hw, nvencc_path, mode):
     ]
 
 
+
 def nvencc_cmd(spec, nvencc_path, src, out, start, dur, info):
     target_w, target_h = fit_dims(info.width, info.height)
     return [
@@ -880,52 +1144,172 @@ def nvencc_cmd(spec, nvencc_path, src, out, start, dur, info):
     ]
 
 
-def run_single_candidate(spec, src, info, segments, work_dir, nvencc_path, keep_outputs):
-    total_encode = 0.0
-    total_sample = 0.0
-    total_bytes = 0
-    ssims = []
-    outputs = []
+def merge_metrics(items):
+    if not items:
+        return {
+            "elapsed": 0.0,
+            "cpu_avg_pct": None,
+            "cpu_peak_pct": None,
+            "gpu_avg_pct": None,
+            "gpu_encoder_avg_pct": None,
+            "gpu_vram_peak_mb": None,
+            "gpu_clock_avg_mhz": None,
+        }
 
-    for idx, (start, dur) in enumerate(segments, 1):
-        out = work_dir / f"{spec['id']}_seg{idx}.mp4"
-        if out.exists():
-            out.unlink()
+    def mean_key(key):
+        vals = [m.get(key) for m in items if m.get(key) is not None]
+        return (sum(vals) / len(vals)) if vals else None
 
-        if spec["backend"] == "nvencc":
-            cmd = nvencc_cmd(spec, nvencc_path, src, out, start, dur, info)
-            elapsed = run_process_timed(cmd)
-        elif spec["backend"] == "ffmpeg_target_2pass":
-            passlog = work_dir / f"pass_{spec['id']}_{idx}"
-            first = ffmpeg_cmd(spec, src, out, start, dur, info, pass_num=1, passlog=passlog)
-            second = ffmpeg_cmd(spec, src, out, start, dur, info, pass_num=2, passlog=passlog)
-            elapsed = run_process_timed(first) + run_process_timed(second)
+    return {
+        "elapsed": sum(float(m.get("elapsed") or 0.0) for m in items),
+        "cpu_avg_pct": mean_key("cpu_avg_pct"),
+        "cpu_peak_pct": max(
+            [m.get("cpu_peak_pct") for m in items if m.get("cpu_peak_pct") is not None],
+            default=None,
+        ),
+        "gpu_avg_pct": mean_key("gpu_avg_pct"),
+        "gpu_encoder_avg_pct": mean_key("gpu_encoder_avg_pct"),
+        "gpu_vram_peak_mb": max(
+            [m.get("gpu_vram_peak_mb") for m in items if m.get("gpu_vram_peak_mb") is not None],
+            default=None,
+        ),
+        "gpu_clock_avg_mhz": mean_key("gpu_clock_avg_mhz"),
+    }
+
+
+def run_candidate_segment(spec, src, info, start, dur, out, work_dir, nvencc_path):
+    monitor_gpu = spec["backend"] in {"ffmpeg_nvenc_cpu", "ffmpeg_nvenc_full", "nvencc"}
+
+    if spec["backend"] == "nvencc":
+        cmd = nvencc_cmd(spec, nvencc_path, src, out, start, dur, info)
+        return run_process_monitored(cmd, monitor_gpu=monitor_gpu)
+
+    if spec["backend"] == "ffmpeg_target_2pass":
+        passlog = work_dir / f"pass_{spec['id']}_{out.stem}"
+        first = ffmpeg_cmd(spec, src, out, start, dur, info, pass_num=1, passlog=passlog)
+        second = ffmpeg_cmd(spec, src, out, start, dur, info, pass_num=2, passlog=passlog)
+        metrics = []
+        try:
+            metrics.append(run_process_monitored(first, monitor_gpu=False))
+            metrics.append(run_process_monitored(second, monitor_gpu=False))
+        finally:
             for p in work_dir.glob(passlog.name + "*"):
                 try:
                     p.unlink()
                 except Exception:
                     pass
-        else:
-            cmd = ffmpeg_cmd(spec, src, out, start, dur, info)
-            elapsed = run_process_timed(cmd)
+        return merge_metrics(metrics)
 
-        if not out.exists() or out.stat().st_size <= 0:
-            raise RuntimeError("لم يتم إنشاء ملف ناتج صالح.")
+    cmd = ffmpeg_cmd(spec, src, out, start, dur, info)
+    return run_process_monitored(cmd, monitor_gpu=monitor_gpu)
 
-        total_encode += elapsed
-        total_sample += dur
-        total_bytes += out.stat().st_size
-        metric = compute_ssim(src, start, dur, out)
-        if metric is not None:
-            ssims.append(metric)
-        outputs.append((start, dur, out))
 
-    speed_x = total_sample / total_encode if total_encode > 0 else 0.0
+def warmup_candidate(spec, src, info, segments, work_dir, nvencc_path):
+    if spec["backend"] == "ffmpeg_target_2pass":
+        return
+
+    start, dur = segments[0]
+    warm_dur = min(2.0, max(0.8, dur))
+    out = work_dir / f"warmup_{spec['id']}.mp4"
+    try:
+        if out.exists():
+            out.unlink()
+        run_candidate_segment(
+            spec,
+            src,
+            info,
+            start,
+            warm_dur,
+            out,
+            work_dir,
+            nvencc_path,
+        )
+    finally:
+        try:
+            out.unlink()
+        except Exception:
+            pass
+
+
+def run_single_candidate(
+    spec,
+    src,
+    info,
+    segments,
+    work_dir,
+    nvencc_path,
+    keep_outputs,
+    repeats=3,
+    warmup=True,
+):
+    repeats = max(1, int(repeats or 1))
+    total_sample = sum(float(d) for _, d in segments)
+
+    if warmup:
+        warmup_candidate(spec, src, info, segments, work_dir, nvencc_path)
+
+    repeat_times = []
+    repeat_bytes = []
+    process_metrics = []
+    ssims = []
+    outputs = []
+
+    for rep in range(repeats):
+        rep_elapsed = 0.0
+        rep_bytes = 0
+
+        for idx, (start, dur) in enumerate(segments, 1):
+            out = work_dir / f"{spec['id']}_r{rep + 1}_seg{idx}.mp4"
+            if out.exists():
+                out.unlink()
+
+            metrics = run_candidate_segment(
+                spec,
+                src,
+                info,
+                start,
+                dur,
+                out,
+                work_dir,
+                nvencc_path,
+            )
+            process_metrics.append(metrics)
+
+            if not out.exists() or out.stat().st_size <= 0:
+                raise RuntimeError("لم يتم إنشاء ملف ناتج صالح.")
+
+            rep_elapsed += float(metrics.get("elapsed") or 0.0)
+            rep_bytes += out.stat().st_size
+
+            if rep == 0:
+                metric = compute_ssim(src, start, dur, out)
+                if metric is not None:
+                    ssims.append(metric)
+                outputs.append((start, dur, out))
+            else:
+                try:
+                    out.unlink()
+                except Exception:
+                    pass
+
+        repeat_times.append(rep_elapsed)
+        repeat_bytes.append(rep_bytes)
+
+    median_encode = statistics.median(repeat_times)
+    median_bytes = statistics.median(repeat_bytes)
+    speed_x = total_sample / median_encode if median_encode > 0 else 0.0
     full_encode_s = info.duration / speed_x if speed_x > 0 else None
-    # Add production-like 48 kbps audio to the sample-based full size estimate.
-    video_full_bytes = (total_bytes / total_sample) * info.duration if total_sample > 0 else 0
+
+    video_full_bytes = (median_bytes / total_sample) * info.duration if total_sample > 0 else 0
     audio_full_bytes = (48_000 / 8) * info.duration if info.has_audio else 0
     estimated_mb = (video_full_bytes + audio_full_bytes) / (1024 ** 2)
+
+    merged = merge_metrics(process_metrics)
+    timing_cv = None
+    if len(repeat_times) > 1:
+        avg_t = statistics.mean(repeat_times)
+        if avg_t > 0:
+            timing_cv = statistics.pstdev(repeat_times) / avg_t * 100
 
     result = {
         "id": spec["id"],
@@ -935,22 +1319,29 @@ def run_single_candidate(spec, src, info, segments, work_dir, nvencc_path, keep_
         "preset": spec.get("preset", ""),
         "fps": round(float(spec.get("fps") or 0), 2),
         "sample_seconds": round(total_sample, 2),
-        "encode_seconds": round(total_encode, 3),
+        "repeats": repeats,
+        "encode_seconds": round(median_encode, 3),
+        "repeat_encode_seconds": [round(x, 3) for x in repeat_times],
+        "timing_cv_pct": round(timing_cv, 2) if timing_cv is not None else None,
         "speed_x": round(speed_x, 3),
         "estimated_full_encode_seconds": round(full_encode_s, 2) if full_encode_s else None,
         "estimated_full_encode": human_time(full_encode_s) if full_encode_s else None,
         "estimated_output_mb": round(estimated_mb, 2),
         "ssim": round(sum(ssims) / len(ssims), 6) if ssims else None,
         "vmaf": None,
+        "cpu_avg_pct": round(merged["cpu_avg_pct"], 1) if merged["cpu_avg_pct"] is not None else None,
+        "cpu_peak_pct": round(merged["cpu_peak_pct"], 1) if merged["cpu_peak_pct"] is not None else None,
+        "gpu_avg_pct": round(merged["gpu_avg_pct"], 1) if merged["gpu_avg_pct"] is not None else None,
+        "gpu_encoder_avg_pct": round(merged["gpu_encoder_avg_pct"], 1) if merged["gpu_encoder_avg_pct"] is not None else None,
+        "gpu_vram_peak_mb": round(merged["gpu_vram_peak_mb"], 1) if merged["gpu_vram_peak_mb"] is not None else None,
+        "gpu_clock_avg_mhz": round(merged["gpu_clock_avg_mhz"], 1) if merged["gpu_clock_avg_mhz"] is not None else None,
         "status": "ok",
         "notes": spec.get("notes", ""),
         "_outputs": outputs,
     }
 
-    if not keep_outputs:
-        # Delay cleanup until optional VMAF shortlist is calculated.
-        pass
     return result
+
 
 
 def cleanup_result_outputs(result):
@@ -962,7 +1353,7 @@ def cleanup_result_outputs(result):
 
 
 async def gpu_batch_throughput(src, info, hw, work_dir, jobs=2):
-    if not (hw["nvenc_available"] and hw["scale_cuda_available"]):
+    if not hw.get("source_full_gpu_ok"):
         return None
 
     dur = min(20.0, max(6.0, info.duration * 0.1))
@@ -1066,14 +1457,18 @@ def enrich_relative_metrics(results):
     )
     if not baseline:
         return
+
     bspeed = baseline.get("speed_x") or 0
     bsize = baseline.get("estimated_output_mb") or 0
     bssim = baseline.get("ssim")
+    bfps = baseline.get("fps") or 0
+
     for r in results:
         if r.get("status") != "ok":
             continue
         r["speedup_vs_current"] = round((r.get("speed_x") or 0) / bspeed, 3) if bspeed else None
         r["size_vs_current"] = round((r.get("estimated_output_mb") or 0) / bsize, 3) if bsize and r.get("estimated_output_mb") else None
+        r["fps_ratio_vs_current"] = round((r.get("fps") or 0) / bfps, 3) if bfps and r.get("fps") else None
         if bssim is not None and r.get("ssim") is not None:
             r["ssim_delta"] = round(r["ssim"] - bssim, 6)
         else:
@@ -1094,23 +1489,100 @@ def recommendations(results):
 
     bssim = baseline["ssim"]
     bsize = baseline["estimated_output_mb"]
+    bfps = baseline.get("fps") or 15.0
 
-    safe = [
+    general_safe = [
         r for r in normal
-        if r["ssim"] >= bssim - 0.010
+        if r.get("group") not in {"Smart FPS", "Target size", "Duplicate frames"}
+        and (r.get("fps") or bfps) >= bfps * 0.95
+        and r["ssim"] >= bssim - 0.010
         and r["estimated_output_mb"] <= bsize * 1.20
     ]
-    safe.sort(key=lambda r: r["speed_x"], reverse=True)
+    general_safe.sort(key=lambda r: r["speed_x"], reverse=True)
+
+    static_safe = [
+        r for r in normal
+        if r.get("group") == "Smart FPS"
+        and r["ssim"] >= bssim - 0.010
+        and r["estimated_output_mb"] <= bsize * 1.05
+    ]
+    static_safe.sort(key=lambda r: r["speed_x"], reverse=True)
+
+    targets = [r for r in normal if r.get("group") == "Target size"]
+    targets.sort(key=lambda r: r["speed_x"], reverse=True)
 
     quality = sorted(normal, key=lambda r: (r.get("ssim") or 0, r.get("speed_x") or 0), reverse=True)
     smallest = sorted(normal, key=lambda r: (r.get("estimated_output_mb") or 1e9, -(r.get("ssim") or 0)))
 
+    fastest_general = general_safe[0] if general_safe else None
     return {
         "baseline": baseline,
-        "fastest_safe": safe[0] if safe else None,
+        "fastest_safe": fastest_general,
+        "fastest_general": fastest_general,
+        "fastest_static": static_safe[0] if static_safe else None,
+        "fastest_target": targets[0] if targets else None,
         "best_ssim": quality[0] if quality else None,
         "smallest": smallest[0] if smallest else None,
     }
+
+
+def confirmation_shortlist(recs):
+    chosen = []
+    for key in ("baseline", "fastest_general", "fastest_static"):
+        row = recs.get(key)
+        if row and row.get("id") not in chosen:
+            chosen.append(row["id"])
+    return chosen[:3]
+
+
+def confirm_candidates(results, spec_by_id, recs, src, info, work_dir, nvencc_path):
+    ids = confirmation_shortlist(recs)
+    if not ids:
+        return
+
+    dur = min(90.0, max(45.0, info.duration * 0.015))
+    dur = min(dur, max(2.0, info.duration))
+    start = max(0.0, min(info.duration * 0.5 - dur / 2, max(0.0, info.duration - dur)))
+    segment = [(start, dur)]
+
+    print()
+    print(f"🔍 تأكيد أفضل النتائج على مقطع أطول: {dur:.0f} ثانية")
+
+    rows = {r.get("id"): r for r in results}
+    for cid in ids:
+        spec = spec_by_id.get(cid)
+        row = rows.get(cid)
+        if not spec or not row or row.get("status") != "ok":
+            continue
+        try:
+            confirm = run_single_candidate(
+                spec,
+                src,
+                info,
+                segment,
+                work_dir,
+                nvencc_path,
+                keep_outputs=False,
+                repeats=1,
+                warmup=True,
+            )
+            row["confirm_speed_x"] = confirm.get("speed_x")
+            row["confirm_estimated_full_encode"] = confirm.get("estimated_full_encode")
+            row["confirm_estimated_output_mb"] = confirm.get("estimated_output_mb")
+            row["confirm_ssim"] = confirm.get("ssim")
+            row["confirm_cpu_avg_pct"] = confirm.get("cpu_avg_pct")
+            row["confirm_gpu_avg_pct"] = confirm.get("gpu_avg_pct")
+            row["confirm_gpu_encoder_avg_pct"] = confirm.get("gpu_encoder_avg_pct")
+            cleanup_result_outputs(confirm)
+            print(
+                f"   ✅ {row['candidate']} — "
+                f"{row['confirm_speed_x']:.2f}x • "
+                f"{row['confirm_estimated_full_encode']}"
+            )
+        except Exception as exc:
+            row["confirmation_error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            print(f"   ⚠️ تعذر تأكيد {row['candidate']}: {type(exc).__name__}")
+
 
 
 def display_results(results, hw, source_info, recs):
@@ -1126,9 +1598,13 @@ def display_results(results, hw, source_info, recs):
     desired = [
         "candidate", "group", "status", "speed_x", "speedup_vs_current",
         "estimated_full_encode", "estimated_output_mb", "size_vs_current",
-        "ssim", "ssim_delta", "vmaf", "fps", "notes"
+        "ssim", "ssim_delta", "vmaf", "fps", "fps_ratio_vs_current",
+        "repeats", "timing_cv_pct",
+        "cpu_avg_pct", "gpu_avg_pct", "gpu_encoder_avg_pct", "gpu_vram_peak_mb",
+        "confirm_speed_x", "confirm_estimated_full_encode", "confirm_ssim",
+        "notes"
     ]
-    cols = [c for c in desired if c in df.columns]
+    cols = [name for name in desired if name in df.columns]
     if "status" in df.columns:
         df = df.sort_values(
             by=["status", "speed_x"],
@@ -1147,20 +1623,43 @@ def display_results(results, hw, source_info, recs):
     ))
     display(df[cols])
 
-    fastest = recs.get("fastest_safe")
-    if fastest:
+    general = recs.get("fastest_general")
+    static = recs.get("fastest_static")
+
+    if general:
+        confirm = ""
+        if general.get("confirm_speed_x"):
+            confirm = (
+                f'<br>تأكيد المقطع الأطول: '
+                f'<bdi dir="ltr">{general["confirm_speed_x"]:.2f}x • '
+                f'{general.get("confirm_estimated_full_encode","")}</bdi>'
+            )
         display(HTML(
             '<div dir="rtl" style="max-width:900px;padding:14px 16px;margin:12px 0;'
             'border:1px solid #16a34a;border-radius:12px;background:#f0fdf4;'
             'font-family:Arial,sans-serif;line-height:1.8">'
-            '<b>🏁 أسرع نتيجة ضمن حدود محافظة</b><br>'
-            f'<b>{fastest["candidate"]}</b><br>'
-            f'السرعة: <bdi dir="ltr">{fastest["speed_x"]:.2f}x</bdi> — '
-            f'زمن الفيديو الكامل المتوقع: <bdi dir="ltr">{fastest["estimated_full_encode"]}</bdi><br>'
-            f'الحجم المتوقع: <bdi dir="ltr">{fastest["estimated_output_mb"]:.1f} MB</bdi> — '
-            f'SSIM: <bdi dir="ltr">{fastest["ssim"]:.5f}</bdi>'
+            '<b>🏁 أسرع مرشح عام بدون تقليل FPS</b><br>'
+            f'<b>{general["candidate"]}</b><br>'
+            f'السرعة: <bdi dir="ltr">{general["speed_x"]:.2f}x</bdi> — '
+            f'الزمن المتوقع: <bdi dir="ltr">{general["estimated_full_encode"]}</bdi><br>'
+            f'الحجم المتوقع: <bdi dir="ltr">{general["estimated_output_mb"]:.1f} MB</bdi> — '
+            f'SSIM: <bdi dir="ltr">{general["ssim"]:.5f}</bdi>'
+            f'{confirm}'
             '</div>'
         ))
+
+    if static and static.get("id") != (general or {}).get("id"):
+        display(HTML(
+            '<div dir="rtl" style="max-width:900px;padding:12px 16px;margin:10px 0;'
+            'border:1px solid #f59e0b;border-radius:12px;background:#fffbeb;'
+            'font-family:Arial,sans-serif;line-height:1.8">'
+            '<b>📊 مرشح للمحتوى الثابت/الشرائح فقط</b><br>'
+            f'<b>{static["candidate"]}</b> — '
+            f'<bdi dir="ltr">{static["speed_x"]:.2f}x • {static["estimated_full_encode"]}</bdi><br>'
+            'ده مش توصية عامة لأن تقليل FPS ممكن يؤثر على نعومة الحركة.'
+            '</div>'
+        ))
+
 
 
 def write_report(report_dir, hardware, source_meta, video_info, segments, results, recs, config):
@@ -1188,13 +1687,16 @@ def write_report(report_dir, hardware, source_meta, video_info, segments, result
             for k, v in recs.items()
         },
         "notes": {
-            "quality_metric": "SSIM for all successful single-stream candidates; VMAF only when libvmaf exists.",
+            "quality_metric": "SSIM is spatial quality only. Lower-FPS candidates are reported separately because SSIM alone does not measure motion smoothness fairly.",
+            "timing": "Candidates use a warm-up plus repeated timed runs; speed is based on the median repeat.",
+            "confirmation": "The baseline and best general/static candidates are rechecked on a longer segment in full/max modes.",
+            "gpu": "FFmpeg NVENC, source NVDEC, full CUDA pipeline and NVEncC are diagnosed independently; failures stay visible with their reasons.",
             "audio": "Video encoder benchmark excludes audio encode. Estimated full output adds 48 kbps audio when the source has audio.",
             "safety": "Benchmark notebook never edits the Telegram channel and never uploads benchmark outputs.",
             "sdk_probe": (
                 "PyNvVideoCodec detected"
                 if hardware.get("pynvvideocodec_available")
-                else "PyNvVideoCodec not installed; direct SDK path is recorded as future experiment, not ranked."
+                else "PyNvVideoCodec not installed; direct SDK path remains a future experiment and is not ranked."
             ),
         },
     }
@@ -1214,6 +1716,11 @@ def write_report(report_dir, hardware, source_meta, video_info, segments, result
         f"- Physical cores: {hardware['cpu_physical_cores']}",
         f"- Logical threads: {hardware['cpu_logical_threads']}",
         f"- GPU: {(hardware['gpu'] or {}).get('name', 'None')}",
+        f"- FFmpeg h264_nvenc listed: {hardware.get('ffmpeg_nvenc_encoder_listed')}",
+        f"- FFmpeg NVENC smoke: {hardware.get('ffmpeg_nvenc_smoke_ok')}",
+        f"- Source NVDEC: {hardware.get('source_nvdec_ok')}",
+        f"- Full GPU pipeline: {hardware.get('source_full_gpu_ok')}",
+        f"- NVEncC hardware check: {hardware.get('nvencc_hw_ok')}",
         f"- Source: {source_meta.get('source_name', '')}",
         f"- Duration: {video_info.duration:.2f}s",
         f"- Resolution: {video_info.width}x{video_info.height}",
@@ -1226,20 +1733,46 @@ def write_report(report_dir, hardware, source_meta, video_info, segments, result
         "## Recommendation",
         "",
     ]
-    fastest = recs.get("fastest_safe")
-    if fastest:
+
+    general = recs.get("fastest_general")
+    static = recs.get("fastest_static")
+    target = recs.get("fastest_target")
+
+    if general:
         lines += [
-            f"- Fastest conservative candidate: **{fastest['candidate']}**",
-            f"- Speed: {fastest['speed_x']:.2f}x",
-            f"- Estimated full encode: {fastest['estimated_full_encode']}",
-            f"- Estimated output: {fastest['estimated_output_mb']:.1f} MB",
-            f"- SSIM: {fastest['ssim']:.6f}",
+            f"- Fastest general candidate without lowering FPS: **{general['candidate']}**",
+            f"- Speed: {general['speed_x']:.2f}x",
+            f"- Estimated full encode: {general['estimated_full_encode']}",
+            f"- Estimated output: {general['estimated_output_mb']:.1f} MB",
+            f"- SSIM: {general['ssim']:.6f}",
         ]
+        if general.get("confirm_speed_x"):
+            lines += [
+                f"- Longer confirmation speed: {general['confirm_speed_x']:.2f}x",
+                f"- Longer confirmation estimate: {general.get('confirm_estimated_full_encode')}",
+            ]
     else:
-        lines.append("- No conservative winner could be selected automatically.")
+        lines.append("- No conservative general candidate could be selected automatically.")
+
+    if static:
+        lines += [
+            "",
+            f"- Static/slide-content candidate only: **{static['candidate']}**",
+            f"- Speed: {static['speed_x']:.2f}x",
+            "- Warning: reduced FPS is not treated as a general-quality win.",
+        ]
+
+    if target:
+        lines += [
+            "",
+            f"- Fastest target-size candidate: **{target['candidate']}**",
+            f"- Speed: {target['speed_x']:.2f}x",
+        ]
 
     (report_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
     return payload
+
+
 
 
 async def benchmark_main():
@@ -1254,6 +1787,8 @@ async def benchmark_main():
     target_mb = int(os.environ.get("BENCH_TARGET_MB", "80") or 80)
     install_nvencc_flag = os.environ.get("BENCH_INSTALL_NVENCC", "1") == "1"
     keep_outputs = os.environ.get("BENCH_KEEP_OUTPUTS", "0") == "1"
+    default_repeats = 2 if mode == "quick" else 3
+    repeats = max(1, min(5, int(os.environ.get("BENCH_REPEATS", str(default_repeats)) or default_repeats)))
 
     hw = hardware_info()
     show_hardware(hw)
@@ -1269,18 +1804,31 @@ async def benchmark_main():
         "codec": info.codec,
     })
 
+    print("🧰 تشخيص مسار GPU على نفس فيديو المصدر...")
+    diagnose_source_gpu(src, info, hw)
+
+    # Important: NVEncC is tested independently from FFmpeg NVENC.
+    nvencc_path = install_nvencc(install_nvencc_flag, hw)
+    show_gpu_diagnostics(hw)
+
     segments = sample_segments(info.duration, mode)
     sample_total = sum(d for _, d in segments)
     print(
         f"🧪 العينة: {len(segments)} مقاطع بإجمالي {sample_total:.0f} ثانية "
         f"من فيديو مدته {human_time(info.duration)}."
     )
+    print(
+        f"🔁 كل مرشح: Warm-up ثم {repeats} قياسات؛ النتيجة = Median. "
+        "ترتيب الاختبارات يتغير لتقليل تحيز حرارة/ضغط المعالج."
+    )
     print("ℹ️ البنش يقيس الفيديو فقط؛ لا رفع إلى Telegram ولا تعديل للقناة.")
-
-    nvencc_path = install_nvencc(install_nvencc_flag, hw)
 
     specs = candidate_specs(info, hw, mode, target_mb)
     specs.extend(nvencc_specs(info, hw, nvencc_path, mode))
+    spec_by_id = {spec["id"]: spec for spec in specs}
+
+    seed = 20260921 + int(info.size % 100000)
+    random.Random(seed).shuffle(specs)
 
     results = []
     test_dir = WORK_DIR / "outputs"
@@ -1296,6 +1844,8 @@ async def benchmark_main():
                 "backend": spec["backend"],
                 "preset": spec.get("preset", ""),
                 "fps": spec.get("fps"),
+                "execution_order": idx,
+                "repeats": repeats,
                 "sample_seconds": None,
                 "encode_seconds": None,
                 "speed_x": None,
@@ -1307,6 +1857,7 @@ async def benchmark_main():
                 "status": "skipped",
                 "notes": reason,
             })
+            print(f"[{idx}/{len(specs)}] ➖ {spec['label']} — {reason[:160]}")
             continue
 
         print()
@@ -1320,12 +1871,21 @@ async def benchmark_main():
                 test_dir,
                 nvencc_path,
                 keep_outputs,
+                repeats=repeats,
+                warmup=True,
             )
+            row["execution_order"] = idx
             results.append(row)
+            util = ""
+            if row.get("gpu_encoder_avg_pct") is not None:
+                util = f" • NVENC {row['gpu_encoder_avg_pct']:.0f}%"
+            elif row.get("cpu_avg_pct") is not None:
+                util = f" • CPU {row['cpu_avg_pct']:.0f}%"
             print(
-                f"   ✅ {row['speed_x']:.2f}x • "
+                f"   ✅ Median {row['speed_x']:.2f}x • "
                 f"{row['estimated_full_encode']} للفيديو الكامل • "
-                f"SSIM {row['ssim'] if row['ssim'] is not None else 'N/A'}"
+                f"CV {row.get('timing_cv_pct') if row.get('timing_cv_pct') is not None else 'N/A'}%"
+                f"{util}"
             )
         except Exception as exc:
             results.append({
@@ -1335,6 +1895,8 @@ async def benchmark_main():
                 "backend": spec["backend"],
                 "preset": spec.get("preset", ""),
                 "fps": spec.get("fps"),
+                "execution_order": idx,
+                "repeats": repeats,
                 "sample_seconds": None,
                 "encode_seconds": None,
                 "speed_x": None,
@@ -1344,19 +1906,20 @@ async def benchmark_main():
                 "ssim": None,
                 "vmaf": None,
                 "status": "failed",
-                "notes": f"{type(exc).__name__}: {str(exc)[:350]}",
+                "notes": f"{type(exc).__name__}: {str(exc)[:500]}",
             })
-            print(f"   ⚠️ تخطي بسبب: {type(exc).__name__}")
+            print(f"   ⚠️ FAILED: {type(exc).__name__}: {str(exc)[:180]}")
 
     if hw["libvmaf_available"]:
         add_vmaf(results, src, hw)
 
-    if mode in ("full", "max") and hw["nvenc_available"] and hw["scale_cuda_available"]:
+    if mode in ("full", "max") and hw.get("source_full_gpu_ok"):
         for jobs in ((2, 3) if mode == "max" else (2,)):
             print(f"⚡ اختبار Throughput لعدد {jobs} encode بالتوازي...")
             try:
                 row = await gpu_batch_throughput(src, info, hw, test_dir, jobs=jobs)
                 if row:
+                    row["execution_order"] = len(results) + 1
                     results.append(row)
             except Exception as exc:
                 results.append({
@@ -1366,6 +1929,7 @@ async def benchmark_main():
                     "backend": "ffmpeg_nvenc_full",
                     "preset": "p3",
                     "fps": None,
+                    "execution_order": len(results) + 1,
                     "sample_seconds": None,
                     "encode_seconds": None,
                     "speed_x": None,
@@ -1375,11 +1939,23 @@ async def benchmark_main():
                     "ssim": None,
                     "vmaf": None,
                     "status": "failed",
-                    "notes": f"{type(exc).__name__}: {str(exc)[:350]}",
+                    "notes": f"{type(exc).__name__}: {str(exc)[:500]}",
                 })
 
     enrich_relative_metrics(results)
     recs = recommendations(results)
+
+    if mode in ("full", "max"):
+        confirm_candidates(
+            results,
+            spec_by_id,
+            recs,
+            src,
+            info,
+            test_dir,
+            nvencc_path,
+        )
+        recs = recommendations(results)
 
     run_stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     report_dir = REPORT_ROOT / run_stamp
@@ -1389,6 +1965,10 @@ async def benchmark_main():
         "install_nvencc": install_nvencc_flag,
         "keep_outputs": keep_outputs,
         "sample_total_seconds": sample_total,
+        "repeats": repeats,
+        "warmup": True,
+        "random_seed": seed,
+        "confirmation_enabled": mode in ("full", "max"),
     }
     write_report(report_dir, hw, source_meta, info, segments, results, recs, config)
     display_results(results, hw, source_meta, recs)
@@ -1406,6 +1986,7 @@ async def benchmark_main():
         "report_dir": str(report_dir),
         "recommendations": recs,
     }
+
 
 
 def run_benchmark():
