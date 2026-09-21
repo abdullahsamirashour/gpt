@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import hashlib
 import html
 import json
 import logging
@@ -23,7 +24,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.4.0"
+ENGINE_BUNDLE_VERSION = "5.5.0"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -41,8 +42,10 @@ BRAND_BANNER_FILE = "media_lite_banner.jpg"
 CHANNEL_ABOUT = "اضغطها | Media Lite — ضغط ذكي للفيديو والصوت عبر Google Colab."
 COLAB_URL = "https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/Smart_Compressor.ipynb"
 TURBO_THRESHOLD = 8 * 1024 * 1024
-TURBO_CONNECTIONS = 4
+TURBO_MAX_CONNECTIONS = 20
+TURBO_FULL_SPEED_BYTES = 100 * 1024 * 1024
 TURBO_PART_KB = 512
+FAST_UPLOAD_THRESHOLD = 8 * 1024 * 1024
 BASE_DIR = Path("/content/drive/MyDrive/Telegram_Extreme_Compressor")
 TMP_DIR = Path("/content/telegram_smart_compressor_tmp")
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -549,6 +552,28 @@ def human_size(size: int) -> str:
     return f"{size:.1f} GB"
 
 
+
+def transfer_connection_count(size: int) -> int:
+    size = max(0, int(size or 0))
+    if size <= 0:
+        return 4
+    scaled = math.ceil((size / TURBO_FULL_SPEED_BYTES) * TURBO_MAX_CONNECTIONS)
+    return min(TURBO_MAX_CONNECTIONS, max(4, scaled))
+
+
+def show_file_header(index: int, total: int, name: str):
+    try:
+        from IPython.display import HTML, display
+        display(HTML(
+            '<div dir="rtl" style="max-width:760px;margin:10px 0 5px;'
+            'font-family:Arial,sans-serif">'
+            f'<b>📄 ملف {index} من {total}</b> — '
+            f'<bdi dir="ltr">{html.escape(name)}</bdi>'
+            '</div>'
+        ))
+    except Exception:
+        print(f"📄 ملف {index} من {total} — {name}")
+
 def clean_name(name: str, fallback: str) -> str:
     name = (name or fallback).strip()
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
@@ -609,7 +634,7 @@ class LiveProgress:
         self.handle = None
         self.terminal_started = False
 
-    def _text(self, current, total, speed_override=None):
+    def _metrics(self, current, total, speed_override=None):
         total = float(total or 0)
         current = float(current or 0)
         pct = min(100.0, current / total * 100) if total > 0 else 0.0
@@ -627,6 +652,20 @@ class LiveProgress:
         eta_text = _format_duration(eta) if eta > 0 else "..."
         return pct, detail, speed_text, eta_text
 
+    def _card(self, pct, detail, speed_text, eta_text):
+        return (
+            '<div dir="rtl" style="max-width:760px;padding:8px 12px;margin:4px 0;'
+            'border:1px solid #d0d7de;border-radius:10px;background:#f8fafc;'
+            'font-family:Arial,sans-serif">'
+            f'<div style="display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;margin-bottom:6px">'
+            f'<b>{html.escape(self.icon)} {html.escape(self.label)}</b>'
+            f'<bdi dir="ltr">{pct:.1f}% • {html.escape(detail)} • {html.escape(speed_text)}</bdi>'
+            f'<span>• باقي</span><bdi dir="ltr">{html.escape(eta_text)}</bdi>'
+            '</div>'
+            f'<progress value="{pct:.2f}" max="100" style="width:100%;height:12px"></progress>'
+            '</div>'
+        )
+
     def update(self, current, total, speed_override=None, force=False):
         now = time.time()
         current = float(current or 0)
@@ -634,7 +673,7 @@ class LiveProgress:
 
         dt = max(now - self.last_time, 1e-6)
         delta = max(0.0, current - self.last_current)
-        if delta > 0:
+        if delta > 0 and dt >= 0.02:
             instant = delta / dt
             self.speed = instant if self.speed <= 0 else (0.25 * instant + 0.75 * self.speed)
 
@@ -645,24 +684,17 @@ class LiveProgress:
             return
         self.last_render = now
 
-        pct, detail, speed_text, eta_text = self._text(current, total, speed_override)
-        line = f"{self.icon} {self.label} — {pct:.1f}% • {detail} • {speed_text} • باقي {eta_text}"
+        pct, detail, speed_text, eta_text = self._metrics(current, total, speed_override)
 
         try:
             from IPython.display import HTML, display
-            card = HTML(
-                f'<div dir="rtl" style="max-width:760px;padding:8px 12px;margin:4px 0;'
-                f'border:1px solid #d0d7de;border-radius:10px;background:#f8fafc;'
-                f'font-family:Arial,sans-serif">'
-                f'<div style="margin-bottom:6px">{html.escape(line)}</div>'
-                f'<progress value="{pct:.2f}" max="100" style="width:100%;height:12px"></progress>'
-                f'</div>'
-            )
+            card = HTML(self._card(pct, detail, speed_text, eta_text))
             if self.handle is None:
                 self.handle = display(card, display_id=True)
-            elif self.handle is not None:
+            else:
                 self.handle.update(card)
         except Exception:
+            line = f"{self.icon} {self.label} — {pct:.1f}% • {detail} • {speed_text} • باقي {eta_text}"
             print("\r" + line + " " * 8, end="", flush=True)
             self.terminal_started = True
 
@@ -676,9 +708,40 @@ class LiveProgress:
         self.update(current or 0, total or 0)
 
     def finish(self, total, speed_override=None):
-        self.update(total, total, speed_override=speed_override, force=True)
-        if self.terminal_started:
-            print()
+        elapsed = max(time.time() - self.started, 0.001)
+        total = float(total or 0)
+
+        if self.mode == "bytes":
+            avg_speed = total / elapsed if total > 0 else 0.0
+            speed_text = f"{avg_speed / 1024 / 1024:.1f} MB/s" if avg_speed > 0 else "..."
+        else:
+            avg_x = speed_override if speed_override and speed_override > 0 else (
+                total / elapsed if total > 0 else 0.0
+            )
+            speed_text = f"{avg_x:.1f}x" if avg_x > 0 else "..."
+
+        compact = (
+            '<div dir="rtl" style="max-width:760px;padding:6px 10px;margin:3px 0;'
+            'border:1px solid #d0d7de;border-radius:9px;background:#f8fafc;'
+            'font-family:Arial,sans-serif">'
+            f'<b>✅ {html.escape(self.label)}</b> — '
+            f'<bdi dir="ltr">{html.escape(_format_duration(elapsed))} • {html.escape(speed_text)}</bdi>'
+            '</div>'
+        )
+
+        try:
+            from IPython.display import HTML, display
+            if self.handle is None:
+                self.handle = display(HTML(compact), display_id=True)
+            else:
+                self.handle.update(HTML(compact))
+        except Exception:
+            if self.terminal_started:
+                print()
+            print(f"✅ {self.label} — {_format_duration(elapsed)} • {speed_text}")
+
+        return elapsed
+
 
 
 def run_ffmpeg(cmd, duration: float, label: str):
@@ -733,16 +796,17 @@ async def download_media_fast(client, msg, path: Path):
             from aiofasttelethonhelper.core.transfer import ParallelTransferrer
             from telethon.utils import get_input_location
 
+            connections = transfer_connection_count(size)
             dc_id, location = get_input_location(msg.document)
             downloader = ParallelTransferrer(client, dc_id)
             chunks = downloader.download(
                 location,
                 size,
                 part_size_kb=TURBO_PART_KB,
-                connection_count=TURBO_CONNECTIONS,
+                connection_count=connections,
             )
 
-            print(f"⚡ تنزيل سريع — {TURBO_CONNECTIONS} اتصالات")
+            print(f"⚡ تنزيل سريع — {connections} اتصال")
             async with aiofiles.open(str(path), "wb") as out:
                 done = 0
                 async for chunk in chunks:
@@ -750,8 +814,8 @@ async def download_media_fast(client, msg, path: Path):
                     done += len(chunk)
                     progress.update(done, size)
 
-            progress.finish(size)
-            return str(path), "turbo"
+            elapsed = progress.finish(size)
+            return str(path), "turbo", elapsed
 
         except Exception:
             try:
@@ -764,15 +828,74 @@ async def download_media_fast(client, msg, path: Path):
             except FileNotFoundError:
                 pass
             print("↪️ تعذر التنزيل السريع؛ هنكمل تلقائيًا بالطريقة العادية.")
+            progress = LiveProgress("تنزيل", "⬇️")
 
     downloaded = await client.download_media(
         msg,
         file=str(path),
         progress_callback=progress.callback,
     )
-    if downloaded:
-        progress.finish(size or Path(downloaded).stat().st_size)
-    return downloaded, "normal"
+    elapsed = progress.finish(size or (Path(downloaded).stat().st_size if downloaded else 0))
+    return downloaded, "normal", elapsed
+
+
+async def upload_media_fast(client, path: Path, progress: LiveProgress):
+    from telethon.helpers import generate_random_long
+    from telethon.tl.types import InputFile, InputFileBig
+
+    size = path.stat().st_size
+    if size < FAST_UPLOAD_THRESHOLD:
+        return str(path), "normal", None
+
+    uploader = None
+    try:
+        import aiofiles
+        from aiofasttelethonhelper.core.transfer import ParallelTransferrer
+
+        connections = transfer_connection_count(size)
+        file_id = generate_random_long()
+        uploader = ParallelTransferrer(client)
+        part_size, part_count, is_large = await uploader.init_upload(
+            file_id,
+            size,
+            part_size_kb=TURBO_PART_KB,
+            connection_count=connections,
+        )
+
+        print(f"⚡ رفع سريع — {connections} اتصال")
+        md5 = hashlib.md5()
+        done = 0
+
+        async with aiofiles.open(str(path), "rb") as reader:
+            while True:
+                part = await reader.read(part_size)
+                if not part:
+                    break
+                if not is_large:
+                    md5.update(part)
+                await uploader.upload(part)
+                done += len(part)
+                progress.update(done, size)
+
+        await uploader.finish_upload()
+        uploader = None
+        elapsed = progress.finish(size)
+
+        if is_large:
+            uploaded = InputFileBig(file_id, part_count, path.name)
+        else:
+            uploaded = InputFile(file_id, part_count, path.name, md5.hexdigest())
+        return uploaded, "turbo", elapsed
+
+    except Exception:
+        try:
+            if uploader is not None and getattr(uploader, "senders", None):
+                await uploader._cleanup()
+        except Exception:
+            pass
+        print("↪️ تعذر الرفع السريع؛ هنكمل تلقائيًا بالطريقة العادية.")
+        return str(path), "normal", None
+
 
 
 
@@ -814,10 +937,11 @@ def video_filter(info: MediaInfo, max_w: int, max_h: int, fps_cap: int) -> str:
     )
 
 
-def classify_video_complexity(src: Path, info: MediaInfo) -> str:
+def classify_video_complexity(src: Path, info: MediaInfo, timings=None) -> str:
     if info.duration <= 8:
         return "NORMAL"
 
+    analysis_started = time.time()
     points = [max(0.0, info.duration * 0.20), max(0.0, info.duration * 0.65)]
     rates = []
 
@@ -846,6 +970,9 @@ def classify_video_complexity(src: Path, info: MediaInfo) -> str:
             except FileNotFoundError:
                 pass
 
+    if timings is not None:
+        timings["analysis"] = timings.get("analysis", 0.0) + (time.time() - analysis_started)
+
     if not rates:
         return "NORMAL"
 
@@ -857,9 +984,17 @@ def classify_video_complexity(src: Path, info: MediaInfo) -> str:
     return "DETAIL"
 
 
-def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb: int | None, nvenc: bool):
+def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb: int | None, nvenc: bool, timings=None):
     if not info.has_video:
         raise AppError("E411", "هذا الملف لا يحتوي على فيديو.")
+
+    def timed_run(cmd, label):
+        started = time.time()
+        try:
+            return run_ffmpeg(cmd, info.duration, label)
+        finally:
+            if timings is not None:
+                timings["encode"] = timings.get("encode", 0.0) + (time.time() - started)
 
     if profile == "VIDEO_SMALLEST":
         vf = video_filter(info, 960, 540, 12)
@@ -871,7 +1006,7 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
             "-movflags", "+faststart",
             str(dst),
         ]
-        run_ffmpeg(cmd, info.duration, "ضغط الفيديو")
+        timed_run(cmd, "ضغط الفيديو")
         return "SMALLEST"
 
     if profile == "VIDEO_TARGET_SIZE":
@@ -905,8 +1040,8 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
             str(dst),
         ]
         try:
-            run_ffmpeg(first, info.duration, "تحليل الحجم")
-            run_ffmpeg(second, info.duration, "ضغط الفيديو")
+            timed_run(first, "تحليل الحجم")
+            timed_run(second, "ضغط الفيديو")
         finally:
             for p in TMP_DIR.glob(Path(passlog).name + "*"):
                 try:
@@ -924,7 +1059,7 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
         ]
         cpu_codec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "31"]
     else:
-        complexity = classify_video_complexity(src, info)
+        complexity = classify_video_complexity(src, info, timings=timings)
         if complexity == "STATIC":
             fps_cap, gpu_cq, cpu_crf = 12, 31, 30
             print("📄 المحتوى ثابت غالبًا — هنقلل الفريمات بدون ما نضيّع وضوح الشرائح.")
@@ -955,7 +1090,7 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
 
     if nvenc:
         try:
-            run_ffmpeg(build_cmd(gpu_codec), info.duration, "ضغط الفيديو")
+            timed_run(build_cmd(gpu_codec), "ضغط الفيديو")
             return complexity
         except AppError:
             print("↪️ كارت الشاشة ما نفعش مع الملف ده؛ هنكمل تلقائيًا على CPU.")
@@ -964,7 +1099,7 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
             except FileNotFoundError:
                 pass
 
-    run_ffmpeg(build_cmd(cpu_codec), info.duration, "ضغط الفيديو")
+    timed_run(build_cmd(cpu_codec), "ضغط الفيديو")
     return complexity
 
 
@@ -1327,20 +1462,27 @@ async def prepare_job(client, job, index: int, total: int):
 
     print()
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print(f"📄 ملف {index} من {total} — {name}")
+    show_file_header(index, total, name)
 
     try:
-        downloaded, mode = await download_media_fast(client, msg, src)
+        downloaded, mode, download_seconds = await download_media_fast(client, msg, src)
         if not downloaded:
             raise AppError("E401", "تعذر تنزيل الملف من Telegram.")
         src = Path(downloaded)
+
+        probe_started = time.time()
+        info = ffprobe(src)
+        probe_seconds = time.time() - probe_started
+
         return {
             "job": job,
             "msg": msg,
             "name": name,
             "src": src,
-            "info": ffprobe(src),
+            "info": info,
             "started_at": started_at,
+            "download_seconds": download_seconds,
+            "probe_seconds": probe_seconds,
             "download_mode": mode,
             "error": None,
         }
@@ -1351,7 +1493,7 @@ async def prepare_job(client, job, index: int, total: int):
         except Exception:
             pass
         return {"job": job, "msg": msg, "name": name, "src": src, "error": exc, "started_at": started_at}
-    except Exception as exc:
+    except Exception:
         try:
             if src.exists():
                 src.unlink()
@@ -1389,9 +1531,15 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
             await client.send_message(channel, f"⚠️ {exc.code}\n{exc.message}", reply_to=msg.id)
         except Exception:
             pass
-        return {"ok": False, "skipped": False, "original": 0, "final": 0}
+        return {"ok": False, "skipped": False, "original": 0, "final": 0, "timings": {}}
 
     info = prepared["info"]
+    timings = {
+        "download": float(prepared.get("download_seconds", 0.0) or 0.0),
+        "analysis": float(prepared.get("probe_seconds", 0.0) or 0.0),
+        "encode": 0.0,
+        "upload": 0.0,
+    }
     parent_lineage = state.get("lineage", {}).get(str(msg.id), {})
     root_id = int(parent_lineage.get("root_id", msg.id))
     version = int(parent_lineage.get("version", 0)) + 1
@@ -1410,7 +1558,13 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
             dst = TMP_DIR / f"{src.stem}_compressed.ogg"
             label = "صوت صغير جدًا"
             print(f"🎧 {label}")
-            encode_audio(src, dst, info)
+
+            encode_started = time.time()
+            try:
+                encode_audio(src, dst, info)
+            finally:
+                timings["encode"] += time.time() - encode_started
+
             out_info = ffprobe(dst)
 
             if dst.stat().st_size >= src.stat().st_size * 0.98:
@@ -1429,27 +1583,28 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
             original_size = src.stat().st_size
             final_size = dst.stat().st_size
             saved_pct = max(0.0, (original_size - final_size) / original_size * 100) if original_size else 0
-            elapsed = time.time() - started_at
-            caption = (
-                f"✅ تم • {label}\n"
-                f"{Path(name).stem}\n"
-                f"{human_size(original_size)} → {human_size(final_size)} • وفر {saved_pct:.0f}%\n"
-                f"⏱ {_format_duration(elapsed)}"
-            )
 
             upload = LiveProgress("رفع", "⬆️")
+            upload_started = time.time()
+            file_arg, upload_mode, fast_upload_seconds = await upload_media_fast(client, dst, upload)
             sent = await client.send_file(
                 channel,
-                str(dst),
-                caption=caption,
+                file_arg,
+                caption=(
+                    f"✅ تم • {label}\n"
+                    f"{Path(name).stem}\n"
+                    f"{human_size(original_size)} → {human_size(final_size)} • وفر {saved_pct:.0f}%"
+                ),
                 attributes=attrs,
                 mime_type="audio/ogg",
                 voice_note=False,
                 force_document=False,
                 reply_to=msg.id,
-                progress_callback=upload.callback,
+                progress_callback=upload.callback if upload_mode == "normal" else None,
             )
-            upload.finish(final_size)
+            if upload_mode == "normal":
+                upload.finish(final_size)
+            timings["upload"] = time.time() - upload_started
 
         else:
             dst = TMP_DIR / f"{src.stem}_compressed.mp4"
@@ -1464,7 +1619,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
             if profile in ("VIDEO_BALANCED", "VIDEO_FAST") and nvenc:
                 print("⚡ كارت الشاشة متاح للترميز.")
 
-            complexity = encode_video(src, dst, info, profile, target_mb, nvenc)
+            encode_video(src, dst, info, profile, target_mb, nvenc, timings=timings)
             if dst.stat().st_size >= src.stat().st_size * 0.98:
                 raise AppError("E430", "الملف مضغوط بالفعل تقريبًا؛ إعادة الضغط مش هتوفر مساحة مفيدة.")
 
@@ -1472,21 +1627,20 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
             original_size = src.stat().st_size
             final_size = dst.stat().st_size
             saved_pct = max(0.0, (original_size - final_size) / original_size * 100) if original_size else 0
-            elapsed = time.time() - started_at
             quality_hint = f"{out_info.height}p" if out_info.height else ""
-            caption = (
-                f"✅ تم • {label}\n"
-                f"{Path(name).stem}\n"
-                f"{human_size(original_size)} → {human_size(final_size)} • وفر {saved_pct:.0f}%\n"
-                f"⏱ {_format_duration(elapsed)}"
-                + (f" • {quality_hint}" if quality_hint else "")
-            )
 
             upload = LiveProgress("رفع", "⬆️")
+            upload_started = time.time()
+            file_arg, upload_mode, fast_upload_seconds = await upload_media_fast(client, dst, upload)
             sent = await client.send_file(
                 channel,
-                str(dst),
-                caption=caption,
+                file_arg,
+                caption=(
+                    f"✅ تم • {label}\n"
+                    f"{Path(name).stem}\n"
+                    f"{human_size(original_size)} → {human_size(final_size)} • وفر {saved_pct:.0f}%"
+                    + (f" • {quality_hint}" if quality_hint else "")
+                ),
                 force_document=False,
                 mime_type="video/mp4",
                 supports_streaming=True,
@@ -1499,9 +1653,13 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
                     )
                 ],
                 reply_to=msg.id,
-                progress_callback=upload.callback,
+                progress_callback=upload.callback if upload_mode == "normal" else None,
             )
-            upload.finish(final_size)
+            if upload_mode == "normal":
+                upload.finish(final_size)
+            timings["upload"] = time.time() - upload_started
+
+        total_elapsed = time.time() - started_at
 
         state["output_ids"].append(int(sent.id))
         state["lineage"][str(sent.id)] = {
@@ -1526,11 +1684,21 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
                 pass
 
         print(f"✅ تم — {human_size(original_size)} → {human_size(final_size)}")
+        print(
+            "⏱ "
+            f"تنزيل {_format_duration(timings['download'])} • "
+            f"تحليل {_format_duration(timings['analysis'])} • "
+            f"ضغط {_format_duration(timings['encode'])} • "
+            f"رفع {_format_duration(timings['upload'])} • "
+            f"الإجمالي {_format_duration(total_elapsed)}"
+        )
         return {
             "ok": True,
             "skipped": False,
             "original": original_size,
             "final": final_size,
+            "timings": timings,
+            "elapsed": total_elapsed,
         }
 
     except AppError as exc:
@@ -1560,7 +1728,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
         print(f"{'ℹ️' if skipped else '⚠️'} {exc.code} — {exc.message}")
         if exc.details:
             ERROR_LOG.write_text(exc.details, encoding="utf-8")
-        return {"ok": False, "skipped": skipped, "original": 0, "final": 0}
+        return {"ok": False, "skipped": skipped, "original": 0, "final": 0, "timings": timings}
 
     except Exception:
         details = traceback.format_exc()
@@ -1574,7 +1742,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
         except Exception:
             pass
         print("❌ E900 — حصل خطأ غير متوقع. التفاصيل محفوظة في Google Drive.")
-        return {"ok": False, "skipped": False, "original": 0, "final": 0}
+        return {"ok": False, "skipped": False, "original": 0, "final": 0, "timings": timings}
 
     finally:
         for path in (src, dst):
