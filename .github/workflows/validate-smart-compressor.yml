@@ -62,6 +62,9 @@ jobs:
               assert code.count("#@param") >= 2
               assert "\\n" not in md
               assert "re.search(r'ENGINE_BUNDLE_VERSION" not in code
+              if path.name == "launcher-beta.ipynb":
+                  assert 'os.environ["TSC_ENGINE_SHA"] = sha' in code
+                  assert 'BRANCH = "beta"' in code
               compile(code, str(path), "exec")
               print("OK notebook:", path)
 
@@ -88,10 +91,24 @@ jobs:
           sys.modules[spec.name] = engine
           spec.loader.exec_module(engine)
 
-          assert engine.ENGINE_BUNDLE_VERSION.startswith("5.3.")
-          assert engine.WORKSPACE_TITLE == "📦 ضغط الفيديو والصوت"
+          assert engine.ENGINE_BUNDLE_VERSION.startswith("5.4.")
+          assert engine.WORKSPACE_TITLE == "🗜️ اضغطها | Media Lite"
+          assert engine.APP_NAME == "اضغطها | Media Lite"
+          assert engine.BRANDING_VERSION == "media-lite-v1"
           assert engine.TURBO_CONNECTIONS == 4
           assert engine.TURBO_PART_KB == 512
+
+          for brand_file in (engine.BRAND_LOGO_FILE, engine.BRAND_BANNER_FILE):
+              brand_path = engine.get_brand_asset(brand_file)
+              assert brand_path.exists()
+              data = brand_path.read_bytes()
+              assert len(data) > 5000
+              assert data[:2] == b"\xff\xd8"
+
+          pin_html = engine.pinned_message_html()
+          assert "اضغطها | Media Lite" in pin_html
+          assert engine.COLAB_URL in pin_html
+          assert "<code>1</code>" in pin_html
 
           setup_html = engine.first_time_setup_html()
           assert "https://my.telegram.org/apps" in setup_html
@@ -214,10 +231,12 @@ jobs:
                   return gen()
 
               async def __call__(self, request):
-                  self.create_calls += 1
-                  if self.create_calls == 1:
-                      raise RpcCallFailError("Telegram is having internal issues, please try again later.")
-                  return Obj(chats=[self.channel])
+                  if type(request).__name__ == "CreateChannelRequest":
+                      self.create_calls += 1
+                      if self.create_calls == 1:
+                          raise RpcCallFailError("Telegram is having internal issues, please try again later.")
+                      return Obj(chats=[self.channel])
+                  return Obj()
 
               async def get_messages(self, _channel, ids=None):
                   return None
@@ -309,7 +328,18 @@ jobs:
           from telethon import functions, types
           req = functions.channels.CreateChannelRequest(title="x", about="x", broadcast=True, megagroup=False)
           assert req.broadcast is True
-          functions.channels.EditTitleRequest(channel=types.InputChannelEmpty(), title="📦 ضغط الفيديو والصوت")
+          functions.channels.EditTitleRequest(channel=types.InputChannelEmpty(), title="🗜️ اضغطها | Media Lite")
+          functions.messages.EditChatAboutRequest(peer=types.InputPeerSelf(), about="x")
+          uploaded_photo_file = types.InputFile(
+              id=1,
+              parts=1,
+              name="x.jpg",
+              md5_checksum="0" * 32,
+          )
+          functions.channels.EditPhotoRequest(
+              channel=types.InputChannelEmpty(),
+              photo=types.InputChatUploadedPhoto(file=uploaded_photo_file),
+          )
           functions.messages.ToggleDialogPinRequest(
               pinned=True,
               peer=types.InputDialogPeer(peer=types.InputPeerSelf()),
