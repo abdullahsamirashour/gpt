@@ -91,12 +91,15 @@ jobs:
           sys.modules[spec.name] = engine
           spec.loader.exec_module(engine)
 
-          assert engine.ENGINE_BUNDLE_VERSION.startswith("5.4.")
+          assert engine.ENGINE_BUNDLE_VERSION.startswith("5.5.")
           assert engine.WORKSPACE_TITLE == "🗜️ اضغطها | Media Lite"
           assert engine.APP_NAME == "اضغطها | Media Lite"
           assert engine.BRANDING_VERSION == "media-lite-v1"
-          assert engine.TURBO_CONNECTIONS == 4
+          assert engine.TURBO_MAX_CONNECTIONS == 20
           assert engine.TURBO_PART_KB == 512
+          assert engine.transfer_connection_count(8 * 1024 * 1024) == 4
+          assert engine.transfer_connection_count(82 * 1024 * 1024) == 17
+          assert engine.transfer_connection_count(234 * 1024 * 1024) == 20
 
           for brand_file in (engine.BRAND_LOGO_FILE, engine.BRAND_BANNER_FILE):
               brand_path = engine.get_brand_asset(brand_file)
@@ -321,8 +324,56 @@ jobs:
 
           # Parallel transfer dependency is importable on Python 3.13 / Telethon 1.45.
           from aiofasttelethonhelper.core.transfer import ParallelTransferrer
+          import aiofasttelethonhelper.core.transfer as transfer_mod
           import inspect
           assert "connection_count" in inspect.signature(ParallelTransferrer.download).parameters
+          assert "connection_count" in inspect.signature(ParallelTransferrer.init_upload).parameters
+
+          # Fast upload uses the adaptive connection budget and returns a Telegram input file.
+          class FakeProgress:
+              def __init__(self):
+                  self.done = 0
+                  self.finished = 0
+              def update(self, done, total):
+                  self.done = done
+              def finish(self, total):
+                  self.finished = total
+                  return 1.0
+
+          class FakeTransferrer:
+              last_connections = None
+              def __init__(self, client, dc_id=None):
+                  self.senders = []
+              async def init_upload(self, file_id, file_size, part_size_kb=None, connection_count=None):
+                  type(self).last_connections = connection_count
+                  part_size = int(part_size_kb * 1024)
+                  part_count = (file_size + part_size - 1) // part_size
+                  return part_size, part_count, True
+              async def upload(self, part):
+                  return None
+              async def finish_upload(self):
+                  return None
+              async def _cleanup(self):
+                  return None
+
+          async def fast_upload_test():
+              original = transfer_mod.ParallelTransferrer
+              transfer_mod.ParallelTransferrer = FakeTransferrer
+              try:
+                  with tempfile.TemporaryDirectory() as td:
+                      src = Path(td) / "upload.mp4"
+                      src.write_bytes(b"x" * (9 * 1024 * 1024))
+                      progress = FakeProgress()
+                      uploaded, mode, elapsed = await engine.upload_media_fast(object(), src, progress)
+                      assert mode == "turbo"
+                      assert uploaded.name == src.name
+                      assert progress.finished == src.stat().st_size
+                      assert FakeTransferrer.last_connections == engine.transfer_connection_count(src.stat().st_size)
+                      assert 4 <= FakeTransferrer.last_connections <= 20
+              finally:
+                  transfer_mod.ParallelTransferrer = original
+
+          asyncio.run(fast_upload_test())
 
           # Telethon API objects used by the engine still match the pinned version.
           from telethon import functions, types
