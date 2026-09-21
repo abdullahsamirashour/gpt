@@ -26,8 +26,10 @@ jobs:
             sudo apt-get install -y -qq ffmpeg
           fi
 
-      - name: Compile engine
-        run: python -m py_compile telegram-smart-compressor/engine.py
+      - name: Compile engines
+        run: |
+          python -m py_compile telegram-smart-compressor/engine.py
+          python -m py_compile telegram-smart-compressor/benchmark_engine.py
 
       - name: Validate Colab notebooks
         run: |
@@ -39,6 +41,7 @@ jobs:
               Path("telegram-smart-compressor/launcher-beta.ipynb"),
               Path("telegram-smart-compressor/Smart_Compressor.ipynb"),
               Path("telegram-smart-compressor/launcher.ipynb"),
+              Path("telegram-smart-compressor/Encoder_Benchmark.ipynb"),
           ]
 
           found = 0
@@ -65,10 +68,96 @@ jobs:
               if path.name == "launcher-beta.ipynb":
                   assert 'os.environ["TSC_ENGINE_SHA"] = sha' in code
                   assert 'BRANCH = "beta"' in code
+              elif path.name == "Encoder_Benchmark.ipynb":
+                  import os
+                  branch = os.environ.get("GITHUB_REF_NAME", "beta")
+                  assert 'ENGINE_REL = "telegram-smart-compressor/benchmark_engine.py"' in code
+                  assert f'BRANCH = "{branch}"' in code
+                  assert 'run_benchmark()' in code
+                  assert code.count("#@param") >= 5
               compile(code, str(path), "exec")
               print("OK notebook:", path)
 
           assert found >= 1
+          PY
+
+      - name: Benchmark engine smoke tests
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          path = Path("telegram-smart-compressor/benchmark_engine.py")
+          spec = importlib.util.spec_from_file_location("bench_engine", path)
+          bench = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = bench
+          spec.loader.exec_module(bench)
+
+          assert bench.BENCH_VERSION.startswith("1.0.")
+          assert bench.fit_dims(1920, 1080) == (1280, 720)
+          assert bench.fit_dims(640, 360) == (640, 360)
+          assert len(bench.sample_segments(3600, "full")) == 3
+
+          fake_hw = {
+              "nvenc_available": False,
+              "scale_cuda_available": False,
+          }
+          fake_info = bench.VideoInfo(
+              duration=3600.0,
+              width=1920,
+              height=1080,
+              fps=30.0,
+              codec="h264",
+              pix_fmt="yuv420p",
+              size=1000000,
+              has_audio=True,
+          )
+          ids = {x["id"] for x in bench.candidate_specs(fake_info, fake_hw, "full", 80)}
+          assert "cpu_x264_veryfast" in ids
+          assert "cpu_x264_ultrafast" in ids
+          assert "cpu_fps8" in ids
+          assert "cpu_mpdecimate" in ids
+          assert "cpu_target_1pass" in ids
+          assert "cpu_target_2pass" in ids
+
+          with tempfile.TemporaryDirectory() as td:
+              td = Path(td)
+              src = td / "source.mp4"
+              import subprocess
+              subprocess.run(
+                  [
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24",
+                      "-t", "3",
+                      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                      "-pix_fmt", "yuv420p",
+                      str(src),
+                  ],
+                  check=True,
+              )
+              info = bench.probe_video(src)
+              candidate = next(
+                  x for x in bench.candidate_specs(info, fake_hw, "quick", 80)
+                  if x["id"] == "cpu_x264_veryfast"
+              )
+              result = bench.run_single_candidate(
+                  candidate,
+                  src,
+                  info,
+                  [(0.0, 2.0)],
+                  td,
+                  None,
+                  False,
+              )
+              assert result["status"] == "ok"
+              assert result["speed_x"] > 0
+              assert result["estimated_output_mb"] > 0
+              assert result["ssim"] is None or 0 <= result["ssim"] <= 1
+              bench.cleanup_result_outputs(result)
+
+          print("OK benchmark engine")
           PY
 
       - name: Engine logic and FFmpeg smoke tests
