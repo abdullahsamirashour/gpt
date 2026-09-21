@@ -1452,14 +1452,18 @@ def enrich_relative_metrics(results):
     )
     if not baseline:
         return
+
     bspeed = baseline.get("speed_x") or 0
     bsize = baseline.get("estimated_output_mb") or 0
     bssim = baseline.get("ssim")
+    bfps = baseline.get("fps") or 0
+
     for r in results:
         if r.get("status") != "ok":
             continue
         r["speedup_vs_current"] = round((r.get("speed_x") or 0) / bspeed, 3) if bspeed else None
         r["size_vs_current"] = round((r.get("estimated_output_mb") or 0) / bsize, 3) if bsize and r.get("estimated_output_mb") else None
+        r["fps_ratio_vs_current"] = round((r.get("fps") or 0) / bfps, 3) if bfps and r.get("fps") else None
         if bssim is not None and r.get("ssim") is not None:
             r["ssim_delta"] = round(r["ssim"] - bssim, 6)
         else:
@@ -1480,23 +1484,100 @@ def recommendations(results):
 
     bssim = baseline["ssim"]
     bsize = baseline["estimated_output_mb"]
+    bfps = baseline.get("fps") or 15.0
 
-    safe = [
+    general_safe = [
         r for r in normal
-        if r["ssim"] >= bssim - 0.010
+        if r.get("group") not in {"Smart FPS", "Target size"}
+        and (r.get("fps") or bfps) >= bfps * 0.95
+        and r["ssim"] >= bssim - 0.010
         and r["estimated_output_mb"] <= bsize * 1.20
     ]
-    safe.sort(key=lambda r: r["speed_x"], reverse=True)
+    general_safe.sort(key=lambda r: r["speed_x"], reverse=True)
+
+    static_safe = [
+        r for r in normal
+        if r.get("group") == "Smart FPS"
+        and r["ssim"] >= bssim - 0.010
+        and r["estimated_output_mb"] <= bsize * 1.05
+    ]
+    static_safe.sort(key=lambda r: r["speed_x"], reverse=True)
+
+    targets = [r for r in normal if r.get("group") == "Target size"]
+    targets.sort(key=lambda r: r["speed_x"], reverse=True)
 
     quality = sorted(normal, key=lambda r: (r.get("ssim") or 0, r.get("speed_x") or 0), reverse=True)
     smallest = sorted(normal, key=lambda r: (r.get("estimated_output_mb") or 1e9, -(r.get("ssim") or 0)))
 
+    fastest_general = general_safe[0] if general_safe else None
     return {
         "baseline": baseline,
-        "fastest_safe": safe[0] if safe else None,
+        "fastest_safe": fastest_general,
+        "fastest_general": fastest_general,
+        "fastest_static": static_safe[0] if static_safe else None,
+        "fastest_target": targets[0] if targets else None,
         "best_ssim": quality[0] if quality else None,
         "smallest": smallest[0] if smallest else None,
     }
+
+
+def confirmation_shortlist(recs):
+    chosen = []
+    for key in ("baseline", "fastest_general", "fastest_static"):
+        row = recs.get(key)
+        if row and row.get("id") not in chosen:
+            chosen.append(row["id"])
+    return chosen[:3]
+
+
+def confirm_candidates(results, spec_by_id, recs, src, info, work_dir, nvencc_path):
+    ids = confirmation_shortlist(recs)
+    if not ids:
+        return
+
+    dur = min(90.0, max(45.0, info.duration * 0.015))
+    dur = min(dur, max(2.0, info.duration))
+    start = max(0.0, min(info.duration * 0.5 - dur / 2, max(0.0, info.duration - dur)))
+    segment = [(start, dur)]
+
+    print()
+    print(f"🔍 تأكيد أفضل النتائج على مقطع أطول: {dur:.0f} ثانية")
+
+    rows = {r.get("id"): r for r in results}
+    for cid in ids:
+        spec = spec_by_id.get(cid)
+        row = rows.get(cid)
+        if not spec or not row or row.get("status") != "ok":
+            continue
+        try:
+            confirm = run_single_candidate(
+                spec,
+                src,
+                info,
+                segment,
+                work_dir,
+                nvencc_path,
+                keep_outputs=False,
+                repeats=1,
+                warmup=True,
+            )
+            row["confirm_speed_x"] = confirm.get("speed_x")
+            row["confirm_estimated_full_encode"] = confirm.get("estimated_full_encode")
+            row["confirm_estimated_output_mb"] = confirm.get("estimated_output_mb")
+            row["confirm_ssim"] = confirm.get("ssim")
+            row["confirm_cpu_avg_pct"] = confirm.get("cpu_avg_pct")
+            row["confirm_gpu_avg_pct"] = confirm.get("gpu_avg_pct")
+            row["confirm_gpu_encoder_avg_pct"] = confirm.get("gpu_encoder_avg_pct")
+            cleanup_result_outputs(confirm)
+            print(
+                f"   ✅ {row['candidate']} — "
+                f"{row['confirm_speed_x']:.2f}x • "
+                f"{row['confirm_estimated_full_encode']}"
+            )
+        except Exception as exc:
+            row["confirmation_error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            print(f"   ⚠️ تعذر تأكيد {row['candidate']}: {type(exc).__name__}")
+
 
 
 def display_results(results, hw, source_info, recs):
