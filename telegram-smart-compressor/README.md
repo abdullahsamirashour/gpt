@@ -47,4 +47,4 @@
 
 [فتح Encoder Benchmark في Colab](https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/Encoder_Benchmark.ipynb)
 
-النوت بوك لا تغيّر القناة ولا محرك الضغط الأساسي. تعرض تلقائيًا اسم المعالج، عدد الـphysical cores والـlogical threads، الرام، نوع الـGPU إن وجد، ثم تختبر بدائل CPU/GPU وتحفظ تقريرًا مفصلًا في Google Drive.
+النوت بوك لا تغيّر القناة ولا محرك الضغط الأساسي. الإصدار v1.1 يشخّص FFmpeg NVENC وNVDEC وFull GPU وNVEncC كلٌ بشكل مستقل، ويستخدم Warm-up + قياسات مكررة بالـMedian، ويعرض CPU/GPU/NVENC utilization، ثم يؤكد أفضل النتائج على مقطع أطول ويحفظ تقريرًا مفصلًا في Google Drive.
