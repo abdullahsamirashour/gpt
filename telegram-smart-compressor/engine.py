@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.2.3"
+ENGINE_BUNDLE_VERSION = "5.2.4"
 APP_NAME = "Smart Compressor"
 WORKSPACE_TITLE = "📦 Smart Compressor"
 BASE_DIR = Path("/content/drive/MyDrive/Telegram_Extreme_Compressor")
@@ -713,17 +713,36 @@ async def ensure_workspace(client, config):
                         repr(exc),
                     )
 
-                transient = type(exc).__name__ in {
+                error_name = type(exc).__name__
+                error_text = str(exc)
+                error_upper = error_text.upper()
+
+                if error_name == "ChannelsTooMuchError" or "CHANNELS_TOO_MUCH" in error_upper:
+                    raise AppError(
+                        "E132",
+                        "حساب Telegram وصل لحد القنوات أو المجموعات المسموح بها. قلّل عدد القنوات/المجموعات في الحساب ثم شغّل الأداة مرة أخرى.",
+                        repr(exc),
+                    )
+
+                if error_name == "UserRestrictedError" or "USER_RESTRICTED" in error_upper:
+                    raise AppError(
+                        "E133",
+                        "Telegram مانع الحساب حاليًا من إنشاء قنوات أو مجموعات. راجع حالة الحساب من @SpamBot داخل Telegram ثم جرّب مرة أخرى.",
+                        repr(exc),
+                    )
+
+                transient = error_name in {
                     "RpcCallFailError",
                     "ServerError",
                     "TimedOutError",
                     "TimeoutError",
-                } or "internal issues" in str(exc).lower() or "try again later" in str(exc).lower()
+                } or "internal issues" in error_text.lower() or "try again later" in error_text.lower()
 
                 if not transient:
+                    safe_reason = re.sub(r"[^A-Za-z0-9_ -]", "", error_name)[:80] or "TelegramError"
                     raise AppError(
-                        "E130",
-                        "تعذر إنشاء قناة Smart Compressor على Telegram.",
+                        "E134",
+                        f"Telegram رفض إنشاء القناة تلقائيًا. نوع الخطأ: {safe_reason}. لو تقدر تنشئ قناة خاصة باسم «📦 Smart Compressor» يدويًا، اعملها ثم شغّل الأداة مرة أخرى.",
                         repr(exc),
                     )
 
