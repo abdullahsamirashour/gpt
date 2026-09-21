@@ -89,7 +89,7 @@ jobs:
           spec.loader.exec_module(engine)
 
           assert engine.ENGINE_BUNDLE_VERSION.startswith("5.3.")
-          assert engine.WORKSPACE_TITLE == "🎓 ضغط المحاضرات"
+          assert engine.WORKSPACE_TITLE == "📦 ضغط الفيديو والصوت"
           assert engine.TURBO_CONNECTIONS == 4
           assert engine.TURBO_PART_KB == 512
 
@@ -309,7 +309,7 @@ jobs:
           from telethon import functions, types
           req = functions.channels.CreateChannelRequest(title="x", about="x", broadcast=True, megagroup=False)
           assert req.broadcast is True
-          functions.channels.EditTitleRequest(channel=types.InputChannelEmpty(), title="🎓 ضغط المحاضرات")
+          functions.channels.EditTitleRequest(channel=types.InputChannelEmpty(), title="📦 ضغط الفيديو والصوت")
           functions.messages.ToggleDialogPinRequest(
               pinned=True,
               peer=types.InputDialogPeer(peer=types.InputPeerSelf()),
