@@ -1348,7 +1348,7 @@ def cleanup_result_outputs(result):
 
 
 async def gpu_batch_throughput(src, info, hw, work_dir, jobs=2):
-    if not (hw["nvenc_available"] and hw["scale_cuda_available"]):
+    if not hw.get("source_full_gpu_ok"):
         return None
 
     dur = min(20.0, max(6.0, info.duration * 0.1))
@@ -1782,6 +1782,8 @@ async def benchmark_main():
     target_mb = int(os.environ.get("BENCH_TARGET_MB", "80") or 80)
     install_nvencc_flag = os.environ.get("BENCH_INSTALL_NVENCC", "1") == "1"
     keep_outputs = os.environ.get("BENCH_KEEP_OUTPUTS", "0") == "1"
+    default_repeats = 2 if mode == "quick" else 3
+    repeats = max(1, min(5, int(os.environ.get("BENCH_REPEATS", str(default_repeats)) or default_repeats)))
 
     hw = hardware_info()
     show_hardware(hw)
@@ -1797,18 +1799,31 @@ async def benchmark_main():
         "codec": info.codec,
     })
 
+    print("🧰 تشخيص مسار GPU على نفس فيديو المصدر...")
+    diagnose_source_gpu(src, info, hw)
+
+    # Important: NVEncC is tested independently from FFmpeg NVENC.
+    nvencc_path = install_nvencc(install_nvencc_flag, hw)
+    show_gpu_diagnostics(hw)
+
     segments = sample_segments(info.duration, mode)
     sample_total = sum(d for _, d in segments)
     print(
         f"🧪 العينة: {len(segments)} مقاطع بإجمالي {sample_total:.0f} ثانية "
         f"من فيديو مدته {human_time(info.duration)}."
     )
+    print(
+        f"🔁 كل مرشح: Warm-up ثم {repeats} قياسات؛ النتيجة = Median. "
+        "ترتيب الاختبارات يتغير لتقليل تحيز حرارة/ضغط المعالج."
+    )
     print("ℹ️ البنش يقيس الفيديو فقط؛ لا رفع إلى Telegram ولا تعديل للقناة.")
-
-    nvencc_path = install_nvencc(install_nvencc_flag, hw)
 
     specs = candidate_specs(info, hw, mode, target_mb)
     specs.extend(nvencc_specs(info, hw, nvencc_path, mode))
+    spec_by_id = {spec["id"]: spec for spec in specs}
+
+    seed = 20260921 + int(info.size % 100000)
+    random.Random(seed).shuffle(specs)
 
     results = []
     test_dir = WORK_DIR / "outputs"
@@ -1824,6 +1839,8 @@ async def benchmark_main():
                 "backend": spec["backend"],
                 "preset": spec.get("preset", ""),
                 "fps": spec.get("fps"),
+                "execution_order": idx,
+                "repeats": repeats,
                 "sample_seconds": None,
                 "encode_seconds": None,
                 "speed_x": None,
@@ -1835,6 +1852,7 @@ async def benchmark_main():
                 "status": "skipped",
                 "notes": reason,
             })
+            print(f"[{idx}/{len(specs)}] ➖ {spec['label']} — {reason[:160]}")
             continue
 
         print()
@@ -1848,12 +1866,21 @@ async def benchmark_main():
                 test_dir,
                 nvencc_path,
                 keep_outputs,
+                repeats=repeats,
+                warmup=True,
             )
+            row["execution_order"] = idx
             results.append(row)
+            util = ""
+            if row.get("gpu_encoder_avg_pct") is not None:
+                util = f" • NVENC {row['gpu_encoder_avg_pct']:.0f}%"
+            elif row.get("cpu_avg_pct") is not None:
+                util = f" • CPU {row['cpu_avg_pct']:.0f}%"
             print(
-                f"   ✅ {row['speed_x']:.2f}x • "
+                f"   ✅ Median {row['speed_x']:.2f}x • "
                 f"{row['estimated_full_encode']} للفيديو الكامل • "
-                f"SSIM {row['ssim'] if row['ssim'] is not None else 'N/A'}"
+                f"CV {row.get('timing_cv_pct') if row.get('timing_cv_pct') is not None else 'N/A'}%"
+                f"{util}"
             )
         except Exception as exc:
             results.append({
@@ -1863,6 +1890,8 @@ async def benchmark_main():
                 "backend": spec["backend"],
                 "preset": spec.get("preset", ""),
                 "fps": spec.get("fps"),
+                "execution_order": idx,
+                "repeats": repeats,
                 "sample_seconds": None,
                 "encode_seconds": None,
                 "speed_x": None,
@@ -1872,19 +1901,20 @@ async def benchmark_main():
                 "ssim": None,
                 "vmaf": None,
                 "status": "failed",
-                "notes": f"{type(exc).__name__}: {str(exc)[:350]}",
+                "notes": f"{type(exc).__name__}: {str(exc)[:500]}",
             })
-            print(f"   ⚠️ تخطي بسبب: {type(exc).__name__}")
+            print(f"   ⚠️ FAILED: {type(exc).__name__}: {str(exc)[:180]}")
 
     if hw["libvmaf_available"]:
         add_vmaf(results, src, hw)
 
-    if mode in ("full", "max") and hw["nvenc_available"] and hw["scale_cuda_available"]:
+    if mode in ("full", "max") and hw.get("source_full_gpu_ok"):
         for jobs in ((2, 3) if mode == "max" else (2,)):
             print(f"⚡ اختبار Throughput لعدد {jobs} encode بالتوازي...")
             try:
                 row = await gpu_batch_throughput(src, info, hw, test_dir, jobs=jobs)
                 if row:
+                    row["execution_order"] = len(results) + 1
                     results.append(row)
             except Exception as exc:
                 results.append({
@@ -1894,6 +1924,7 @@ async def benchmark_main():
                     "backend": "ffmpeg_nvenc_full",
                     "preset": "p3",
                     "fps": None,
+                    "execution_order": len(results) + 1,
                     "sample_seconds": None,
                     "encode_seconds": None,
                     "speed_x": None,
@@ -1903,11 +1934,23 @@ async def benchmark_main():
                     "ssim": None,
                     "vmaf": None,
                     "status": "failed",
-                    "notes": f"{type(exc).__name__}: {str(exc)[:350]}",
+                    "notes": f"{type(exc).__name__}: {str(exc)[:500]}",
                 })
 
     enrich_relative_metrics(results)
     recs = recommendations(results)
+
+    if mode in ("full", "max"):
+        confirm_candidates(
+            results,
+            spec_by_id,
+            recs,
+            src,
+            info,
+            test_dir,
+            nvencc_path,
+        )
+        recs = recommendations(results)
 
     run_stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     report_dir = REPORT_ROOT / run_stamp
@@ -1917,6 +1960,10 @@ async def benchmark_main():
         "install_nvencc": install_nvencc_flag,
         "keep_outputs": keep_outputs,
         "sample_total_seconds": sample_total,
+        "repeats": repeats,
+        "warmup": True,
+        "random_seed": seed,
+        "confirmation_enabled": mode in ("full", "max"),
     }
     write_report(report_dir, hw, source_meta, info, segments, results, recs, config)
     display_results(results, hw, source_meta, recs)
@@ -1934,6 +1981,7 @@ async def benchmark_main():
         "report_dir": str(report_dir),
         "recommendations": recs,
     }
+
 
 
 def run_benchmark():
