@@ -10,8 +10,10 @@ import json
 import math
 import os
 import platform
+import random
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -22,7 +24,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-BENCH_VERSION = "1.0.0-beta"
+BENCH_VERSION = "1.1.0-beta"
 BASE_DIR = Path("/content/drive/MyDrive/Telegram_Extreme_Compressor")
 CONFIG_PATH = BASE_DIR / "config.json"
 SESSION_FILE = BASE_DIR / "telegram_user.session"
@@ -127,24 +129,68 @@ def ffmpeg_has_filter(name: str) -> bool:
         return False
 
 
-def detect_nvenc() -> bool:
-    if not shutil.which("nvidia-smi"):
-        return False
+def probe_command(cmd, timeout=20):
     try:
-        p = subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "color=size=64x64:rate=1",
-                "-frames:v", "1", "-c:v", "h264_nvenc",
-                "-f", "null", "-"
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=20,
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
         )
-        return p.returncode == 0
+        text = (proc.stderr or proc.stdout or "").strip()
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": int(proc.returncode),
+            "reason": text[-1200:] if text else "",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "returncode": None,
+            "reason": f"{type(exc).__name__}: {str(exc)[:1000]}",
+        }
+
+
+def ffmpeg_has_encoder(name: str) -> bool:
+    try:
+        text = run(["ffmpeg", "-hide_banner", "-encoders"]).stdout
+        return bool(re.search(rf"\\b{re.escape(name)}\\b", text))
     except Exception:
         return False
+
+
+def detect_nvenc_details():
+    listed = ffmpeg_has_encoder("h264_nvenc")
+    if not shutil.which("nvidia-smi"):
+        return {
+            "listed": listed,
+            "ok": False,
+            "reason": "nvidia-smi غير موجود؛ لا يوجد NVIDIA GPU متاح للـRuntime.",
+        }
+
+    probe = probe_command(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=size=128x72:rate=10",
+            "-t", "1",
+            "-an",
+            "-c:v", "h264_nvenc",
+            "-preset", "p3",
+            "-f", "null", "-",
+        ],
+        timeout=25,
+    )
+    return {
+        "listed": listed,
+        "ok": bool(probe["ok"]),
+        "reason": probe["reason"],
+    }
+
+
+def detect_nvenc() -> bool:
+    return bool(detect_nvenc_details()["ok"])
+
 
 
 def gpu_info():
@@ -188,7 +234,7 @@ def hardware_info():
     except Exception:
         lscpu_map = {}
 
-    nvenc = detect_nvenc()
+    nvenc = detect_nvenc_details()
     scale_cuda = ffmpeg_has_filter("scale_cuda")
     libvmaf = ffmpeg_has_filter("libvmaf")
 
@@ -209,14 +255,25 @@ def hardware_info():
         "threads_per_core": lscpu_map.get("Thread(s) per core", "?"),
         "ram_gb": round(ram_gb, 2),
         "gpu": gpu,
-        "nvenc_available": nvenc,
+        "ffmpeg_nvenc_encoder_listed": bool(nvenc["listed"]),
+        "ffmpeg_nvenc_smoke_ok": bool(nvenc["ok"]),
+        "ffmpeg_nvenc_smoke_reason": nvenc["reason"],
+        "nvenc_available": bool(nvenc["ok"]),
         "scale_cuda_available": scale_cuda,
         "libvmaf_available": libvmaf,
         "pynvvideocodec_available": importlib.util.find_spec("PyNvVideoCodec") is not None,
+        "source_nvdec_ok": None,
+        "source_nvdec_reason": "",
+        "source_full_gpu_ok": None,
+        "source_full_gpu_reason": "",
+        "nvencc_installed": False,
+        "nvencc_hw_ok": None,
+        "nvencc_hw_reason": "",
         "ffmpeg": ffmpeg_version(),
         "python": sys.version.split()[0],
         "platform": platform.platform(),
     }
+
 
 
 def show_hardware(info):
@@ -240,13 +297,49 @@ def show_hardware(info):
             f'{info["cpu_logical_threads"]} logical threads</bdi><br>'
             f'<b>GPU:</b> <bdi dir="ltr">{gpu_line}</bdi><br>'
             f'<b>RAM:</b> <bdi dir="ltr">{info["ram_gb"]:.1f} GB</bdi><br>'
-            f'<b>NVENC:</b> {"✅" if info["nvenc_available"] else "❌"} &nbsp; '
+            f'<b>FFmpeg h264_nvenc listed:</b> {"✅" if info["ffmpeg_nvenc_encoder_listed"] else "❌"} &nbsp; '
+            f'<b>NVENC smoke:</b> {"✅" if info["ffmpeg_nvenc_smoke_ok"] else "❌"} &nbsp; '
             f'<b>scale_cuda:</b> {"✅" if info["scale_cuda_available"] else "❌"} &nbsp; '
             f'<b>libvmaf:</b> {"✅" if info["libvmaf_available"] else "❌"}'
             '</div>'
         ))
     except Exception:
         print(json.dumps(info, ensure_ascii=False, indent=2))
+
+
+def show_gpu_diagnostics(info):
+    if not info.get("gpu"):
+        return
+    rows = [
+        ("FFmpeg h264_nvenc موجود", info.get("ffmpeg_nvenc_encoder_listed"), ""),
+        ("FFmpeg NVENC smoke", info.get("ffmpeg_nvenc_smoke_ok"), info.get("ffmpeg_nvenc_smoke_reason", "")),
+        ("NVDEC على فيديو المصدر", info.get("source_nvdec_ok"), info.get("source_nvdec_reason", "")),
+        ("Full GPU NVDEC→CUDA→NVENC", info.get("source_full_gpu_ok"), info.get("source_full_gpu_reason", "")),
+        ("NVEncC hardware check", info.get("nvencc_hw_ok"), info.get("nvencc_hw_reason", "")),
+    ]
+    try:
+        from IPython.display import HTML, display
+        html_rows = []
+        for label, ok, reason in rows:
+            mark = "✅" if ok is True else ("❌" if ok is False else "➖")
+            detail = ""
+            if ok is False and reason:
+                clean = html.escape(str(reason).replace("\n", " ")[:260])
+                detail = f'<br><span style="color:#6b7280;font-size:12px"><bdi dir="ltr">{clean}</bdi></span>'
+            html_rows.append(f'<div style="margin:5px 0">{mark} <b>{label}</b>{detail}</div>')
+        display(HTML(
+            '<div dir="rtl" style="max-width:900px;padding:12px 16px;margin:8px 0;'
+            'border:1px solid #d0d7de;border-radius:12px;background:#fff7ed;'
+            'font-family:Arial,sans-serif">'
+            '<b>🧰 تشخيص مسار الـGPU</b>'
+            + "".join(html_rows) +
+            '</div>'
+        ))
+    except Exception:
+        print("GPU diagnostics:")
+        for label, ok, reason in rows:
+            print(label, ok, reason[:300] if reason else "")
+
 
 
 def parse_rate(value):
