@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import html
 import importlib.util
 import json
 import math
@@ -939,35 +940,39 @@ def run_process_monitored(cmd, monitor_gpu=False):
     import psutil
 
     started = time.time()
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
     cpu_samples = []
     gpu_samples = []
     psutil.cpu_percent(interval=None)
     last_gpu = 0.0
 
-    while proc.poll() is None:
-        time.sleep(0.20)
-        try:
-            cpu_samples.append(float(psutil.cpu_percent(interval=None)))
-        except Exception:
-            pass
-        now = time.time()
-        if monitor_gpu and now - last_gpu >= 0.55:
-            sample = sample_gpu_stats()
-            if sample:
-                gpu_samples.append(sample)
-            last_gpu = now
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
 
-    stdout, stderr = proc.communicate()
-    elapsed = time.time() - started
+        while proc.poll() is None:
+            time.sleep(0.20)
+            try:
+                cpu_samples.append(float(psutil.cpu_percent(interval=None)))
+            except Exception:
+                pass
+            now = time.time()
+            if monitor_gpu and now - last_gpu >= 0.55:
+                sample = sample_gpu_stats()
+                if sample:
+                    gpu_samples.append(sample)
+                last_gpu = now
+
+        proc.wait()
+        elapsed = time.time() - started
+        log.seek(0)
+        output = log.read()
+
     if proc.returncode != 0:
-        raise RuntimeError((stderr or stdout or "unknown error")[-2500:])
+        raise RuntimeError((output or "unknown error")[-2500:])
 
     def avg(values):
         values = [v for v in values if v is not None]
@@ -1488,7 +1493,7 @@ def recommendations(results):
 
     general_safe = [
         r for r in normal
-        if r.get("group") not in {"Smart FPS", "Target size"}
+        if r.get("group") not in {"Smart FPS", "Target size", "Duplicate frames"}
         and (r.get("fps") or bfps) >= bfps * 0.95
         and r["ssim"] >= bssim - 0.010
         and r["estimated_output_mb"] <= bsize * 1.20
