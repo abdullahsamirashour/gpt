@@ -246,6 +246,52 @@ jobs:
 
           asyncio.run(workspace_retry_test())
 
+          class ChannelsTooMuchError(Exception):
+              pass
+
+          class UserRestrictedError(Exception):
+              pass
+
+          class WeirdTelegramError(Exception):
+              pass
+
+          class AlwaysFailWorkspaceClient(FakeWorkspaceClient):
+              def __init__(self, error):
+                  super().__init__()
+                  self.error = error
+
+              async def __call__(self, request):
+                  self.create_calls += 1
+                  raise self.error
+
+          async def workspace_error_mapping_test():
+              old_config_path = engine.CONFIG_PATH
+              old_sleep = engine.asyncio.sleep
+              with tempfile.TemporaryDirectory() as td:
+                  engine.CONFIG_PATH = Path(td) / "config.json"
+
+                  async def no_sleep(_seconds):
+                      return None
+                  engine.asyncio.sleep = no_sleep
+
+                  cases = [
+                      (ChannelsTooMuchError("CHANNELS_TOO_MUCH"), "E132"),
+                      (UserRestrictedError("USER_RESTRICTED"), "E133"),
+                      (WeirdTelegramError("SOMETHING_ELSE"), "E134"),
+                  ]
+
+                  for error, expected in cases:
+                      try:
+                          await engine.ensure_workspace(AlwaysFailWorkspaceClient(error), {})
+                      except engine.AppError as exc:
+                          assert exc.code == expected, (type(error).__name__, exc.code)
+                      else:
+                          raise AssertionError(f"Expected {expected}")
+              engine.CONFIG_PATH = old_config_path
+              engine.asyncio.sleep = old_sleep
+
+          asyncio.run(workspace_error_mapping_test())
+
           # Telethon API objects used by the engine still match the pinned version.
           from telethon import functions, types
           req = functions.channels.CreateChannelRequest(title="x", about="x", broadcast=True, megagroup=False)
