@@ -184,6 +184,68 @@ jobs:
               assert migrated["output_ids"] == [9, 10]
               assert migrated["command_ids"] == [20]
 
+          # Workspace creation must recover from transient Telegram RPC failures.
+          class RpcCallFailError(Exception):
+              pass
+
+          class FakeDialog:
+              def __init__(self, entity):
+                  self.name = engine.WORKSPACE_TITLE
+                  self.entity = entity
+
+          class FakeWorkspaceClient:
+              def __init__(self):
+                  self.create_calls = 0
+                  self.dialogs = []
+                  self.channel = Obj(id=555, creator=True, admin_rights=None)
+
+              async def get_entity(self, _peer):
+                  raise ValueError("not found")
+
+              def iter_dialogs(self):
+                  async def gen():
+                      for dialog in list(self.dialogs):
+                          yield dialog
+                  return gen()
+
+              async def __call__(self, request):
+                  self.create_calls += 1
+                  if self.create_calls == 1:
+                      raise RpcCallFailError("Telegram is having internal issues, please try again later.")
+                  return Obj(chats=[self.channel])
+
+              async def get_messages(self, _channel, ids=None):
+                  return None
+
+              async def send_message(self, _channel, _text):
+                  return Obj(id=777)
+
+              async def pin_message(self, *_args, **_kwargs):
+                  return None
+
+              async def get_input_entity(self, _channel):
+                  return types.InputPeerSelf()
+
+          async def workspace_retry_test():
+              old_config_path = engine.CONFIG_PATH
+              old_sleep = engine.asyncio.sleep
+              with tempfile.TemporaryDirectory() as td:
+                  engine.CONFIG_PATH = Path(td) / "config.json"
+
+                  async def no_sleep(_seconds):
+                      return None
+                  engine.asyncio.sleep = no_sleep
+
+                  client = FakeWorkspaceClient()
+                  channel, created = await engine.ensure_workspace(client, {})
+                  assert channel.id == 555
+                  assert created is True
+                  assert client.create_calls == 2
+              engine.CONFIG_PATH = old_config_path
+              engine.asyncio.sleep = old_sleep
+
+          asyncio.run(workspace_retry_test())
+
           # Telethon API objects used by the engine still match the pinned version.
           from telethon import functions, types
           req = functions.channels.CreateChannelRequest(title="x", about="x", broadcast=True, megagroup=False)
