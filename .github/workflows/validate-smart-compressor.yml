@@ -65,6 +65,9 @@ jobs:
               if path.name == "launcher-beta.ipynb":
                   assert 'os.environ["TSC_ENGINE_SHA"] = sha' in code
                   assert 'BRANCH = "beta"' in code
+              elif path.name in {"Smart_Compressor.ipynb", "launcher.ipynb"}:
+                  assert 'os.environ["TSC_ENGINE_SHA"] = sha' in code
+                  assert 'BRANCH = "main"' in code
               compile(code, str(path), "exec")
               print("OK notebook:", path)
 
