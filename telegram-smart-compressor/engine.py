@@ -18,14 +18,27 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.request
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.3.1"
-APP_NAME = "ضغط الفيديو والصوت"
-WORKSPACE_TITLE = "📦 ضغط الفيديو والصوت"
-WORKSPACE_ALIASES = {WORKSPACE_TITLE, "🎓 ضغط المحاضرات", "📦 Smart Compressor", "Smart Compressor"}
+ENGINE_BUNDLE_VERSION = "5.4.0"
+APP_NAME = "اضغطها | Media Lite"
+WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
+WORKSPACE_ALIASES = {
+    WORKSPACE_TITLE,
+    "📦 ضغط الفيديو والصوت",
+    "🎓 ضغط المحاضرات",
+    "📦 Smart Compressor",
+    "Smart Compressor",
+}
+BRANDING_VERSION = "media-lite-v1"
+BRAND_REPO = "abdullahsamirashour/gpt"
+BRAND_ASSET_DIR = "telegram-smart-compressor/assets"
+BRAND_LOGO_FILE = "media_lite_logo.jpg"
+BRAND_BANNER_FILE = "media_lite_banner.jpg"
+CHANNEL_ABOUT = "اضغطها | Media Lite — ضغط ذكي للفيديو والصوت عبر Google Colab."
 COLAB_URL = "https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/Smart_Compressor.ipynb"
 TURBO_THRESHOLD = 8 * 1024 * 1024
 TURBO_CONNECTIONS = 4
@@ -236,7 +249,8 @@ def first_time_setup(config):
     print()
 
     print("٣/٣ — رقم الهاتف")
-    phone = input("مثال +2010XXXXXXX: ").strip()
+    print("لن يظهر الرقم أثناء الكتابة — ده طبيعي.")
+    phone = getpass.getpass("رقم الهاتف بصيغة دولية: ").strip()
     print()
 
     if not api_id_raw.isdigit() or not api_hash or not phone:
@@ -250,6 +264,189 @@ def first_time_setup(config):
     save_json(CONFIG_PATH, config)
     print("✅ تم حفظ إعداد تيليجرام. البوكس ده مش هيظهر في التشغيلات القادمة.")
     return config
+
+
+def get_brand_asset(filename: str) -> Path:
+    local = Path("telegram-smart-compressor") / "assets" / filename
+    if os.environ.get("TSC_TEST_MODE") == "1" and local.exists():
+        return local
+
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    target = TMP_DIR / filename
+    if target.exists() and target.stat().st_size > 1024:
+        return target
+
+    ref = (
+        os.environ.get("TSC_ENGINE_SHA")
+        or os.environ.get("TSC_UPDATE_CHANNEL")
+        or "main"
+    )
+
+    # Old saved notebook copies may only provide the branch name. Resolve it
+    # to a commit SHA first so branding files never depend on raw-branch cache.
+    if not re.fullmatch(r"[0-9a-f]{40}", str(ref or "")):
+        try:
+            p = subprocess.run(
+                [
+                    "git",
+                    "ls-remote",
+                    f"https://github.com/{BRAND_REPO}.git",
+                    f"refs/heads/{ref}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if p.returncode == 0 and p.stdout.strip():
+                candidate = p.stdout.strip().split()[0]
+                if re.fullmatch(r"[0-9a-f]{40}", candidate):
+                    ref = candidate
+        except Exception:
+            pass
+
+    url = (
+        f"https://raw.githubusercontent.com/{BRAND_REPO}/{ref}/"
+        f"{BRAND_ASSET_DIR}/{filename}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Media-Lite-Colab",
+            "Cache-Control": "no-cache",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        data = response.read()
+
+    if len(data) < 1024 or not data.startswith(b"\xff\xd8"):
+        raise RuntimeError(f"invalid-brand-asset:{filename}")
+
+    target.write_bytes(data)
+    return target
+
+
+async def apply_channel_branding(client, channel, config):
+    from telethon import functions, types
+
+    changed = False
+
+    if config.get("workspace_about_version") != BRANDING_VERSION:
+        try:
+            await client(
+                functions.messages.EditChatAboutRequest(
+                    peer=channel,
+                    about=CHANNEL_ABOUT,
+                )
+            )
+            config["workspace_about_version"] = BRANDING_VERSION
+            changed = True
+        except Exception:
+            pass
+
+    if config.get("workspace_photo_version") != BRANDING_VERSION:
+        try:
+            logo = get_brand_asset(BRAND_LOGO_FILE)
+            uploaded = await client.upload_file(str(logo))
+            await client(
+                functions.channels.EditPhotoRequest(
+                    channel=channel,
+                    photo=types.InputChatUploadedPhoto(file=uploaded),
+                )
+            )
+            config["workspace_photo_version"] = BRANDING_VERSION
+            changed = True
+            print("✅ تم تحديث لوجو القناة.")
+        except Exception:
+            print("↪️ تعذر تحديث لوجو القناة الآن؛ هنكمل عادي ونجرب في التشغيل القادم.")
+
+    if changed:
+        save_json(CONFIG_PATH, config)
+
+
+def pinned_message_html():
+    return (
+        "🗜️ <b>اضغطها | Media Lite</b>\n"
+        "ضغط ذكي للفيديو والصوت.\n\n"
+        "ابعت الملف هنا، وبعدها افتح Colab واضغط تشغيل.\n"
+        f'<a href="{COLAB_URL}">▶ افتح Colab</a>\n\n'
+        "<b>إعادة نتيجة قديمة</b> — اعمل Reply عليها واكتب:\n"
+        "<code>1</code> نفس الإعداد  •  <code>2</code> أصغر  •  <code>3</code> صوت فقط\n"
+        "أو اكتب الحجم مباشرة، مثال <code>80</code>."
+    )
+
+
+async def ensure_pinned_brand_message(client, channel, config):
+    instructions = pinned_message_html()
+    old_instruction = None
+    instruction_id = config.get("workspace_instruction_id")
+
+    if instruction_id:
+        try:
+            old_instruction = await client.get_messages(channel, ids=int(instruction_id))
+        except Exception:
+            old_instruction = None
+
+    if (
+        old_instruction
+        and config.get("workspace_pin_version") == BRANDING_VERSION
+    ):
+        try:
+            updated = await client.edit_message(
+                channel,
+                old_instruction,
+                instructions,
+                parse_mode="html",
+            )
+            await client.pin_message(channel, updated or old_instruction, notify=False)
+            return updated or old_instruction
+        except Exception:
+            old_instruction = None
+
+    banner = None
+    try:
+        banner = get_brand_asset(BRAND_BANNER_FILE)
+    except Exception:
+        banner = None
+
+    try:
+        if banner is not None:
+            instruction = await client.send_file(
+                channel,
+                str(banner),
+                caption=instructions,
+                parse_mode="html",
+                force_document=False,
+            )
+        else:
+            instruction = await client.send_message(
+                channel,
+                instructions,
+                parse_mode="html",
+                link_preview=False,
+            )
+    except Exception:
+        instruction = await client.send_message(
+            channel,
+            instructions,
+            parse_mode="html",
+            link_preview=False,
+        )
+
+    await client.pin_message(channel, instruction, notify=False)
+
+    config["workspace_instruction_id"] = int(instruction.id)
+    config["workspace_pin_version"] = BRANDING_VERSION
+    save_json(CONFIG_PATH, config)
+
+    if old_instruction and int(old_instruction.id) != int(instruction.id):
+        try:
+            await client.delete_messages(channel, [int(old_instruction.id)])
+        except Exception:
+            pass
+
+    return instruction
+
+
 
 
 def default_state():
@@ -624,7 +821,7 @@ def classify_video_complexity(src: Path, info: MediaInfo) -> str:
     points = [max(0.0, info.duration * 0.20), max(0.0, info.duration * 0.65)]
     rates = []
 
-    print("🧠 تحليل سريع لطبيعة المحاضرة...")
+    print("🧠 تحليل سريع لطبيعة المحتوى...")
     for i, start in enumerate(points, 1):
         sample = TMP_DIR / f"sample_{src.stem}_{i}_{int(time.time() * 1000)}.mp4"
         sample_len = min(4.0, max(1.0, info.duration - start))
@@ -736,7 +933,7 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
             print("🔎 المحتوى فيه تفاصيل — هنحافظ على جودة أعلى.")
         else:
             fps_cap, gpu_cq, cpu_crf = 15, 30, 29
-            print("🎓 محتوى محاضرة عادي — إعداد متوازن.")
+            print("🎞️ محتوى عادي — إعداد متوازن.")
 
         gpu_codec = [
             "-c:v", "h264_nvenc", "-preset", "p4",
@@ -933,7 +1130,7 @@ async def ensure_workspace(client, config):
 
     if channel is None:
         print()
-        print("📦 إنشاء مساحة ضغط الفيديو والصوت...")
+        print("🗜️ إنشاء مساحة اضغطها | Media Lite...")
 
         last_error = None
         for attempt, delay in enumerate((0, 3, 7, 15), 1):
@@ -945,7 +1142,7 @@ async def ensure_workspace(client, config):
                 result = await client(
                     functions.channels.CreateChannelRequest(
                         title=WORKSPACE_TITLE,
-                        about="مساحة خاصة لضغط الفيديو والصوت عبر Google Colab.",
+                        about=CHANNEL_ABOUT,
                         broadcast=True,
                         megagroup=False,
                     )
@@ -1013,59 +1210,25 @@ async def ensure_workspace(client, config):
                 repr(last_error),
             )
 
-    # Rename only our exact old default title; never overwrite a user's custom title.
-    if (getattr(channel, "title", "") or "").strip() in {"🎓 ضغط المحاضرات", "📦 Smart Compressor", "Smart Compressor"}:
+    current_title = (getattr(channel, "title", "") or "").strip()
+    if current_title in (WORKSPACE_ALIASES - {WORKSPACE_TITLE}):
         try:
-            await client(functions.channels.EditTitleRequest(channel=channel, title=WORKSPACE_TITLE))
+            await client(
+                functions.channels.EditTitleRequest(
+                    channel=channel,
+                    title=WORKSPACE_TITLE,
+                )
+            )
             channel = await client.get_entity(channel)
+            print(f"✅ تم تحديث اسم القناة إلى «{WORKSPACE_TITLE}».")
         except Exception:
             pass
 
     config["workspace_id"] = int(channel.id)
     save_json(CONFIG_PATH, config)
 
-    instructions = (
-        "📦 <b>ضغط الفيديو والصوت</b>\n\n"
-        "ابعت ملف صوت أو فيديو هنا، وبعدها افتح Colab واضغط تشغيل.\n\n"
-        f'<a href="{COLAB_URL}">▶ افتح Colab</a>\n\n'
-        "<b>إعادة نتيجة قديمة</b> — اعمل Reply عليها برقم:\n"
-        "<code>1</code> نفس الإعداد  •  <code>2</code> أصغر  •  <code>3</code> صوت فقط\n"
-        "لحجم محدد: اكتب الرقم مباشرة، مثال <code>80</code>."
-    )
-
-    instruction = None
-    instruction_id = config.get("workspace_instruction_id")
-    if instruction_id:
-        try:
-            instruction = await client.get_messages(channel, ids=int(instruction_id))
-        except Exception:
-            instruction = None
-
-    if instruction:
-        try:
-            instruction = await client.edit_message(
-                channel,
-                instruction,
-                instructions,
-                parse_mode="html",
-                link_preview=False,
-            )
-        except Exception:
-            pass
-    else:
-        instruction = await client.send_message(
-            channel,
-            instructions,
-            parse_mode="html",
-            link_preview=False,
-        )
-        config["workspace_instruction_id"] = int(instruction.id)
-        save_json(CONFIG_PATH, config)
-
-    try:
-        await client.pin_message(channel, instruction, notify=False)
-    except Exception:
-        pass
+    await apply_channel_branding(client, channel, config)
+    instruction = await ensure_pinned_brand_message(client, channel, config)
 
     try:
         input_peer = await client.get_input_entity(channel)
@@ -1081,8 +1244,6 @@ async def ensure_workspace(client, config):
     if created:
         print(f"✅ تم إنشاء قناة «{WORKSPACE_TITLE}» وحفظها للاستخدام القادم.")
     return channel, created
-
-
 
 
 async def collect_queue(client, channel, state):
@@ -1462,7 +1623,15 @@ async def app():
 
     try:
         try:
-            await client.start(phone=config["phone"])
+            await client.start(
+                phone=config["phone"],
+                code_callback=lambda: getpass.getpass(
+                    "اكتب كود Telegram (لن يظهر أثناء الكتابة): "
+                ).strip(),
+                password=lambda: getpass.getpass(
+                    "كلمة مرور التحقق بخطوتين (لن تظهر): "
+                ).strip(),
+            )
         except Exception as exc:
             raise AppError(
                 "E120",
