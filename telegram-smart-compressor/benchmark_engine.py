@@ -389,6 +389,52 @@ def fit_dims(width, height, max_w=1280, max_h=720):
     return w, h
 
 
+
+def diagnose_source_gpu(src: Path, info: VideoInfo, hw):
+    if not hw.get("gpu"):
+        return hw
+
+    start = max(0.0, min(info.duration * 0.25, max(0.0, info.duration - 2.0)))
+    target_w, target_h = fit_dims(info.width, info.height)
+
+    nvdec_probe = probe_command(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-hwaccel", "cuda",
+            "-hwaccel_output_format", "cuda",
+            "-ss", f"{start:.3f}",
+            "-i", str(src),
+            "-t", "1.5",
+            "-an",
+            "-vf", "hwdownload,format=nv12",
+            "-f", "null", "-",
+        ],
+        timeout=30,
+    )
+    hw["source_nvdec_ok"] = bool(nvdec_probe["ok"])
+    hw["source_nvdec_reason"] = nvdec_probe["reason"]
+
+    full_probe = probe_command(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-hwaccel", "cuda",
+            "-hwaccel_output_format", "cuda",
+            "-ss", f"{start:.3f}",
+            "-i", str(src),
+            "-t", "1.5",
+            "-an",
+            "-vf", f"scale_cuda={target_w}:{target_h}",
+            "-c:v", "h264_nvenc",
+            "-preset", "p3",
+            "-f", "null", "-",
+        ],
+        timeout=30,
+    )
+    hw["source_full_gpu_ok"] = bool(full_probe["ok"])
+    hw["source_full_gpu_reason"] = full_probe["reason"]
+    return hw
+
+
 def human_time(seconds):
     seconds = max(0, int(round(seconds or 0)))
     m, s = divmod(seconds, 60)
@@ -715,13 +761,34 @@ def should_skip(spec, info, hw, nvencc_path):
     native_fits = info.width <= 1280 and info.height <= 720
     if spec.get("only_if_native") and not native_fits:
         return "المصدر أكبر من 720p؛ تخطي no-resize غير عادل."
-    if spec["backend"].startswith("ffmpeg_nvenc") and not hw["nvenc_available"]:
-        return "NVENC غير متاح في هذا الـRuntime."
-    if spec["backend"] == "ffmpeg_nvenc_full" and not hw["scale_cuda_available"]:
-        return "scale_cuda غير متاح في FFmpeg."
-    if spec["backend"] == "nvencc" and not nvencc_path:
-        return "NVEncC غير مثبت/غير متوافق."
+
+    backend = spec["backend"]
+    if backend == "ffmpeg_nvenc_cpu":
+        if not hw.get("gpu"):
+            return "لا يوجد NVIDIA GPU في الـRuntime."
+        if not hw.get("ffmpeg_nvenc_smoke_ok"):
+            reason = hw.get("ffmpeg_nvenc_smoke_reason") or "FFmpeg NVENC smoke test فشل."
+            return f"FFmpeg NVENC غير صالح: {reason[:260]}"
+
+    if backend == "ffmpeg_nvenc_full":
+        if not hw.get("gpu"):
+            return "لا يوجد NVIDIA GPU في الـRuntime."
+        if not hw.get("source_full_gpu_ok"):
+            reason = hw.get("source_full_gpu_reason") or "Full GPU source probe فشل."
+            return f"Full GPU pipeline غير صالح: {reason[:260]}"
+
+    if backend == "nvencc":
+        if not hw.get("gpu"):
+            return "لا يوجد NVIDIA GPU في الـRuntime."
+        if not nvencc_path:
+            reason = hw.get("nvencc_hw_reason") or "NVEncC غير مثبت."
+            return f"NVEncC غير متاح: {reason[:260]}"
+        if hw.get("nvencc_hw_ok") is False:
+            reason = hw.get("nvencc_hw_reason") or "NVEncC hardware check فشل."
+            return f"NVEncC hardware check فشل: {reason[:260]}"
+
     return None
+
 
 
 def cpu_filter(info, spec):
@@ -907,11 +974,16 @@ def compute_vmaf(src, start, dur, encoded):
 
 
 def install_nvencc(enabled, hw):
-    if not enabled or not hw["nvenc_available"]:
+    if not enabled or not hw.get("gpu"):
         return None
+
     existing = shutil.which("NVEncC") or shutil.which("nvencc")
     if existing:
-        return existing
+        hw["nvencc_installed"] = True
+        probe = probe_command([existing, "--check-hw", "0"], timeout=30)
+        hw["nvencc_hw_ok"] = bool(probe["ok"])
+        hw["nvencc_hw_reason"] = probe["reason"]
+        return existing if probe["ok"] else existing
 
     print(f"📦 تثبيت NVEncC {NVENCC_VERSION} للبنش مارك فقط...")
     deb = WORK_DIR / f"nvencc_{NVENCC_VERSION}_amd64.deb"
@@ -929,14 +1001,27 @@ def install_nvencc(enabled, hw):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        return shutil.which("NVEncC") or shutil.which("nvencc")
+        path = shutil.which("NVEncC") or shutil.which("nvencc")
+        hw["nvencc_installed"] = bool(path)
+        if path:
+            probe = probe_command([path, "--check-hw", "0"], timeout=30)
+            hw["nvencc_hw_ok"] = bool(probe["ok"])
+            hw["nvencc_hw_reason"] = probe["reason"]
+        else:
+            hw["nvencc_hw_ok"] = False
+            hw["nvencc_hw_reason"] = "تم تثبيت الحزمة لكن لم يتم العثور على NVEncC في PATH."
+        return path
     except Exception as exc:
+        hw["nvencc_installed"] = False
+        hw["nvencc_hw_ok"] = False
+        hw["nvencc_hw_reason"] = f"{type(exc).__name__}: {str(exc)[:1000]}"
         print(f"↪️ NVEncC لم يثبت: {type(exc).__name__}")
         return None
 
 
+
 def nvencc_specs(info, hw, nvencc_path, mode):
-    if not (nvencc_path and hw["nvenc_available"]):
+    if not hw.get("gpu"):
         return []
     base_fps = min(info.fps if info.fps > 0 else 15.0, 15.0)
     presets = ("p4", "p3", "p2", "p1")
@@ -955,6 +1040,7 @@ def nvencc_specs(info, hw, nvencc_path, mode):
         }
         for p in presets
     ]
+
 
 
 def nvencc_cmd(spec, nvencc_path, src, out, start, dur, info):
