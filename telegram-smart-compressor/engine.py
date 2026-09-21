@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.2.1"
+ENGINE_BUNDLE_VERSION = "5.2.2-beta"
 APP_NAME = "Smart Compressor"
 WORKSPACE_TITLE = "📦 Smart Compressor"
 BASE_DIR = Path("/content/drive/MyDrive/Telegram_Extreme_Compressor")
@@ -131,21 +131,99 @@ def load_config():
     return load_json(CONFIG_PATH, {})
 
 
+def first_time_setup_html():
+    return """
+    <div dir="rtl" style="
+        max-width: 760px;
+        margin: 10px 0 18px;
+        padding: 18px 20px;
+        border: 1px solid #d0d7de;
+        border-radius: 14px;
+        background: #f8fafc;
+        color: #111827;
+        line-height: 1.9;
+        text-align: right;
+        font-family: Arial, sans-serif;
+    ">
+      <div style="font-size: 22px; font-weight: 700; margin-bottom: 6px;">
+        🔐 توصيل تيليجرام لأول مرة
+      </div>
+
+      <div style="margin-bottom: 14px;">
+        الخطوة دي بتتعمل <b>مرة واحدة فقط</b>. بعد حفظ البيانات، البوكس ده مش هيظهر في التشغيلات الجاية.
+      </div>
+
+      <div style="font-weight: 700; margin-top: 10px;">١) افتح صفحة Telegram API</div>
+      <div style="margin: 8px 0 14px;">
+        <a href="https://my.telegram.org/apps" target="_blank" rel="noopener noreferrer"
+           style="
+             display: inline-block;
+             padding: 8px 14px;
+             border-radius: 9px;
+             background: #2563eb;
+             color: white;
+             text-decoration: none;
+             font-weight: 700;
+           ">
+          فتح my.telegram.org/apps ↗
+        </a>
+      </div>
+
+      <div style="font-weight: 700;">٢) من الصفحة انسخ البيانات التالية</div>
+      <div style="margin: 6px 0 14px;">
+        <div><code dir="ltr">API ID</code> — رقم.</div>
+        <div><code dir="ltr">API Hash</code> — نص طويل.</div>
+      </div>
+
+      <div style="font-weight: 700;">٣) ارجع هنا وأدخل البيانات في الخانات اللي هتظهر تحت البوكس</div>
+      <div style="margin-top: 6px;">
+        واكتب رقم موبايلك بصيغة دولية، مثال:
+        <code dir="ltr">+2010XXXXXXX</code>
+      </div>
+
+      <div style="
+          margin-top: 16px;
+          padding: 10px 12px;
+          border-radius: 9px;
+          background: #eef6ff;
+      ">
+        ✅ بعد أول إعداد، البيانات تتقرأ تلقائيًا من Google Drive الخاص بيك.
+      </div>
+    </div>
+    """
+
+
+def show_first_time_setup_card():
+    try:
+        from IPython.display import HTML, display
+        display(HTML(first_time_setup_html()))
+    except Exception:
+        print()
+        print("🔐 توصيل تيليجرام لأول مرة")
+        print("الخطوة دي بتتعمل مرة واحدة فقط.")
+        print("افتح: https://my.telegram.org/apps")
+        print("انسخ API ID و API Hash، ثم ارجع وأدخلهم هنا.")
+        print()
+
+
 def first_time_setup(config):
     if config.get("api_id") and config.get("api_hash") and config.get("phone"):
         return config
 
-    print()
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("👋 إعداد أول مرة")
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print("تحتاج بيانات Telegram API الخاصة بك مرة واحدة فقط.")
-    print("يمكنك الحصول عليها من my.telegram.org ثم Apps.")
+    show_first_time_setup_card()
+
+    print("١/٣ — API ID")
+    api_id_raw = input("اكتب API ID: ").strip()
     print()
 
-    api_id_raw = input("اكتب API ID: ").strip()
+    print("٢/٣ — API Hash")
+    print("لن يظهر النص أثناء الكتابة — ده طبيعي.")
     api_hash = getpass.getpass("اكتب API Hash: ").strip()
-    phone = input("اكتب رقم الهاتف مع كود الدولة، مثال +2010...: ").strip()
+    print()
+
+    print("٣/٣ — رقم الهاتف")
+    phone = input("مثال +2010XXXXXXX: ").strip()
+    print()
 
     if not api_id_raw.isdigit() or not api_hash or not phone:
         raise AppError("E110", "بيانات Telegram غير مكتملة أو غير صحيحة.")
@@ -156,7 +234,7 @@ def first_time_setup(config):
         phone=phone,
     )
     save_json(CONFIG_PATH, config)
-    print("✅ تم حفظ بيانات الإعداد في Google Drive الخاص بك.")
+    print("✅ تم حفظ إعداد تيليجرام. البوكس ده مش هيظهر في التشغيلات القادمة.")
     return config
 
 
