@@ -281,6 +281,29 @@ def get_brand_asset(filename: str) -> Path:
         or os.environ.get("TSC_UPDATE_CHANNEL")
         or "main"
     )
+
+    # Old saved notebook copies may only provide the branch name. Resolve it
+    # to a commit SHA first so branding files never depend on raw-branch cache.
+    if not re.fullmatch(r"[0-9a-f]{40}", str(ref or "")):
+        try:
+            p = subprocess.run(
+                [
+                    "git",
+                    "ls-remote",
+                    f"https://github.com/{BRAND_REPO}.git",
+                    f"refs/heads/{ref}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if p.returncode == 0 and p.stdout.strip():
+                candidate = p.stdout.strip().split()[0]
+                if re.fullmatch(r"[0-9a-f]{40}", candidate):
+                    ref = candidate
+        except Exception:
+            pass
+
     url = (
         f"https://raw.githubusercontent.com/{BRAND_REPO}/{ref}/"
         f"{BRAND_ASSET_DIR}/{filename}"
@@ -310,8 +333,8 @@ async def apply_channel_branding(client, channel, config):
     if config.get("workspace_about_version") != BRANDING_VERSION:
         try:
             await client(
-                functions.channels.EditAboutRequest(
-                    channel=channel,
+                functions.messages.EditChatAboutRequest(
+                    peer=channel,
                     about=CHANNEL_ABOUT,
                 )
             )
