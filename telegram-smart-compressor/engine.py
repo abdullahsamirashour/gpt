@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import getpass
 import json
+import logging
 import math
 import os
 import re
@@ -20,7 +21,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.2.2"
+ENGINE_BUNDLE_VERSION = "5.2.3"
 APP_NAME = "Smart Compressor"
 WORKSPACE_TITLE = "📦 Smart Compressor"
 BASE_DIR = Path("/content/drive/MyDrive/Telegram_Extreme_Compressor")
@@ -626,6 +627,20 @@ def make_progress(label):
 async def ensure_workspace(client, config):
     from telethon import functions, types
 
+    async def find_existing_workspace():
+        async for dialog in client.iter_dialogs():
+            if (dialog.name or "").strip() != WORKSPACE_TITLE:
+                continue
+            entity = dialog.entity
+            rights = getattr(entity, "admin_rights", None)
+            can_post = bool(
+                getattr(entity, "creator", False)
+                or (rights and getattr(rights, "post_messages", False))
+            )
+            if can_post:
+                return entity
+        return None
+
     channel = None
     created = False
 
@@ -646,32 +661,78 @@ async def ensure_workspace(client, config):
                 channel = None
 
     if channel is None:
-        async for dialog in client.iter_dialogs():
-            if (dialog.name or "").strip() != WORKSPACE_TITLE:
-                continue
-            entity = dialog.entity
-            rights = getattr(entity, "admin_rights", None)
-            can_post = bool(
-                getattr(entity, "creator", False)
-                or (rights and getattr(rights, "post_messages", False))
-            )
-            if can_post:
-                channel = entity
-                break
+        channel = await find_existing_workspace()
 
     if channel is None:
         print()
         print("📦 إنشاء مساحة العمل الخاصة بك...")
-        result = await client(
-            functions.channels.CreateChannelRequest(
-                title=WORKSPACE_TITLE,
-                about="مساحة خاصة لضغط ملفات الصوت والفيديو عبر Google Colab.",
-                broadcast=True,
-                megagroup=False,
+
+        last_error = None
+        for attempt, delay in enumerate((0, 3, 7, 15), 1):
+            if delay:
+                print(f"↻ إعادة المحاولة {attempt}/4 بعد {delay} ثوانٍ...")
+                await asyncio.sleep(delay)
+
+            try:
+                result = await client(
+                    functions.channels.CreateChannelRequest(
+                        title=WORKSPACE_TITLE,
+                        about="مساحة خاصة لضغط ملفات الصوت والفيديو عبر Google Colab.",
+                        broadcast=True,
+                        megagroup=False,
+                    )
+                )
+                channel = result.chats[0]
+                created = True
+                break
+
+            except Exception as exc:
+                last_error = exc
+
+                # أحيانًا Telegram ينشئ القناة ثم يفشل الرد نفسه.
+                # نتأكد قبل أي retry حتى لا ننشئ قنوات مكررة.
+                try:
+                    channel = await find_existing_workspace()
+                except Exception:
+                    channel = None
+
+                if channel is not None:
+                    created = True
+                    break
+
+                seconds = int(getattr(exc, "seconds", 0) or 0)
+                if seconds:
+                    if seconds <= 60 and attempt < 4:
+                        wait_for = max(seconds, 1)
+                        print(f"⏳ Telegram طلب الانتظار {wait_for} ثانية...")
+                        await asyncio.sleep(wait_for)
+                        continue
+                    raise AppError(
+                        "E131",
+                        f"Telegram طلب الانتظار {seconds} ثانية قبل إنشاء القناة. جرّب التشغيل بعد انتهاء المدة.",
+                        repr(exc),
+                    )
+
+                transient = type(exc).__name__ in {
+                    "RpcCallFailError",
+                    "ServerError",
+                    "TimedOutError",
+                    "TimeoutError",
+                } or "internal issues" in str(exc).lower() or "try again later" in str(exc).lower()
+
+                if not transient:
+                    raise AppError(
+                        "E130",
+                        "تعذر إنشاء قناة Smart Compressor على Telegram.",
+                        repr(exc),
+                    )
+
+        if channel is None:
+            raise AppError(
+                "E130",
+                "Telegram واجه مشكلة مؤقتة أثناء إنشاء القناة. تسجيل الدخول محفوظ؛ شغّل الخلية مرة أخرى بعد دقيقة.",
+                repr(last_error),
             )
-        )
-        channel = result.chats[0]
-        created = True
 
     config["workspace_id"] = int(channel.id)
     save_json(CONFIG_PATH, config)
@@ -989,6 +1050,8 @@ async def app():
     mount_drive()
 
     from telethon import TelegramClient
+
+    logging.getLogger("telethon").setLevel(logging.ERROR)
 
     config = first_time_setup(load_config())
     state = normalize_state(load_json(STATE_PATH, default_state()))
