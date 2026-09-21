@@ -90,6 +90,12 @@ jobs:
 
           assert engine.ENGINE_BUNDLE_VERSION.startswith("5.2.")
 
+          setup_html = engine.first_time_setup_html()
+          assert "https://my.telegram.org/apps" in setup_html
+          assert "توصيل تيليجرام لأول مرة" in setup_html
+          complete_config = {"api_id": 123, "api_hash": "abc", "phone": "+201000000000"}
+          assert engine.first_time_setup(dict(complete_config)) == complete_config
+
           assert engine.parse_rerun_command("🔁") == {"profile": None, "target_mb": None}
           assert engine.parse_rerun_command("🔁 أصغر")["profile"] == "VIDEO_SMALLEST"
           assert engine.parse_rerun_command("🔁 صوت")["profile"] == "AUDIO_TINY"
