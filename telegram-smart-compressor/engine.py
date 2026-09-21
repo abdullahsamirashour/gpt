@@ -22,10 +22,10 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.3.0-beta"
-APP_NAME = "ضغط المحاضرات"
-WORKSPACE_TITLE = "🎓 ضغط المحاضرات"
-WORKSPACE_ALIASES = {WORKSPACE_TITLE, "📦 Smart Compressor", "Smart Compressor"}
+ENGINE_BUNDLE_VERSION = "5.3.1-beta"
+APP_NAME = "ضغط الفيديو والصوت"
+WORKSPACE_TITLE = "📦 ضغط الفيديو والصوت"
+WORKSPACE_ALIASES = {WORKSPACE_TITLE, "🎓 ضغط المحاضرات", "📦 Smart Compressor", "Smart Compressor"}
 COLAB_URL = "https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/Smart_Compressor.ipynb"
 TURBO_THRESHOLD = 8 * 1024 * 1024
 TURBO_CONNECTIONS = 4
@@ -933,7 +933,7 @@ async def ensure_workspace(client, config):
 
     if channel is None:
         print()
-        print("🎓 إنشاء مساحة ضغط المحاضرات...")
+        print("📦 إنشاء مساحة ضغط الفيديو والصوت...")
 
         last_error = None
         for attempt, delay in enumerate((0, 3, 7, 15), 1):
@@ -945,7 +945,7 @@ async def ensure_workspace(client, config):
                 result = await client(
                     functions.channels.CreateChannelRequest(
                         title=WORKSPACE_TITLE,
-                        about="مساحة خاصة لضغط صوت وفيديو المحاضرات عبر Google Colab.",
+                        about="مساحة خاصة لضغط الفيديو والصوت عبر Google Colab.",
                         broadcast=True,
                         megagroup=False,
                     )
@@ -1014,7 +1014,7 @@ async def ensure_workspace(client, config):
             )
 
     # Rename only our exact old default title; never overwrite a user's custom title.
-    if (getattr(channel, "title", "") or "").strip() in {"📦 Smart Compressor", "Smart Compressor"}:
+    if (getattr(channel, "title", "") or "").strip() in {"🎓 ضغط المحاضرات", "📦 Smart Compressor", "Smart Compressor"}:
         try:
             await client(functions.channels.EditTitleRequest(channel=channel, title=WORKSPACE_TITLE))
             channel = await client.get_entity(channel)
@@ -1025,7 +1025,7 @@ async def ensure_workspace(client, config):
     save_json(CONFIG_PATH, config)
 
     instructions = (
-        "🎓 <b>ضغط المحاضرات</b>\n\n"
+        "📦 <b>ضغط الفيديو والصوت</b>\n\n"
         "ابعت ملف صوت أو فيديو هنا، وبعدها افتح Colab واضغط تشغيل.\n\n"
         f'<a href="{COLAB_URL}">▶ افتح Colab</a>\n\n'
         "<b>إعادة نتيجة قديمة</b> — اعمل Reply عليها برقم:\n"
