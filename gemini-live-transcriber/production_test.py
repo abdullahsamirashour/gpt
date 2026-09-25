@@ -676,13 +676,14 @@ async def full_e2e_main():
 
         jobs = []
         count = math.ceil(duration / FULL_CHUNK_SEC)
+        chunk_span = duration / count
         for i in range(count):
-            start = i * FULL_CHUNK_SEC
-            seconds = min(FULL_CHUNK_SEC, duration - start)
-            jobs.append((start, seconds, f"chunk-{i+1:03d}"))
+            start = i * chunk_span
+            end = duration if i == count - 1 else (i + 1) * chunk_span
+            jobs.append((start, end - start, f"chunk-{i+1:03d}"))
 
         print(
-            f"[plan] duration={duration/60:.2f} min | chunks={len(jobs)} | "
+            f"[plan] duration={duration/60:.2f} min | chunks={len(jobs)} | span={chunk_span:.3f}s | "
             f"waves={math.ceil(len(jobs)/FULL_CONCURRENCY)}"
         )
 
