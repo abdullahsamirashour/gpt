@@ -2,10 +2,6 @@ name: Gemini 3.5 Live Full E2E
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "gemini-live-transcriber/production_test.py"
-      - ".github/workflows/gemini-live-full-e2e.yml"
 
 permissions:
   contents: read

@@ -2,10 +2,6 @@ name: Gemini 3.5 Live Benchmark
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "gemini-live-transcriber/benchmark.py"
-      - ".github/workflows/gemini-live-benchmark.yml"
 
 permissions:
   contents: read
