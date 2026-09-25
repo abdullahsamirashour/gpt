@@ -34,7 +34,7 @@ MIN_REFERENCE_RECALL = 0.55
 MIN_SCORABLE_REFERENCE_WORDS = 5
 MIN_SCORABLE_REGIONS = 4
 
-TMP = Path("/content/gemini35_chunk_bench")
+TMP = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "gemini35_chunk_bench"
 TMP.mkdir(parents=True, exist_ok=True)
 
 
