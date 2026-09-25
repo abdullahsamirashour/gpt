@@ -488,8 +488,10 @@ async def main():
     client = None
 
     try:
-        duration = await asyncio.to_thread(ffmpeg_to_pcm, src, pcm)
-        report["source_duration_sec"] = duration
+        source_duration = await asyncio.to_thread(ffmpeg_to_pcm, src, pcm)
+        duration = min(source_duration, FULL_LIMIT_SEC) if FULL_LIMIT_SEC > 0 else source_duration
+        report["source_duration_sec"] = source_duration
+        report["test_duration_sec"] = duration
         report["google_genai_version"] = installed_sdk
         regions = select_regions(pcm, duration)
         report["regions"] = regions
@@ -623,9 +625,11 @@ async def main():
 
 
 
-FULL_CHUNK_SEC = 10.0
-FULL_CONCURRENCY = 6
-FULL_FALLBACK_CONCURRENCY = 5
+FULL_CHUNK_SEC = float(os.environ.get("FULL_CHUNK_SEC", "10"))
+FULL_CONCURRENCY = int(os.environ.get("FULL_CONCURRENCY", "6"))
+FULL_FALLBACK_CONCURRENCY = int(os.environ.get("FULL_FALLBACK_CONCURRENCY", "5"))
+FULL_ADAPTIVE_BACKOFF = os.environ.get("FULL_ADAPTIVE_BACKOFF", "1") == "1"
+FULL_LIMIT_SEC = float(os.environ.get("FULL_LIMIT_SEC", "0") or "0")
 FULL_RECOVERY_ATTEMPTS = 3
 FULL_RECOVERY_COOLDOWN_SEC = 8
 FULL_RECOVERY_CONCURRENCY = 2
@@ -719,10 +723,14 @@ async def full_e2e_main():
     }
 
     print("Gemini 3.5 Transcribe Live - full recording E2E")
+    mode = (
+        f"start c={FULL_CONCURRENCY}, auto-backoff c={FULL_FALLBACK_CONCURRENCY}"
+        if FULL_ADAPTIVE_BACKOFF and FULL_FALLBACK_CONCURRENCY < FULL_CONCURRENCY
+        else f"fixed c={FULL_CONCURRENCY}"
+    )
     print(
         f"Independent {FULL_CHUNK_SEC:.0f}s manual-VAD sessions | "
-        f"start c={FULL_CONCURRENCY}, auto-backoff c={FULL_FALLBACK_CONCURRENCY} | "
-        "Arabic+English hints."
+        f"{mode} | Arabic+English hints."
     )
 
     api_key = load_key()
@@ -787,7 +795,9 @@ async def full_e2e_main():
             )
 
             if (
-                active_concurrency == FULL_CONCURRENCY
+                FULL_ADAPTIVE_BACKOFF
+                and FULL_FALLBACK_CONCURRENCY < FULL_CONCURRENCY
+                and active_concurrency == FULL_CONCURRENCY
                 and non_silent_empty > 0
             ):
                 active_concurrency = FULL_FALLBACK_CONCURRENCY
@@ -805,6 +815,9 @@ async def full_e2e_main():
             if r.get("rms", 0) >= SUSPICIOUS_MIN_RMS
             and not r["effective_text"].strip()
         ]
+
+        main_empty_non_silent = len(blocking_indexes)
+        report["main_empty_non_silent"] = main_empty_non_silent
 
         if blocking_indexes:
             print(
@@ -887,6 +900,7 @@ async def full_e2e_main():
             "recovered_chunks": sum(bool(r.get("recovered")) for r in all_results),
             "chunks_total": len(all_results),
             "chunks_usable": sum(r["ok"] for r in all_results),
+            "main_empty_non_silent": main_empty_non_silent,
             "blocking_empty_non_silent": len(blocking),
             "suspicious_short_non_silent": len(suspicious_short),
             "mode_counts": mode_counts(all_results),
