@@ -624,8 +624,7 @@ async def main():
 
 
 FULL_CHUNK_SEC = 10.0
-FULL_CONCURRENCY = 6
-FULL_FALLBACK_CONCURRENCY = 5
+FULL_CONCURRENCY = 5
 FULL_RECOVERY_ATTEMPTS = 3
 FULL_RECOVERY_COOLDOWN_SEC = 8
 FULL_RECOVERY_CONCURRENCY = 2
@@ -721,8 +720,7 @@ async def full_e2e_main():
     print("Gemini 3.5 Transcribe Live - full recording E2E")
     print(
         f"Independent {FULL_CHUNK_SEC:.0f}s manual-VAD sessions | "
-        f"start c={FULL_CONCURRENCY}, auto-backoff c={FULL_FALLBACK_CONCURRENCY} | "
-        "Arabic+English hints."
+        f"concurrency={FULL_CONCURRENCY} | Arabic+English hints."
     )
 
     api_key = load_key()
@@ -746,24 +744,17 @@ async def full_e2e_main():
 
         print(
             f"[plan] duration={duration/60:.2f} min | chunks={len(jobs)} | span={chunk_span:.3f}s | "
-            f"initial waves~={math.ceil(len(jobs)/FULL_CONCURRENCY)}"
+            f"waves={math.ceil(len(jobs)/FULL_CONCURRENCY)}"
         )
 
         client = genai.Client(api_key=api_key)
         all_results = []
         started = time.monotonic()
 
-        cursor = 0
-        wave_no = 0
-        active_concurrency = FULL_CONCURRENCY
-        backed_off = False
-
-        while cursor < len(jobs):
-            wave_no += 1
-            wave_jobs = jobs[cursor:cursor + active_concurrency]
+        for offset in range(0, len(jobs), FULL_CONCURRENCY):
+            wave_jobs = jobs[offset:offset + FULL_CONCURRENCY]
             results, elapsed = await run_wave_once(client, pcm, wave_jobs)
 
-            non_silent_empty = 0
             for result in results:
                 rms = pcm_rms(
                     pcm,
@@ -773,32 +764,15 @@ async def full_e2e_main():
                 result["rms"] = round(rms, 1)
                 result["recovered"] = False
                 result["recovery_shift_sec"] = 0.0
-                if rms >= SUSPICIOUS_MIN_RMS and not result["effective_text"].strip():
-                    non_silent_empty += 1
 
             all_results.extend(results)
-            cursor += len(results)
+            done = len(all_results)
             usable = sum(r["ok"] for r in results)
-
             print(
-                f"  wave {wave_no:02d}: c={active_concurrency} | "
+                f"  wave {offset//FULL_CONCURRENCY + 1:02d}: "
                 f"{usable}/{len(results)} usable | {elapsed:.1f}s | "
-                f"done {cursor}/{len(jobs)} | modes={mode_counts(results)}"
+                f"done {done}/{len(jobs)} | modes={mode_counts(results)}"
             )
-
-            if (
-                active_concurrency == FULL_CONCURRENCY
-                and non_silent_empty > 0
-            ):
-                active_concurrency = FULL_FALLBACK_CONCURRENCY
-                backed_off = True
-                print(
-                    f"    adaptive backoff: detected {non_silent_empty} non-silent empty "
-                    f"chunk(s); using c={active_concurrency} for remaining waves."
-                )
-
-        report["adaptive_backoff"] = backed_off
-        report["final_main_concurrency"] = active_concurrency
 
         blocking_indexes = [
             i for i, r in enumerate(all_results)
