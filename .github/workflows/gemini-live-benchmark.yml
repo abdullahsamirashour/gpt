@@ -1,0 +1,50 @@
+name: Gemini 3.5 Live Benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "gemini-live-transcriber/benchmark.py"
+      - ".github/workflows/gemini-live-benchmark.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINIAPIKEY }}
+      BENCHMARK_REPORT_PATH: gemini35_live_chunk_integrity_report.json
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "google-genai==2.25.0"
+          ffmpeg -version | head -n 1
+
+      - name: Syntax check
+        run: python -m py_compile gemini-live-transcriber/benchmark.py
+
+      - name: Run benchmark
+        run: python gemini-live-transcriber/benchmark.py
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini35-live-benchmark-report
+          path: gemini35_live_chunk_integrity_report.json
+          if-no-files-found: warn
+          retention-days: 7
