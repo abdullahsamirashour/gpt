@@ -934,25 +934,32 @@ async def full_e2e_main():
             pass
 
 
-report = asyncio.run(full_e2e_main())
-report_path = Path(
-    os.environ.get("FULL_REPORT_PATH", "gemini35_live_full_e2e_report.json")
-)
-report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-print(f"Saved report: {report_path}")
+def write_full_report(report):
+    report_path = Path(
+        os.environ.get("FULL_REPORT_PATH", "gemini35_live_full_e2e_report.json")
+    )
+    report_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"Saved report: {report_path}")
 
-summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-if summary_path:
-    with open(summary_path, "a", encoding="utf-8") as fh:
-        fh.write("## Gemini 3.5 Live full E2E\n\n")
-        fh.write(f"- Validated: {report.get('validated')}\n")
-        fh.write(f"- Wall clock: {report.get('wall_clock_min')} min\n")
-        fh.write(
-            f"- Usable chunks: {report.get('chunks_usable')}/"
-            f"{report.get('chunks_total')}\n"
-        )
-        fh.write(
-            f"- Blocking non-silent empty chunks: "
-            f"{report.get('blocking_empty_non_silent')}\n"
-        )
-        fh.write(f"- Transcript words: {report.get('total_words')}\n")
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as fh:
+            fh.write("## Gemini 3.5 Live full E2E\n\n")
+            fh.write(f"- Validated: {report.get('validated')}\n")
+            fh.write(f"- Wall clock: {report.get('wall_clock_min')} min\n")
+            fh.write(
+                f"- Usable chunks: {report.get('chunks_usable')}/"
+                f"{report.get('chunks_total')}\n"
+            )
+            fh.write(
+                f"- Blocking non-silent empty chunks: "
+                f"{report.get('blocking_empty_non_silent')}\n"
+            )
+            fh.write(f"- Transcript words: {report.get('total_words')}\n")
+
+
+if __name__ == "__main__":
+    write_full_report(asyncio.run(full_e2e_main()))
