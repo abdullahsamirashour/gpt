@@ -1,0 +1,51 @@
+name: Gemini 3.5 High Concurrency Batch
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "gemini-live-transcriber/high_concurrency_batch.request"
+
+permissions:
+  contents: read
+
+jobs:
+  batch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINIAPIKEY }}
+      BATCH_OUT_DIR: gemini_high_concurrency_batch
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install "google-genai==2.25.0"
+
+      - name: Syntax check
+        run: |
+          python -m py_compile gemini-live-transcriber/production_test.py
+          python -m py_compile gemini-live-transcriber/high_concurrency_batch.py
+
+      - name: Run sequential batch
+        run: python gemini-live-transcriber/high_concurrency_batch.py
+
+      - name: Upload batch artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemini35-high-concurrency-batch
+          path: gemini_high_concurrency_batch/
+          if-no-files-found: warn
+          retention-days: 7
