@@ -2,9 +2,6 @@ name: Gemini 3.5 Live Audio Speed Benchmark
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "gemini-live-transcriber/audio_speed_benchmark.request"
 
 permissions:
   contents: read
