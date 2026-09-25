@@ -624,9 +624,10 @@ async def main():
 
 
 FULL_CHUNK_SEC = 10.0
-FULL_CONCURRENCY = 6
+FULL_CONCURRENCY = 5
 FULL_RECOVERY_ATTEMPTS = 3
 FULL_RECOVERY_COOLDOWN_SEC = 8
+FULL_RECOVERY_CONCURRENCY = 2
 FULL_RECOVERY_SHIFTS_SEC = (0.0, -1.0, 1.0)
 SUSPICIOUS_MIN_RMS = 140.0
 SUSPICIOUS_MAX_WORDS = 1
@@ -639,6 +640,23 @@ async def run_wave_once(client, pcm_path, jobs):
         for start, seconds, label in jobs
     ])
     return results, time.monotonic() - started
+
+
+async def recover_empty_batch(client, pcm_path, originals):
+    jobs = [
+        (
+            float(r["start_sec"]),
+            float(r["audio_sec"]),
+            r["label"],
+        )
+        for r in originals
+    ]
+    results, elapsed = await run_wave_once(client, pcm_path, jobs)
+    for original, retry in zip(originals, results):
+        retry["recovery_shift_sec"] = 0.0
+        retry["rms"] = original["rms"]
+        retry["recovered"] = bool(retry["effective_text"].strip())
+    return results, elapsed
 
 
 async def recover_empty_chunk(client, pcm_path, result, duration):
@@ -765,26 +783,53 @@ async def full_e2e_main():
         if blocking_indexes:
             print(
                 f"\n[recovery] {len(blocking_indexes)} non-silent empty chunk(s); "
-                f"cooling down {FULL_RECOVERY_COOLDOWN_SEC}s before isolated retries."
+                f"cooling down {FULL_RECOVERY_COOLDOWN_SEC}s, then retrying "
+                f"{FULL_RECOVERY_CONCURRENCY} at a time."
             )
             await asyncio.sleep(FULL_RECOVERY_COOLDOWN_SEC)
 
-            for idx in blocking_indexes:
-                original = all_results[idx]
-                recovered = await recover_empty_chunk(
-                    client, pcm, original, duration
-                )
-                recovered["rms"] = original["rms"]
-                recovered["recovered"] = recovered["effective_text"].strip() != ""
-                all_results[idx] = recovered
+            still_empty = []
+            for off in range(0, len(blocking_indexes), FULL_RECOVERY_CONCURRENCY):
+                batch_indexes = blocking_indexes[off:off + FULL_RECOVERY_CONCURRENCY]
+                originals = [all_results[i] for i in batch_indexes]
+                retries, elapsed = await recover_empty_batch(client, pcm, originals)
+
+                for idx, original, retry in zip(batch_indexes, originals, retries):
+                    if retry["effective_text"].strip():
+                        all_results[idx] = retry
+                    else:
+                        still_empty.append(idx)
+
                 print(
-                    f"  {original['label']}: "
-                    f"{'RECOVERED' if recovered['effective_text'].strip() else 'STILL EMPTY'} | "
-                    f"attempt={recovered.get('attempt')} | "
-                    f"shift={recovered.get('recovery_shift_sec', 0.0):+.1f}s | "
-                    f"mode={recovered['mode']} | words={recovered['effective_words']} | "
-                    f"api={recovered['api_error'][:100]}"
+                    f"  exact batch {off//FULL_RECOVERY_CONCURRENCY + 1}: "
+                    f"{sum(bool(r['effective_text'].strip()) for r in retries)}/{len(retries)} recovered | "
+                    f"{elapsed:.1f}s"
                 )
+
+                if off + FULL_RECOVERY_CONCURRENCY < len(blocking_indexes):
+                    await asyncio.sleep(1.5)
+
+            if still_empty:
+                print(
+                    f"  {len(still_empty)} chunk(s) still empty; "
+                    "using isolated shifted-boundary retries."
+                )
+                for idx in still_empty:
+                    original = all_results[idx]
+                    recovered = await recover_empty_chunk(
+                        client, pcm, original, duration
+                    )
+                    recovered["rms"] = original["rms"]
+                    recovered["recovered"] = recovered["effective_text"].strip() != ""
+                    all_results[idx] = recovered
+                    print(
+                        f"    {original['label']}: "
+                        f"{'RECOVERED' if recovered['effective_text'].strip() else 'STILL EMPTY'} | "
+                        f"attempt={recovered.get('attempt')} | "
+                        f"shift={recovered.get('recovery_shift_sec', 0.0):+.1f}s | "
+                        f"mode={recovered['mode']} | words={recovered['effective_words']} | "
+                        f"api={recovered['api_error'][:100]}"
+                    )
 
         wall = time.monotonic() - started
 
