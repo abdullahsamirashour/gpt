@@ -1,0 +1,5 @@
+authorized by user
+created: 2026-09-25
+benchmark: Gemini 3.5 Transcribe Live audio speed-up
+speeds: 1.0x baseline twice, 1.25x, 1.5x, 1.75x, 2.0x, 2.5x, 3.0x
+concurrency: 5
