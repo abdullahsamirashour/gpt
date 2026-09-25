@@ -625,9 +625,51 @@ async def main():
 
 FULL_CHUNK_SEC = 10.0
 FULL_CONCURRENCY = 6
-FULL_RECOVERY_ATTEMPTS = 2
+FULL_RECOVERY_ATTEMPTS = 3
+FULL_RECOVERY_COOLDOWN_SEC = 8
+FULL_RECOVERY_SHIFTS_SEC = (0.0, -1.0, 1.0)
 SUSPICIOUS_MIN_RMS = 140.0
 SUSPICIOUS_MAX_WORDS = 1
+
+
+async def run_wave_once(client, pcm_path, jobs):
+    started = time.monotonic()
+    results = await asyncio.gather(*[
+        one_segment(client, pcm_path, start, seconds, label, attempt=1)
+        for start, seconds, label in jobs
+    ])
+    return results, time.monotonic() - started
+
+
+async def recover_empty_chunk(client, pcm_path, result, duration):
+    best = result
+    original_start = float(result["start_sec"])
+    original_sec = float(result["audio_sec"])
+
+    for attempt_i in range(FULL_RECOVERY_ATTEMPTS):
+        shift = FULL_RECOVERY_SHIFTS_SEC[min(attempt_i, len(FULL_RECOVERY_SHIFTS_SEC) - 1)]
+        start = min(max(0.0, original_start + shift), max(0.0, duration - original_sec))
+
+        if attempt_i:
+            await asyncio.sleep(FULL_RECOVERY_COOLDOWN_SEC)
+
+        retry = await one_segment(
+            client,
+            pcm_path,
+            start,
+            original_sec,
+            result["label"],
+            attempt=int(result.get("attempt", 1)) + attempt_i + 1,
+        )
+        retry["recovery_shift_sec"] = round(start - original_start, 3)
+
+        if retry["effective_words"] > best["effective_words"]:
+            best = retry
+
+        if best["effective_text"].strip():
+            break
+
+    return best
 
 
 async def recover_chunk(client, pcm_path, result):
@@ -693,9 +735,8 @@ async def full_e2e_main():
 
         for offset in range(0, len(jobs), FULL_CONCURRENCY):
             wave_jobs = jobs[offset:offset + FULL_CONCURRENCY]
-            results, elapsed = await run_wave(client, pcm, wave_jobs)
+            results, elapsed = await run_wave_once(client, pcm, wave_jobs)
 
-            recovered = []
             for result in results:
                 rms = pcm_rms(
                     pcm,
@@ -703,26 +744,47 @@ async def full_e2e_main():
                     min(result["audio_sec"], FULL_CHUNK_SEC),
                 )
                 result["rms"] = round(rms, 1)
-                suspicious = (
-                    rms >= SUSPICIOUS_MIN_RMS
-                    and result["effective_words"] <= SUSPICIOUS_MAX_WORDS
-                )
-                if suspicious:
-                    result = await recover_chunk(client, pcm, result)
-                    result["rms"] = round(rms, 1)
-                    result["recovered"] = True
-                else:
-                    result["recovered"] = False
-                recovered.append(result)
+                result["recovered"] = False
+                result["recovery_shift_sec"] = 0.0
 
-            all_results.extend(recovered)
+            all_results.extend(results)
             done = len(all_results)
-            usable = sum(r["ok"] for r in recovered)
+            usable = sum(r["ok"] for r in results)
             print(
                 f"  wave {offset//FULL_CONCURRENCY + 1:02d}: "
-                f"{usable}/{len(recovered)} usable | {elapsed:.1f}s | "
-                f"done {done}/{len(jobs)} | modes={mode_counts(recovered)}"
+                f"{usable}/{len(results)} usable | {elapsed:.1f}s | "
+                f"done {done}/{len(jobs)} | modes={mode_counts(results)}"
             )
+
+        blocking_indexes = [
+            i for i, r in enumerate(all_results)
+            if r.get("rms", 0) >= SUSPICIOUS_MIN_RMS
+            and not r["effective_text"].strip()
+        ]
+
+        if blocking_indexes:
+            print(
+                f"\n[recovery] {len(blocking_indexes)} non-silent empty chunk(s); "
+                f"cooling down {FULL_RECOVERY_COOLDOWN_SEC}s before isolated retries."
+            )
+            await asyncio.sleep(FULL_RECOVERY_COOLDOWN_SEC)
+
+            for idx in blocking_indexes:
+                original = all_results[idx]
+                recovered = await recover_empty_chunk(
+                    client, pcm, original, duration
+                )
+                recovered["rms"] = original["rms"]
+                recovered["recovered"] = recovered["effective_text"].strip() != ""
+                all_results[idx] = recovered
+                print(
+                    f"  {original['label']}: "
+                    f"{'RECOVERED' if recovered['effective_text'].strip() else 'STILL EMPTY'} | "
+                    f"attempt={recovered.get('attempt')} | "
+                    f"shift={recovered.get('recovery_shift_sec', 0.0):+.1f}s | "
+                    f"mode={recovered['mode']} | words={recovered['effective_words']} | "
+                    f"api={recovered['api_error'][:100]}"
+                )
 
         wall = time.monotonic() - started
 
@@ -737,11 +799,11 @@ async def full_e2e_main():
             and r["effective_words"] <= SUSPICIOUS_MAX_WORDS
         ]
 
-        transcript = "\n".join(
+        transcript = merge_overlap([
             r["effective_text"].strip()
             for r in all_results
             if r["effective_text"].strip()
-        ).strip()
+        ])
 
         transcript_path = Path(
             os.environ.get("FULL_TRANSCRIPT_PATH", "gemini35_live_full_transcript.txt")
@@ -751,6 +813,7 @@ async def full_e2e_main():
         report.update({
             "wall_clock_sec": round(wall, 3),
             "wall_clock_min": round(wall/60, 3),
+            "recovered_chunks": sum(bool(r.get("recovered")) for r in all_results),
             "chunks_total": len(all_results),
             "chunks_usable": sum(r["ok"] for r in all_results),
             "blocking_empty_non_silent": len(blocking),
