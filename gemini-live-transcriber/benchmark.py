@@ -1,7 +1,7 @@
 #@title Gemini 3.5 Live - Chunk Integrity Benchmark { display-mode: "form" }
 # Fully automatic: Colab Secret -> GitHub test audio -> correctness reference -> chunk-size benchmark -> c=6 estimate.
 
-import os, sys, math, time, json, asyncio, shutil, re, difflib
+import os, sys, math, time, json, asyncio, subprocess, shutil, re, difflib
 from array import array
 from pathlib import Path
 from collections import Counter
