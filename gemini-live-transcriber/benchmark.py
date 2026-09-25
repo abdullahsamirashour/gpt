@@ -622,7 +622,7 @@ async def main():
             pass
 
 
-report = await main()
+report = asyncio.run(main())
 report_path = Path(os.environ.get("BENCHMARK_REPORT_PATH", "gemini35_live_chunk_integrity_report.json"))
 report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 print(f"\nSaved report: {report_path}")
