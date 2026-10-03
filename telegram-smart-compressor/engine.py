@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.5.0"
+ENGINE_BUNDLE_VERSION = "5.5.1"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -900,12 +900,19 @@ async def upload_media_fast(client, path: Path, progress: LiveProgress):
 
 
 def encode_audio(src: Path, dst: Path, info: MediaInfo):
+    if not info.has_audio:
+        raise AppError("E412", "هذا الفيديو لا يحتوي على مسار صوتي يمكن ضغطه.")
+
     cmd = [
         "ffmpeg",
         "-y",
         "-i",
         str(src),
+        "-map",
+        "0:a:0",
         "-vn",
+        "-sn",
+        "-dn",
         "-c:a",
         "libopus",
         "-b:a",
@@ -1586,10 +1593,9 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
 
             upload = LiveProgress("رفع", "⬆️")
             upload_started = time.time()
-            file_arg, upload_mode, fast_upload_seconds = await upload_media_fast(client, dst, upload)
             sent = await client.send_file(
                 channel,
-                file_arg,
+                str(dst),
                 caption=(
                     f"✅ تم • {label}\n"
                     f"{Path(name).stem}\n"
@@ -1600,10 +1606,9 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
                 voice_note=False,
                 force_document=False,
                 reply_to=msg.id,
-                progress_callback=upload.callback if upload_mode == "normal" else None,
+                progress_callback=upload.callback,
             )
-            if upload_mode == "normal":
-                upload.finish(final_size)
+            upload.finish(final_size)
             timings["upload"] = time.time() - upload_started
 
         else:
