@@ -583,6 +583,44 @@ jobs:
               assert audio_out.exists() and audio_out.stat().st_size > 0
               audio_info = engine.ffprobe(audio_out)
               assert audio_info.has_audio and not audio_info.has_video
+              audio_codec = subprocess.check_output(
+                  [
+                      "ffprobe", "-v", "error", "-select_streams", "a:0",
+                      "-show_entries", "stream=codec_name",
+                      "-of", "default=nw=1:nk=1", str(audio_out),
+                  ],
+                  text=True,
+              ).strip()
+              audio_container = subprocess.check_output(
+                  [
+                      "ffprobe", "-v", "error",
+                      "-show_entries", "format=format_name",
+                      "-of", "default=nw=1:nk=1", str(audio_out),
+                  ],
+                  text=True,
+              ).strip()
+              assert audio_codec == "opus"
+              assert "ogg" in audio_container.split(",")
+
+              silent_src = td / "silent.mp4"
+              subprocess.run(
+                  [
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=12",
+                      "-t", "1", "-an",
+                      "-c:v", "libx264", "-preset", "ultrafast",
+                      str(silent_src),
+                  ],
+                  check=True,
+              )
+              silent_info = engine.ffprobe(silent_src)
+              assert silent_info.has_video and not silent_info.has_audio
+              try:
+                  engine.encode_audio(silent_src, td / "silent.ogg", silent_info)
+              except engine.AppError as exc:
+                  assert exc.code == "E412"
+              else:
+                  raise AssertionError("video without an audio stream must fail with E412")
 
               video_out = td / "video.mp4"
               engine.encode_video(src, video_out, info, "VIDEO_BALANCED", None, False)
