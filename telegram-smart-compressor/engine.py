@@ -204,6 +204,7 @@ def show_log_controls(log_path: Path):
             button_style="danger",
             disabled=True,
             tooltip="حذف نسخة Drive والنسخة المحلية لهذا التشغيل",
+            layout=widgets.Layout(display="none"),
         )
         status = widgets.HTML(
             value=(
@@ -220,6 +221,7 @@ def show_log_controls(log_path: Path):
                 saved_state["path"] = saved
                 save_btn.disabled = True
                 delete_btn.disabled = False
+                delete_btn.layout.display = ""
                 relative = saved.relative_to(BASE_DIR)
                 status.value = (
                     '<div dir="rtl" style="line-height:1.8">'
@@ -240,6 +242,7 @@ def show_log_controls(log_path: Path):
                 delete_run_logs(saved_state.get("path"), log_path)
                 save_btn.disabled = True
                 delete_btn.disabled = True
+                delete_btn.layout.display = "none"
                 status.value = (
                     '<div dir="rtl" style="color:#166534">'
                     '🗑️ تم حذف لوج التشغيل من Drive ومن مساحة Colab المحلية.'
