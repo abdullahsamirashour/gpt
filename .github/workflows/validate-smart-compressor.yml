@@ -593,6 +593,55 @@ jobs:
               assert abs(offset_start) < 0.05
               assert abs(offset_out_info.duration - offset_info.duration) < 0.25
 
+              # Regression: the first audio stream may be silent while a later
+              # stream contains the real lecture audio. Never map 0:a:0 blindly.
+              multi_src = td / "multi-audio.mp4"
+              subprocess.run(
+                  [
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=12:duration=2",
+                      "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono:d=2",
+                      "-f", "lavfi", "-i", "sine=frequency=700:sample_rate=44100:duration=2",
+                      "-map", "0:v", "-map", "1:a", "-map", "2:a",
+                      "-c:v", "libx264", "-preset", "ultrafast",
+                      "-c:a", "aac", "-b:a", "96k",
+                      str(multi_src),
+                  ],
+                  check=True,
+              )
+              multi_info = engine.ffprobe(multi_src)
+              streams = engine._audio_streams(multi_src)
+              assert len(streams) == 2
+              assert engine._audio_peak_db(multi_src, streams[0]["index"]) < -70.0
+              assert engine._audio_peak_db(multi_src, streams[1]["index"]) > -30.0
+              multi_out = td / "multi-audio.ogg"
+              engine.encode_audio(multi_src, multi_out, multi_info)
+              out_stream = engine._audio_streams(multi_out)[0]["index"]
+              assert engine._audio_peak_db(multi_out, out_stream) > -40.0
+
+              # A truly silent source must fail instead of being uploaded as a
+              # tiny, apparently successful Ogg file.
+              silent_audio_src = td / "silent-audio.mp4"
+              subprocess.run(
+                  [
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=12:duration=1",
+                      "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono:d=1",
+                      "-map", "0:v", "-map", "1:a",
+                      "-c:v", "libx264", "-preset", "ultrafast",
+                      "-c:a", "aac",
+                      str(silent_audio_src),
+                  ],
+                  check=True,
+              )
+              silent_audio_info = engine.ffprobe(silent_audio_src)
+              try:
+                  engine.encode_audio(silent_audio_src, td / "silent-audio.ogg", silent_audio_info)
+              except engine.AppError as exc:
+                  assert exc.code == "E415"
+              else:
+                  raise AssertionError("silent audio must fail with E415")
+
               silent_src = td / "silent.mp4"
               subprocess.run(
                   [
