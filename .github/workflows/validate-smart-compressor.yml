@@ -601,6 +601,38 @@ jobs:
               ).strip()
               assert audio_codec == "opus"
               assert "ogg" in audio_container.split(",")
+              assert abs(audio_info.duration - info.duration) < 0.25
+
+              # Audio extraction must normalize non-zero source timestamps so
+              # Telegram receives a complete, zero-based Ogg timeline.
+              offset_src = td / "offset.mp4"
+              subprocess.run(
+                  [
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=12:duration=2",
+                      "-itsoffset", "0.5",
+                      "-f", "lavfi", "-i", "sine=frequency=700:sample_rate=44100:duration=1.5",
+                      "-map", "0:v", "-map", "1:a",
+                      "-c:v", "libx264", "-preset", "ultrafast",
+                      "-c:a", "aac", "-b:a", "96k",
+                      str(offset_src),
+                  ],
+                  check=True,
+              )
+              offset_info = engine.ffprobe(offset_src)
+              offset_out = td / "offset.ogg"
+              engine.encode_audio(offset_src, offset_out, offset_info)
+              offset_out_info = engine.ffprobe(offset_out)
+              offset_start = float(subprocess.check_output(
+                  [
+                      "ffprobe", "-v", "error", "-select_streams", "a:0",
+                      "-show_entries", "stream=start_time",
+                      "-of", "default=nw=1:nk=1", str(offset_out),
+                  ],
+                  text=True,
+              ).strip())
+              assert abs(offset_start) < 0.05
+              assert abs(offset_out_info.duration - offset_info.duration) < 0.25
 
               silent_src = td / "silent.mp4"
               subprocess.run(
