@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.5.1"
+ENGINE_BUNDLE_VERSION = "5.5.2"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -913,6 +913,8 @@ def encode_audio(src: Path, dst: Path, info: MediaInfo):
         "-vn",
         "-sn",
         "-dn",
+        "-af",
+        "aresample=async=1:first_pts=0",
         "-c:a",
         "libopus",
         "-b:a",
