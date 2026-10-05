@@ -619,6 +619,49 @@ jobs:
               out_stream = engine._audio_streams(multi_out)[0]["index"]
               assert engine._audio_peak_db(multi_out, out_stream) > -40.0
 
+              # Regression: opposite-phase stereo channels are audible alone,
+              # but a normal mono downmix cancels them to near silence.
+              phase_src = td / "phase-cancel.mp4"
+              subprocess.run(
+                  [
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=12:duration=2",
+                      "-f", "lavfi", "-i", "sine=frequency=700:sample_rate=44100:duration=2",
+                      "-filter_complex",
+                      "[1:a]asplit=2[a][b];[b]volume=-1[b2];[a][b2]amerge=inputs=2[aout]",
+                      "-map", "0:v", "-map", "[aout]",
+                      "-c:v", "libx264", "-preset", "ultrafast",
+                      "-c:a", "aac", "-ac", "2",
+                      str(phase_src),
+                  ],
+                  check=True,
+              )
+              phase_info = engine.ffprobe(phase_src)
+              phase_stream = engine._audio_streams(phase_src)[0]
+              assert phase_stream["channels"] == 2
+              assert engine._audio_peak_db(phase_src, phase_stream["index"]) > -30.0
+              naive_phase_out = td / "phase-naive.ogg"
+              subprocess.run(
+                  [
+                      "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                      "-i", str(phase_src), "-map", f"0:{phase_stream['index']}",
+                      "-vn", "-sn", "-dn",
+                      "-af", "aresample=async=1:first_pts=0",
+                      "-c:a", "libopus", "-b:a", "8k", "-ac", "1", "-ar", "12000",
+                      "-application", "voip", "-frame_duration", "60",
+                      "-compression_level", "0", "-vbr", "on",
+                      str(naive_phase_out),
+                  ],
+                  check=True,
+              )
+              naive_stream = engine._audio_streams(naive_phase_out)[0]["index"]
+              assert engine._audio_peak_db(naive_phase_out, naive_stream) < -70.0
+
+              phase_out = td / "phase-fixed.ogg"
+              engine.encode_audio(phase_src, phase_out, phase_info)
+              phase_out_stream = engine._audio_streams(phase_out)[0]["index"]
+              assert engine._audio_peak_db(phase_out, phase_out_stream) > -40.0
+
               # A truly silent source must fail instead of being uploaded as a
               # tiny, apparently successful Ogg file.
               silent_audio_src = td / "silent-audio.mp4"
@@ -668,6 +711,21 @@ jobs:
               video_info = engine.ffprobe(video_out)
               assert video_info.has_video
               assert video_info.width <= 640 and video_info.height <= 360
+
+          # Log export is opt-in and writes under the app's Drive folder.
+          old_base = engine.BASE_DIR
+          with tempfile.TemporaryDirectory() as td:
+              td = Path(td)
+              engine.BASE_DIR = td / "drive"
+              local_log = td / "run.log"
+              local_log.write_text("example-log", encoding="utf-8")
+              saved_log, drive_url = engine.export_run_log_to_drive(local_log)
+              assert saved_log == engine.BASE_DIR / "logs" / "Media_Lite" / "run.log"
+              assert saved_log.read_text(encoding="utf-8") == "example-log"
+              assert "drive.google.com/drive/u/0/search?q=run.log" in drive_url
+              engine.delete_run_logs(local_log, saved_log)
+              assert not local_log.exists() and not saved_log.exists()
+          engine.BASE_DIR = old_base
 
           print("ALL SMART COMPRESSOR TESTS PASSED")
           PY
