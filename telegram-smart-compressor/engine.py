@@ -886,7 +886,7 @@ def _audio_peak_db(src: Path, stream_index: int) -> float:
         ],
         check=False,
     )
-    match = re.findall(r"max_volume:\\s*(-?inf|[-+]?\\d+(?:\\.\\d+)?)\\s*dB", proc.stderr or "")
+    match = re.findall(r"max_volume:\s*(-?inf|[-+]?\d+(?:\.\d+)?)\s*dB", proc.stderr or "")
     if not match:
         return float("-inf")
     value = match[-1].lower()
