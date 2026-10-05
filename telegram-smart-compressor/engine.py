@@ -19,11 +19,12 @@ import sys
 import time
 import traceback
 import urllib.request
+import urllib.parse
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.5.4"
+ENGINE_BUNDLE_VERSION = "5.5.5"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -51,7 +52,13 @@ STATE_PATH = BASE_DIR / "state_v5.json"
 OLD_STATE_PATH = BASE_DIR / "processed_v4.json"
 ERROR_LOG = BASE_DIR / "last_error.log"
 SESSION_PATH = BASE_DIR / "telegram_user"
+RUN_LOG_DIR = Path("/content/telegram_smart_compressor_logs")
 SCAN_LIMIT = 3000
+
+RUN_LOG_PATH = None
+_RUN_LOG_HANDLE = None
+_RUN_LOG_STDOUT = None
+_RUN_LOG_STDERR = None
 
 PROFILE_FROM_UI = {
     "تلقائي — مناسب لمعظم الاستخدامات": "SMART_AUTO",
@@ -87,14 +94,192 @@ class MediaInfo:
     has_audio: bool = False
 
 
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            try:
+                stream.write(data)
+                stream.flush()
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self):
+        for stream in self.streams:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+    def __getattr__(self, name):
+        return getattr(self.streams[0], name)
+
+
+def _log_debug(message):
+    if _RUN_LOG_HANDLE is None:
+        return
+    try:
+        _RUN_LOG_HANDLE.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
+        _RUN_LOG_HANDLE.flush()
+    except Exception:
+        pass
+
+
+def _start_run_log():
+    global RUN_LOG_PATH, _RUN_LOG_HANDLE, _RUN_LOG_STDOUT, _RUN_LOG_STDERR
+    RUN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    RUN_LOG_PATH = RUN_LOG_DIR / (
+        f"media_lite_{time.strftime('%Y%m%d_%H%M%S')}_v{ENGINE_BUNDLE_VERSION}.log"
+    )
+    _RUN_LOG_HANDLE = RUN_LOG_PATH.open("w", encoding="utf-8", buffering=1)
+    _RUN_LOG_STDOUT, _RUN_LOG_STDERR = sys.stdout, sys.stderr
+    sys.stdout = _Tee(_RUN_LOG_STDOUT, _RUN_LOG_HANDLE)
+    sys.stderr = _Tee(_RUN_LOG_STDERR, _RUN_LOG_HANDLE)
+    _log_debug(
+        f"run-start version={ENGINE_BUNDLE_VERSION} sha={os.environ.get('TSC_ENGINE_SHA', '')} "
+        f"profile={PROFILE} target_mb={TARGET_SIZE_TEXT}"
+    )
+    return RUN_LOG_PATH
+
+
+def _stop_run_log():
+    global _RUN_LOG_HANDLE, _RUN_LOG_STDOUT, _RUN_LOG_STDERR
+    handle = _RUN_LOG_HANDLE
+    if _RUN_LOG_STDOUT is not None:
+        sys.stdout = _RUN_LOG_STDOUT
+    if _RUN_LOG_STDERR is not None:
+        sys.stderr = _RUN_LOG_STDERR
+    _RUN_LOG_HANDLE = None
+    _RUN_LOG_STDOUT = None
+    _RUN_LOG_STDERR = None
+    if handle is not None:
+        try:
+            handle.flush()
+            handle.close()
+        except Exception:
+            pass
+
+
+def export_run_log_to_drive(log_path: Path):
+    log_path = Path(log_path)
+    if not log_path.exists():
+        raise FileNotFoundError(str(log_path))
+    folder = BASE_DIR / "logs" / "Media_Lite"
+    folder.mkdir(parents=True, exist_ok=True)
+    saved = folder / log_path.name
+    shutil.copy2(log_path, saved)
+    url = (
+        "https://drive.google.com/drive/u/0/search?q="
+        + urllib.parse.quote(saved.name)
+    )
+    return saved, url
+
+
+def delete_run_logs(*paths):
+    for path in paths:
+        if not path:
+            continue
+        try:
+            Path(path).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def show_log_controls(log_path: Path):
+    try:
+        import ipywidgets as widgets
+        from IPython.display import display
+
+        log_path = Path(log_path)
+        save_btn = widgets.Button(
+            description="📥 Import logs to Drive",
+            button_style="info",
+            tooltip="حفظ سجل التشغيل في Google Drive",
+        )
+        delete_btn = widgets.Button(
+            description="🗑️ امسح اللوجز دي",
+            button_style="danger",
+            disabled=True,
+            tooltip="حذف نسخة Drive والنسخة المحلية لهذا التشغيل",
+        )
+        status = widgets.HTML(
+            value=(
+                '<div dir="rtl" style="line-height:1.8">'
+                '📝 سجل التشغيل جاهز محليًا. احفظه في Drive لو محتاج تبعته أو تراجعه.'
+                '</div>'
+            )
+        )
+        saved_state = {"path": None}
+
+        def save_click(_button):
+            try:
+                saved, url = export_run_log_to_drive(log_path)
+                saved_state["path"] = saved
+                save_btn.disabled = True
+                delete_btn.disabled = False
+                relative = saved.relative_to(BASE_DIR)
+                status.value = (
+                    '<div dir="rtl" style="line-height:1.8">'
+                    '✅ تم حفظ اللوج في Google Drive.<br>'
+                    f'<code>{html.escape(str(relative))}</code><br>'
+                    f'<a href="{html.escape(url)}" target="_blank">🔗 افتح اللوج في Drive</a>'
+                    '</div>'
+                )
+            except Exception as exc:
+                status.value = (
+                    '<div dir="rtl" style="color:#b91c1c">'
+                    f'❌ تعذر حفظ اللوج: {html.escape(type(exc).__name__)}'
+                    '</div>'
+                )
+
+        def delete_click(_button):
+            try:
+                delete_run_logs(saved_state.get("path"), log_path)
+                save_btn.disabled = True
+                delete_btn.disabled = True
+                status.value = (
+                    '<div dir="rtl" style="color:#166534">'
+                    '🗑️ تم حذف لوج التشغيل من Drive ومن مساحة Colab المحلية.'
+                    '</div>'
+                )
+            except Exception as exc:
+                status.value = (
+                    '<div dir="rtl" style="color:#b91c1c">'
+                    f'❌ تعذر حذف اللوج: {html.escape(type(exc).__name__)}'
+                    '</div>'
+                )
+
+        save_btn.on_click(save_click)
+        delete_btn.on_click(delete_click)
+        display(widgets.VBox([save_btn, delete_btn, status]))
+    except Exception:
+        print(f"📝 سجل التشغيل المحلي: {log_path}")
+
+
 def run_quiet(args, check=True):
-    return subprocess.run(
+    result = subprocess.run(
         args,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        check=check,
+        check=False,
     )
+    if result.returncode != 0:
+        _log_debug(
+            f"command-failed rc={result.returncode} args={json.dumps([str(x) for x in args], ensure_ascii=False)} "
+            f"stderr={(result.stderr or '')[-4000:]}"
+        )
+        if check:
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                args,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
+    return result
 
 
 def ensure_dependencies():
@@ -744,6 +929,9 @@ class LiveProgress:
 
 def run_ffmpeg(cmd, duration: float, label: str):
     full = [cmd[0], "-y", "-nostdin", "-hide_banner", "-loglevel", "error", *cmd[1:-1], "-progress", "pipe:1", "-nostats", cmd[-1]]
+    _log_debug(
+        f"ffmpeg-start label={label} cmd={json.dumps([str(x) for x in full], ensure_ascii=False)}"
+    )
     proc = subprocess.Popen(
         full,
         stdout=subprocess.PIPE,
@@ -778,8 +966,10 @@ def run_ffmpeg(cmd, duration: float, label: str):
     code = proc.wait()
     if code != 0:
         tail = "\n".join(lines[-30:])
+        _log_debug(f"ffmpeg-failed label={label} rc={code} tail={tail}")
         raise AppError("E420", "فشل ضغط الملف.", tail)
 
+    _log_debug(f"ffmpeg-ok label={label} duration={duration:.3f} speed={speed_x}")
     progress.finish(duration, speed_override=speed_x)
 
 
@@ -846,24 +1036,28 @@ def _audio_streams(src: Path):
             "-select_streams",
             "a",
             "-show_entries",
-            "stream=index:stream_disposition=default",
+            "stream=index,channels,channel_layout:stream_disposition=default",
             "-of",
             "json",
             str(src),
         ]
     )
     data = json.loads(proc.stdout or "{}")
-    return [
+    streams = [
         {
             "index": int(stream["index"]),
+            "channels": max(1, int(stream.get("channels") or 1)),
+            "layout": str(stream.get("channel_layout") or ""),
             "default": bool((stream.get("disposition") or {}).get("default")),
         }
         for stream in data.get("streams", [])
         if str(stream.get("index", "")).isdigit()
     ]
+    _log_debug(f"audio-streams file={src.name} streams={json.dumps(streams, ensure_ascii=False)}")
+    return streams
 
 
-def _audio_peak_db(src: Path, stream_index: int) -> float:
+def _audio_peak_db(src: Path, stream_index: int, audio_filter: str = "volumedetect") -> float:
     proc = run_quiet(
         [
             "ffmpeg",
@@ -879,7 +1073,7 @@ def _audio_peak_db(src: Path, stream_index: int) -> float:
             "-sn",
             "-dn",
             "-af",
-            "volumedetect",
+            audio_filter,
             "-f",
             "null",
             "-",
@@ -888,47 +1082,71 @@ def _audio_peak_db(src: Path, stream_index: int) -> float:
     )
     match = re.findall(r"max_volume:\s*(-?inf|[-+]?\d+(?:\.\d+)?)\s*dB", proc.stderr or "")
     if not match:
+        _log_debug(
+            f"audio-peak-missing file={src.name} stream={stream_index} filter={audio_filter}"
+        )
         return float("-inf")
     value = match[-1].lower()
-    return float("-inf") if value == "-inf" else float(value)
+    peak = float("-inf") if value == "-inf" else float(value)
+    _log_debug(
+        f"audio-peak file={src.name} stream={stream_index} filter={audio_filter} peak_db={peak}"
+    )
+    return peak
 
 
-def _select_audio_stream(src: Path) -> int:
+def _select_audio_stream(src: Path):
     streams = _audio_streams(src)
     if not streams:
         raise AppError("E412", "هذا الفيديو لا يحتوي على مسار صوتي يمكن ضغطه.")
-    if len(streams) == 1:
-        return streams[0]["index"]
 
     measured = [
         {**stream, "peak": _audio_peak_db(src, stream["index"])}
         for stream in streams
     ]
-    audible = [stream for stream in measured if stream["peak"] > -70.0]
-    if not audible:
+    chosen = max(measured, key=lambda stream: (stream["peak"], stream["default"]))
+    _log_debug(
+        f"audio-selected file={src.name} candidates={json.dumps(measured, ensure_ascii=False)} "
+        f"chosen={json.dumps(chosen, ensure_ascii=False)}"
+    )
+    if chosen["peak"] <= -70.0:
         raise AppError("E415", "كل مسارات الصوت داخل الفيديو صامتة أو غير قابلة للاستخدام.")
 
-    default_audible = [stream for stream in audible if stream["default"]]
-    chosen = max(default_audible or audible, key=lambda stream: stream["peak"])
     if chosen["index"] != streams[0]["index"]:
         print("🎧 تم اختيار مسار الصوت المسموع بدل المسار الأول الصامت.")
-    return chosen["index"]
+    return chosen
 
 
-def _ensure_audible_output(dst: Path):
+def _audio_output_peak(dst: Path) -> float:
     streams = _audio_streams(dst)
-    if not streams or _audio_peak_db(dst, streams[0]["index"]) <= -70.0:
-        raise AppError(
-            "E415",
-            "الصوت الناتج صامت أو تالف؛ لم يتم إرساله إلى Telegram.",
+    if not streams:
+        return float("-inf")
+    return _audio_peak_db(dst, streams[0]["index"])
+
+
+def _best_audio_channel(src: Path, stream):
+    peaks = []
+    for channel in range(int(stream.get("channels") or 1)):
+        peak = _audio_peak_db(
+            src,
+            stream["index"],
+            f"pan=mono|c0=c{channel},volumedetect",
         )
+        peaks.append((channel, peak))
+    best = max(peaks, key=lambda item: item[1])
+    _log_debug(
+        f"audio-channel-peaks file={src.name} stream={stream['index']} peaks={peaks} best={best}"
+    )
+    return best
 
 
-def encode_audio(src: Path, dst: Path, info: MediaInfo):
-    if not info.has_audio:
-        raise AppError("E412", "هذا الفيديو لا يحتوي على مسار صوتي يمكن ضغطه.")
-
-    stream_index = _select_audio_stream(src)
+def _encode_audio_once(
+    src: Path,
+    dst: Path,
+    info: MediaInfo,
+    stream_index: int,
+    audio_filter: str,
+    label: str,
+):
     cmd = [
         "ffmpeg",
         "-y",
@@ -940,7 +1158,7 @@ def encode_audio(src: Path, dst: Path, info: MediaInfo):
         "-sn",
         "-dn",
         "-af",
-        "aresample=async=1:first_pts=0",
+        audio_filter,
         "-c:a",
         "libopus",
         "-b:a",
@@ -959,8 +1177,63 @@ def encode_audio(src: Path, dst: Path, info: MediaInfo):
         "on",
         str(dst),
     ]
-    run_ffmpeg(cmd, info.duration, "ضغط الصوت")
-    _ensure_audible_output(dst)
+    run_ffmpeg(cmd, info.duration, label)
+
+
+def encode_audio(src: Path, dst: Path, info: MediaInfo):
+    if not info.has_audio:
+        raise AppError("E412", "هذا الفيديو لا يحتوي على مسار صوتي يمكن ضغطه.")
+
+    stream = _select_audio_stream(src)
+    _encode_audio_once(
+        src,
+        dst,
+        info,
+        stream["index"],
+        "aresample=async=1:first_pts=0",
+        "ضغط الصوت",
+    )
+    output_peak = _audio_output_peak(dst)
+    if output_peak > -70.0:
+        return
+
+    # Some recordings contain stereo channels with opposite phase. A normal
+    # stereo-to-mono downmix cancels them almost completely. Keep the requested
+    # mono output, but retry using the strongest single channel.
+    if stream["channels"] > 1 and stream["peak"] > -70.0:
+        channel, channel_peak = _best_audio_channel(src, stream)
+        if channel_peak > -70.0:
+            print("🔧 اكتشفنا تعارض بين قنوات الصوت — هنستخدم القناة المسموعة تلقائيًا.")
+            _log_debug(
+                f"audio-phase-cancellation file={src.name} output_peak={output_peak} "
+                f"retry_channel={channel} channel_peak={channel_peak}"
+            )
+            try:
+                dst.unlink()
+            except FileNotFoundError:
+                pass
+            _encode_audio_once(
+                src,
+                dst,
+                info,
+                stream["index"],
+                f"pan=mono|c0=c{channel},aresample=async=1:first_pts=0",
+                "إصلاح قناة الصوت",
+            )
+            retry_peak = _audio_output_peak(dst)
+            if retry_peak > -70.0:
+                _log_debug(
+                    f"audio-phase-recovery-ok file={src.name} channel={channel} peak={retry_peak}"
+                )
+                return
+
+    _log_debug(
+        f"audio-output-silent file={src.name} source_peak={stream['peak']} output_peak={output_peak}"
+    )
+    raise AppError(
+        "E415",
+        "الصوت الناتج صامت أو تالف؛ لم يتم إرساله إلى Telegram.",
+    )
 
 
 def video_filter(info: MediaInfo, max_w: int, max_h: int, fps_cap: int) -> str:
@@ -1914,6 +2187,14 @@ async def app():
 
 
 def run():
+    use_run_log = os.environ.get("TSC_TEST_MODE") != "1"
+    log_path = None
+    if use_run_log:
+        try:
+            log_path = _start_run_log()
+        except Exception:
+            log_path = None
+
     print(f"✅ المحرك {ENGINE_BUNDLE_VERSION}")
     try:
         ensure_dependencies()
@@ -1950,6 +2231,13 @@ def run():
         print("❌ E999")
         print("حصل خطأ غير متوقع. تم حفظ التفاصيل في Google Drive.")
         print("إذا استمرت المشكلة، أرسل كود الخطأ E999.")
+
+    finally:
+        if use_run_log:
+            _log_debug("run-end")
+            _stop_run_log()
+            if log_path is not None and log_path.exists():
+                show_log_controls(log_path)
 
 
 if os.environ.get("TSC_TEST_MODE") != "1":
