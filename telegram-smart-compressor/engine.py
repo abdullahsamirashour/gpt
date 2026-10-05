@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import getpass
-import hashlib
 import html
 import json
 import logging
@@ -24,7 +23,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.5.2"
+ENGINE_BUNDLE_VERSION = "5.5.3"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -45,7 +44,6 @@ TURBO_THRESHOLD = 8 * 1024 * 1024
 TURBO_MAX_CONNECTIONS = 20
 TURBO_FULL_SPEED_BYTES = 100 * 1024 * 1024
 TURBO_PART_KB = 512
-FAST_UPLOAD_THRESHOLD = 8 * 1024 * 1024
 BASE_DIR = Path("/content/drive/MyDrive/Telegram_Extreme_Compressor")
 TMP_DIR = Path("/content/telegram_smart_compressor_tmp")
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -839,66 +837,6 @@ async def download_media_fast(client, msg, path: Path):
     return downloaded, "normal", elapsed
 
 
-async def upload_media_fast(client, path: Path, progress: LiveProgress):
-    from telethon.helpers import generate_random_long
-    from telethon.tl.types import InputFile, InputFileBig
-
-    size = path.stat().st_size
-    if size < FAST_UPLOAD_THRESHOLD:
-        return str(path), "normal", None
-
-    uploader = None
-    try:
-        import aiofiles
-        from aiofasttelethonhelper.core.transfer import ParallelTransferrer
-
-        connections = transfer_connection_count(size)
-        file_id = generate_random_long()
-        uploader = ParallelTransferrer(client)
-        part_size, part_count, is_large = await uploader.init_upload(
-            file_id,
-            size,
-            part_size_kb=TURBO_PART_KB,
-            connection_count=connections,
-        )
-
-        print(f"⚡ رفع سريع — {connections} اتصال")
-        md5 = hashlib.md5()
-        done = 0
-
-        async with aiofiles.open(str(path), "rb") as reader:
-            while True:
-                part = await reader.read(part_size)
-                if not part:
-                    break
-                if not is_large:
-                    md5.update(part)
-                await uploader.upload(part)
-                done += len(part)
-                progress.update(done, size)
-
-        await uploader.finish_upload()
-        uploader = None
-        elapsed = progress.finish(size)
-
-        if is_large:
-            uploaded = InputFileBig(file_id, part_count, path.name)
-        else:
-            uploaded = InputFile(file_id, part_count, path.name, md5.hexdigest())
-        return uploaded, "turbo", elapsed
-
-    except Exception:
-        try:
-            if uploader is not None and getattr(uploader, "senders", None):
-                await uploader._cleanup()
-        except Exception:
-            pass
-        print("↪️ تعذر الرفع السريع؛ هنكمل تلقائيًا بالطريقة العادية.")
-        return str(path), "normal", None
-
-
-
-
 def encode_audio(src: Path, dst: Path, info: MediaInfo):
     if not info.has_audio:
         raise AppError("E412", "هذا الفيديو لا يحتوي على مسار صوتي يمكن ضغطه.")
@@ -1638,10 +1576,9 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
 
             upload = LiveProgress("رفع", "⬆️")
             upload_started = time.time()
-            file_arg, upload_mode, fast_upload_seconds = await upload_media_fast(client, dst, upload)
             sent = await client.send_file(
                 channel,
-                file_arg,
+                str(dst),
                 caption=(
                     f"✅ تم • {label}\n"
                     f"{Path(name).stem}\n"
@@ -1660,10 +1597,9 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
                     )
                 ],
                 reply_to=msg.id,
-                progress_callback=upload.callback if upload_mode == "normal" else None,
+                progress_callback=upload.callback,
             )
-            if upload_mode == "normal":
-                upload.finish(final_size)
+            upload.finish(final_size)
             timings["upload"] = time.time() - upload_started
 
         total_elapsed = time.time() - started_at
