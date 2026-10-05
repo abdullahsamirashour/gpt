@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.5.3"
+ENGINE_BUNDLE_VERSION = "5.5.4"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -837,17 +837,105 @@ async def download_media_fast(client, msg, path: Path):
     return downloaded, "normal", elapsed
 
 
+def _audio_streams(src: Path):
+    proc = run_quiet(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index:stream_disposition=default",
+            "-of",
+            "json",
+            str(src),
+        ]
+    )
+    data = json.loads(proc.stdout or "{}")
+    return [
+        {
+            "index": int(stream["index"]),
+            "default": bool((stream.get("disposition") or {}).get("default")),
+        }
+        for stream in data.get("streams", [])
+        if str(stream.get("index", "")).isdigit()
+    ]
+
+
+def _audio_peak_db(src: Path, stream_index: int) -> float:
+    proc = run_quiet(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-i",
+            str(src),
+            "-map",
+            f"0:{stream_index}",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            "-",
+        ],
+        check=False,
+    )
+    match = re.findall(r"max_volume:\\s*(-?inf|[-+]?\\d+(?:\\.\\d+)?)\\s*dB", proc.stderr or "")
+    if not match:
+        return float("-inf")
+    value = match[-1].lower()
+    return float("-inf") if value == "-inf" else float(value)
+
+
+def _select_audio_stream(src: Path) -> int:
+    streams = _audio_streams(src)
+    if not streams:
+        raise AppError("E412", "هذا الفيديو لا يحتوي على مسار صوتي يمكن ضغطه.")
+    if len(streams) == 1:
+        return streams[0]["index"]
+
+    measured = [
+        {**stream, "peak": _audio_peak_db(src, stream["index"])}
+        for stream in streams
+    ]
+    audible = [stream for stream in measured if stream["peak"] > -70.0]
+    if not audible:
+        raise AppError("E415", "كل مسارات الصوت داخل الفيديو صامتة أو غير قابلة للاستخدام.")
+
+    default_audible = [stream for stream in audible if stream["default"]]
+    chosen = max(default_audible or audible, key=lambda stream: stream["peak"])
+    if chosen["index"] != streams[0]["index"]:
+        print("🎧 تم اختيار مسار الصوت المسموع بدل المسار الأول الصامت.")
+    return chosen["index"]
+
+
+def _ensure_audible_output(dst: Path):
+    streams = _audio_streams(dst)
+    if not streams or _audio_peak_db(dst, streams[0]["index"]) <= -70.0:
+        raise AppError(
+            "E415",
+            "الصوت الناتج صامت أو تالف؛ لم يتم إرساله إلى Telegram.",
+        )
+
+
 def encode_audio(src: Path, dst: Path, info: MediaInfo):
     if not info.has_audio:
         raise AppError("E412", "هذا الفيديو لا يحتوي على مسار صوتي يمكن ضغطه.")
 
+    stream_index = _select_audio_stream(src)
     cmd = [
         "ffmpeg",
         "-y",
         "-i",
         str(src),
         "-map",
-        "0:a:0",
+        f"0:{stream_index}",
         "-vn",
         "-sn",
         "-dn",
@@ -872,6 +960,7 @@ def encode_audio(src: Path, dst: Path, info: MediaInfo):
         str(dst),
     ]
     run_ffmpeg(cmd, info.duration, "ضغط الصوت")
+    _ensure_audible_output(dst)
 
 
 def video_filter(info: MediaInfo, max_w: int, max_h: int, fps_cap: int) -> str:
