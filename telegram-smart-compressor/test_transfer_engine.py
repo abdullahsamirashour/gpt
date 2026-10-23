@@ -6,7 +6,7 @@ import hashlib
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import json
 import tempfile
 import unittest
@@ -52,7 +52,96 @@ class FakeDrive:
         return self.client
 
 
+def mocked_google_modules(authenticator, mounter, get_credentials, make_service):
+    """Provide Colab and Google API test doubles without real login or network."""
+    google = types.ModuleType("google")
+    google.__path__ = []
+    colab = types.ModuleType("google.colab")
+    colab.__path__ = []
+    colab.auth = SimpleNamespace(authenticate_user=authenticator)
+    colab.drive = SimpleNamespace(mount=mounter)
+    googleauth = types.ModuleType("google.auth")
+    googleauth.default = get_credentials
+    api = types.ModuleType("googleapiclient")
+    api.__path__ = []
+    discovery = types.ModuleType("googleapiclient.discovery")
+    discovery.build = make_service
+    return {
+        "google": google, "google.colab": colab, "google.auth": googleauth,
+        "googleapiclient": api, "googleapiclient.discovery": discovery,
+    }
+
+
 class TransferEngineTests(unittest.TestCase):
+    def test_drive_auth_reuses_mounted_drive_and_existing_api_login(self):
+        with tempfile.TemporaryDirectory() as td:
+            api = MagicMock()
+            api.about.return_value.get.return_value.execute.return_value = {
+                "user": {"emailAddress": "student@gmail.com"}
+            }
+            mount = MagicMock(side_effect=AssertionError("Mount should not be requested again"))
+            auth = MagicMock(side_effect=AssertionError("Auth should not be requested again"))
+            default = MagicMock(return_value=(object(), None))
+            build = MagicMock(return_value=api)
+            modules = mocked_google_modules(auth, mount, default, build)
+            with patch.dict(sys.modules, modules), \
+                 patch.object(transfer.os.path, "ismount", return_value=True), \
+                 patch.object(transfer, "BASE_DIR", Path(td) / "base"), \
+                 patch.object(transfer, "APP_DIR", Path(td) / "base" / "transfer"), \
+                 patch.object(transfer, "TEMP_ROOT", Path(td) / "tmp"):
+                result = transfer.connect_drive()
+            self.assertIs(result, api)
+            mount.assert_not_called()
+            auth.assert_not_called()
+            default.assert_called_once_with(scopes=[transfer.DRIVE_SCOPE])
+            self.assertTrue((Path(td) / "base" / "transfer").exists())
+
+    def test_drive_auth_requests_api_permission_only_if_no_cached_login(self):
+        with tempfile.TemporaryDirectory() as td:
+            api = MagicMock()
+            api.about.return_value.get.return_value.execute.return_value = {
+                "user": {"emailAddress": "student@gmail.com"}
+            }
+            default = MagicMock(side_effect=[
+                RuntimeError("No reusable API credential"),
+                (object(), None),
+            ])
+            mount = MagicMock()
+            auth = MagicMock()
+            modules = mocked_google_modules(auth, mount, default, MagicMock(return_value=api))
+            with patch.dict(sys.modules, modules), \
+                 patch.object(transfer.os.path, "ismount", side_effect=[False, True]), \
+                 patch.object(transfer, "BASE_DIR", Path(td) / "base"), \
+                 patch.object(transfer, "APP_DIR", Path(td) / "base" / "transfer"), \
+                 patch.object(transfer, "TEMP_ROOT", Path(td) / "tmp"):
+                result = transfer.connect_drive()
+            self.assertIs(result, api)
+            mount.assert_called_once_with("/content/drive", force_remount=False)
+            auth.assert_called_once_with()
+            self.assertEqual(default.call_count, 2)
+
+    def test_drive_mount_failure_is_identified_before_telegram_login(self):
+        with tempfile.TemporaryDirectory() as td:
+            mount = MagicMock(side_effect=RuntimeError("credential propagation was unsuccessful"))
+            auth = MagicMock(side_effect=AssertionError("Must not authorize API after mount failed"))
+            modules = mocked_google_modules(auth, mount, MagicMock(), MagicMock())
+            with patch.dict(sys.modules, modules), \
+                 patch.object(transfer.os.path, "ismount", return_value=False), \
+                 patch.object(transfer, "BASE_DIR", Path(td) / "base"):
+                with self.assertRaisesRegex(RuntimeError, "فشل توصيل Google Drive"):
+                    transfer.connect_drive()
+            auth.assert_not_called()
+
+    def test_service_account_credentials_not_accepted_as_personal_drive(self):
+        service = MagicMock()
+        service.about.return_value.get.return_value.execute.return_value = {
+            "user": {"emailAddress": "service@project.iam.gserviceaccount.com"}
+        }
+        with self.assertRaisesRegex(RuntimeError, "Google Drive API"):
+            transfer._drive_service_for_signed_in_user(
+                lambda scopes: (object(), None), lambda *a, **k: service
+            )
+
     def test_qr_login_can_refresh_without_sms(self):
         images = []
         links = []

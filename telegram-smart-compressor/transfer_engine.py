@@ -312,18 +312,80 @@ def load_account_config() -> dict:
     return shared
 
 
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+
+
+def _drive_service_for_signed_in_user(default_credentials, build_api):
+    """Reuse an existing Drive API login, but never silently use the VM service account."""
+    credentials, _project = default_credentials(scopes=[DRIVE_SCOPE])
+    service = build_api("drive", "v3", credentials=credentials, cache_discovery=False)
+    info = service.about().get(fields="user(emailAddress)").execute(num_retries=2)
+    email = str(info.get("user", {}).get("emailAddress", "")).lower()
+    if not email or email.endswith(".gserviceaccount.com"):
+        raise RuntimeError("Google Drive API مش متصلة بحساب Google شخصي أو Workspace مسجل الدخول.")
+    return service
+
+
 def connect_drive():
     from google.colab import auth, drive
     from google.auth import default
     from googleapiclient.discovery import build
 
-    drive.mount("/content/drive", force_remount=False)
+    # Colab's drive.mount can start a *new* browser credential-propagation request
+    # even if the Drive FUSE mount is already active (notably on mobile Safari).
+    # Avoid repeating a grant when the authorized filesystem is already mounted.
+    mountpoint = "/content/drive"
+    if os.path.ismount(mountpoint):
+        print("✅ Google Drive متوصل بالفعل؛ مش هطلب Mount جديد.")
+    else:
+        print("🔑 أولًا: توصيل مساحة Google Drive بجلسة Colab...")
+        try:
+            drive.mount(mountpoint, force_remount=False)
+        except Exception as exc:
+            raise RuntimeError(
+                "فشل توصيل Google Drive من Colab نفسه (قبل Telegram). "
+                "افتح Files من الشريط الجانبي وجرب Mount Drive، ووافق على الأذونات. "
+                "لو ظهر credential propagation was unsuccessful، فدي مشكلة معروفة "
+                "في صلاحيات Colab؛ جرّب نافذة جديدة، واسمح بالكوكيز والنوافذ المنبثقة "
+                "أو جرّب متصفح آخر."
+            ) from exc
+
+    if not os.path.ismount(mountpoint):
+        raise RuntimeError(
+            "Colab لم يؤكد ربط Google Drive. اربطه من قائمة Files أولًا قبل تشغيل النقل."
+        )
+
     BASE_DIR.mkdir(parents=True, exist_ok=True)
     APP_DIR.mkdir(parents=True, exist_ok=True)
     TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-    auth.authenticate_user()
-    credentials, _project = default(scopes=["https://www.googleapis.com/auth/drive"])
-    return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+    try:
+        service = _drive_service_for_signed_in_user(default, build)
+        print("✅ Google Drive API متوصلة بالفعل؛ استخدمت الإذن الحالي.")
+        return service
+    except Exception:
+        # Access to mounted Drive files is separate from Google Drive API OAuth.
+        # Only ask for a second grant when no working *user* API credential exists.
+        print("🔑 Google Drive API محتاجة إذن وصول مرة واحدة...")
+    try:
+        auth.authenticate_user()
+    except Exception as exc:
+        raise RuntimeError(
+            "فشل تفويض Google Drive API من Colab، بعد نجاح Mount. "
+            "اتأكد إن نوافذ تسجيل Google والأذونات بتفتح على المتصفح وإن حساب Google صحيح. "
+            "لو رسالة credential propagation was unsuccessful ظهرت هنا أيضًا، "
+            "جرب متصفح مختلف؛ المشكلة من ربط أذونات Colab وليست من Telegram."
+        ) from exc
+
+    try:
+        service = _drive_service_for_signed_in_user(default, build)
+    except Exception as exc:
+        raise RuntimeError(
+            "تم طلب التفويض لكن Google Drive API مش قادرة تقرأ حساب Drive. "
+            "تأكد إنك اخترت الحساب اللي فيه الفولدر ووافقت على صلاحيات Google Drive."
+        ) from exc
+    print("✅ تم توصيل Google Drive API بنجاح.")
+    return service
 
 
 def get_drive_metadata(service, file_id: str) -> dict:
