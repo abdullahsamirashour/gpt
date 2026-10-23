@@ -112,6 +112,38 @@ def parse_drive_id(value: str) -> str:
     return identifier
 
 
+
+def normalize_transfer_inputs(direction: str, source: str, destination: str) -> tuple[str, str]:
+    """Accept a single Drive URL even if an older Colab cell put it in 'destination'."""
+    source, destination = (source or "").strip(), (destination or "").strip()
+    if direction == "drive_to_telegram":
+        if source and destination and parse_drive_id(source) != parse_drive_id(destination):
+            raise ValueError("في اتجاه Drive → Telegram حط رابط فولدر Drive واحد بس في خانة الرابط.")
+        link = source or destination
+        if not link:
+            raise ValueError("انسخ رابط ملف أو فولدر Google Drive وحطه في خانة الرابط.")
+        parse_drive_id(link)
+        if not source:
+            print("ℹ️ استخدمت رابط Drive المكتوب في خانة الوجهة كمصدر للنقل إلى Telegram.")
+        return link, ""
+    if direction == "telegram_to_drive":
+        if destination:
+            parse_drive_id(destination)
+        return source, destination
+    raise ValueError("اتجاه النقل غير معروف.")
+
+
+def bind_transfer_channel(state: dict, channel_id: int, previous_channel_id=None) -> None:
+    """A recreated Telegram channel needs fresh upload records, not old channel receipts."""
+    channel_id = int(channel_id)
+    old_id = state.get("drive_to_telegram_channel_id") or previous_channel_id
+    if old_id is not None and int(old_id) != channel_id:
+        state["drive_to_telegram"] = {}
+        print("📣 قناة النقل اتغيرت؛ هراجع الملفات كأنها أول مرة للقناة الجديدة.")
+    state["drive_to_telegram_channel_id"] = channel_id
+    save_json(STATE_PATH, state)
+
+
 def transfer_token(metadata: dict) -> str:
     """Prefer the content checksum, falling back to modifiedTime for native Docs."""
     revision = metadata.get("md5Checksum") or metadata.get("modifiedTime") or ""
@@ -499,23 +531,42 @@ def download_drive_file(service, metadata: dict, path: Path) -> tuple[int, str]:
 async def ensure_channel(client, config: dict):
     from telethon import functions, types
 
-    cid = config.get("channel_id")
-    if cid:
+    def usable(entity):
+        rights = getattr(entity, "admin_rights", None)
+        can_post = bool(getattr(entity, "creator", False) or getattr(rights, "post_messages", False))
+        return bool(
+            getattr(entity, "broadcast", False) and can_post
+            and not getattr(entity, "username", None)
+        )
+
+    channel_id = config.get("channel_id")
+    if channel_id:
         try:
-            entity = await client.get_entity(types.PeerChannel(int(cid)))
-            if not getattr(entity, "username", None):
+            entity = await client.get_entity(types.PeerChannel(int(channel_id)))
+            if usable(entity):
+                print(f"📣 استخدام قناة النقل المحفوظة: {getattr(entity, 'title', CHANNEL_TITLE)}")
                 return entity
+        except (ValueError, TypeError):
+            pass
         except Exception:
+            # The Telegram entity cache may be unavailable in a fresh session.
             pass
 
+    matches = []
     async for dialog in client.iter_dialogs():
-        entity = dialog.entity
-        rights = getattr(entity, "admin_rights", None)
-        can_post = getattr(entity, "creator", False) or bool(rights and rights.post_messages)
-        if dialog.name == CHANNEL_TITLE and can_post and not getattr(entity, "username", None):
-            config["channel_id"] = int(entity.id)
-            save_json(TRANSFER_CONFIG, config)
-            return entity
+        if dialog.name == CHANNEL_TITLE and usable(dialog.entity):
+            matches.append(dialog.entity)
+    if len(matches) > 1:
+        raise RuntimeError(
+            "فيه أكتر من قناة خاصة بنفس اسم Media Lite | File Transfer. "
+            "مش هختار قناة عشوائية؛ لازم نحدد القناة المقصودة."
+        )
+    if matches:
+        channel = matches[0]
+        config["channel_id"] = int(channel.id)
+        save_json(TRANSFER_CONFIG, config)
+        print(f"📣 لقيت قناة النقل القديمة وهستخدمها: {CHANNEL_TITLE}")
+        return channel
 
     result = await client(functions.channels.CreateChannelRequest(
         title=CHANNEL_TITLE,
@@ -525,7 +576,7 @@ async def ensure_channel(client, config: dict):
     channel = result.chats[0]
     config["channel_id"] = int(channel.id)
     save_json(TRANSFER_CONFIG, config)
-    print(f"✅ تم إنشاء قناة النقل الخاصة: {CHANNEL_TITLE}")
+    print(f"✅ أنشأت قناة Telegram خاصة جديدة: {CHANNEL_TITLE}")
     return channel
 
 
@@ -546,21 +597,31 @@ async def transfer_drive_to_telegram(
 ) -> dict:
     from telethon.tl.types import DocumentAttributeFilename
 
-    items = list_drive_sources(service, source_id, recursive)[:max_files]
-    if not items:
-        print("📭 مفيش ملفات في المصدر المحدد.")
+    all_items = list_drive_sources(service, source_id, recursive)
+    if not all_items:
+        print("📭 مفيش ملفات في المجلد المحدد (أو هو فاضي).")
         return {"ok": 0, "skipped": 0, "failed": 0}
+    records = state_section(state, "drive_to_telegram")
+    pending = [m for m in all_items if not records.get(transfer_token(m), {}).get("done")]
+    already_done = len(all_items) - len(pending)
+    items = pending[:max_files] if max_files else pending
     count_bytes = sum(int(x.get("size") or 0) for x in items)
-    print(f"📦 Drive → Telegram | {len(items)} ملف | {count_bytes / 1024**2:.1f} MiB")
+    print(
+        f"📦 Drive → Telegram | إجمالي المجلد: {len(all_items)} ملف | "
+        f"اتنقل قبل كده: {already_done} | هيتنقل دلوقتي: {len(items)} "
+        f"({count_bytes / 1024**2:.1f} MiB)"
+    )
     for item in items[:10]:
         print(" •", item["relative_path"])
     if preview:
-        print("👁️ معاينة فقط — لم يتم نقل ملفات.")
-        return {"ok": 0, "skipped": 0, "failed": 0}
+        print("👁️ معاينة فقط — لم يتم نقل ملفات أو إنشاء قناة.")
+        return {"ok": 0, "skipped": already_done, "failed": 0}
+    if not items:
+        print("✅ كل ملفات المجلد اتنقلت بالفعل إلى قناة Telegram.")
+        return {"ok": 0, "skipped": already_done, "failed": 0}
 
     sent = await cached_part_messages(client, channel)
-    records = state_section(state, "drive_to_telegram")
-    counters = {"ok": 0, "skipped": 0, "failed": 0}
+    counters = {"ok": 0, "skipped": already_done, "failed": 0}
     for index, meta in enumerate(items, 1):
         token = transfer_token(meta)
         previous = records.get(token, {})
@@ -670,7 +731,9 @@ async def transfer_telegram_to_drive(
         if state_section(state, "telegram_to_drive").get(key):
             continue
         downloaded.append(msg)
-    jobs = list(reversed(downloaded))[:max_files]
+    jobs = list(reversed(downloaded))
+    if max_files:
+        jobs = jobs[:max_files]
     print(f"📦 Telegram → Drive | {len(jobs)} ملف جديد من آخر {SCAN_LIMIT} رسالة")
     for msg in jobs[:10]:
         print(" •", clean_filename(getattr(msg.file, "name", "") or f"telegram_{msg.id}"))
@@ -723,9 +786,14 @@ async def _run_transfer(
 ) -> dict:
     from telethon import TelegramClient
 
+    state = load_json(STATE_PATH, new_state())
+    if direction == "drive_to_telegram" and preview:
+        return await transfer_drive_to_telegram(
+            None, None, service, state, parse_drive_id(source), recursive, max_files, True
+        )
+
     account = load_account_config()
     transfer_config = load_json(TRANSFER_CONFIG, {})
-    state = load_json(STATE_PATH, new_state())
     if PERSISTENT_SESSION.exists():
         shutil.copy2(PERSISTENT_SESSION, LOCAL_SESSION)
     elif LOCAL_SESSION.exists():
@@ -748,11 +816,11 @@ async def _run_transfer(
         if actual_phone and configured_phone != actual_phone:
             raise RuntimeError("جلسة النقل مرتبطة بحساب Telegram مختلف عن الإعدادات؛ لا يمكن استخدامها.")
         if direction == "drive_to_telegram":
-            source_id = parse_drive_id(source)
-            # A preview must not create a channel or upload anything.
-            channel = None if preview else await ensure_channel(client, transfer_config)
+            previous_id = transfer_config.get("channel_id")
+            channel = await ensure_channel(client, transfer_config)
+            bind_transfer_channel(state, int(channel.id), previous_id)
             return await transfer_drive_to_telegram(
-                client, channel, service, state, source_id, recursive, max_files, preview
+                client, channel, service, state, parse_drive_id(source), recursive, max_files, False
             )
         if direction == "telegram_to_drive":
             if source.strip():
@@ -780,15 +848,10 @@ def run_transfer(
     max_files: int = 20, recursive: bool = True, preview: bool = True,
 ) -> None:
     """Entry point called by the small GitHub-backed Colab launcher cell."""
-    if direction not in {"drive_to_telegram", "telegram_to_drive"}:
-        raise ValueError("اتجاه النقل غير صالح.")
-    if direction == "drive_to_telegram":
-        parse_drive_id(source)  # Reject missing/unsafe links before authentication.
-    if destination:
-        parse_drive_id(destination)
+    source, destination = normalize_transfer_inputs(direction, source, destination)
     max_files = int(max_files)
-    if not 1 <= max_files <= 200:
-        raise ValueError("عدد الملفات في التشغيل لازم يكون بين 1 و200.")
+    if not 0 <= max_files <= 200:
+        raise ValueError("عدد الملفات لازم يكون 0 (كل الملفات) أو رقم من 1 إلى 200.")
 
     ensure_dependencies()
     import nest_asyncio
