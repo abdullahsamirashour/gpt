@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -61,17 +62,35 @@ def load_json(path: Path, default: dict) -> dict:
 def single_run():
     """Prevent simultaneous Colab runtimes from sharing the transfer session/state."""
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    if LOCK_PATH.exists() and time.time() - LOCK_PATH.stat().st_mtime > 12 * 3600:
-        LOCK_PATH.unlink(missing_ok=True)
+    # A heartbeat distinguishes an active transfer from a crash in another runtime.
+    # An abandoned lock expires after 10 minutes; an active transfer can run longer.
+    try:
+        if time.time() - LOCK_PATH.stat().st_mtime > 600:
+            LOCK_PATH.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
     try:
         fd = os.open(str(LOCK_PATH), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        raise RuntimeError("فيه عملية نقل تانية شغالة أو قفل قديم؛ راجع ملف run.lock على Drive.")
+        raise RuntimeError("فيه عملية نقل تانية شغالة؛ افتح نفس الـColab أو جرّب بعد إعادة الاتصال.")
     with os.fdopen(fd, "w", encoding="utf-8") as guard:
         guard.write(str(os.getpid()))
+    stopped = threading.Event()
+
+    def heartbeat():
+        while not stopped.wait(30):
+            try:
+                os.utime(LOCK_PATH, None)
+            except OSError:
+                return
+
+    worker = threading.Thread(target=heartbeat, daemon=True)
+    worker.start()
     try:
         yield
     finally:
+        stopped.set()
+        worker.join(timeout=1)
         LOCK_PATH.unlink(missing_ok=True)
 
 
