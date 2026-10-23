@@ -6,6 +6,11 @@ on:
     paths:
       - 'telegram-smart-compressor/**'
       - '.github/workflows/validate-smart-compressor.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'telegram-smart-compressor/**'
+      - '.github/workflows/validate-smart-compressor.yml'
   workflow_dispatch:
 
 jobs:
@@ -30,6 +35,7 @@ jobs:
         run: |
           python -m py_compile telegram-smart-compressor/engine.py
           python -m py_compile telegram-smart-compressor/benchmark_engine.py
+          python -m py_compile telegram-smart-compressor/transfer_engine.py
 
       - name: Validate Colab notebooks
         run: |
@@ -70,16 +76,29 @@ jobs:
                   assert 'BRANCH = "beta"' in code
               elif path.name == "Encoder_Benchmark.ipynb":
                   import os
-                  branch = os.environ.get("GITHUB_REF_NAME", "beta")
+                  branch = os.environ.get("GITHUB_BASE_REF") or os.environ.get("GITHUB_REF_NAME", "beta")
                   assert 'ENGINE_REL = "telegram-smart-compressor/benchmark_engine.py"' in code
                   assert f'BRANCH = "{branch}"' in code
                   assert 'run_benchmark()' in code
                   assert code.count("#@param") >= 5
               compile(code, str(path), "exec")
+              if path.name == "Smart_Compressor.ipynb":
+                  assert len(code_cells) == 2
+                  transfer_code = "".join(code_cells[1].get("source", []))
+                  assert 'transfer_engine.py' in transfer_code
+                  assert '_transfer_module.run_transfer(' in transfer_code
+                  assert 'drive_to_telegram' in transfer_code
+                  assert 'telegram_to_drive' in transfer_code
+                  assert '"main"' in transfer_code
+                  compile(transfer_code, "Media-Lite transfer cell", "exec")
               print("OK notebook:", path)
 
           assert found >= 1
           PY
+
+      - name: Bidirectional transfer regression tests
+        run: |
+          python -m unittest discover -s telegram-smart-compressor -p 'test_transfer_engine.py' -v
 
       - name: Benchmark engine smoke tests
         run: |

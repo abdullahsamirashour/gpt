@@ -2,7 +2,7 @@
 
 [فتح النسخة المستقرة في Google Colab](https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/Smart_Compressor.ipynb)
 
-أداة Colab لضغط الفيديو والصوت وإرجاع النتيجة إلى قناة Telegram خاصة.
+أداة Colab لضغط الفيديو والصوت، وبخلية مستقلة لنقل الملفات بين Google Drive وTelegram في الاتجاهين.
 
 ## الاستخدام
 
@@ -48,3 +48,28 @@
 [فتح Encoder Benchmark في Colab](https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/Encoder_Benchmark.ipynb)
 
 النوت بوك لا تغيّر القناة ولا محرك الضغط الأساسي. الإصدار v1.1 يشخّص FFmpeg NVENC وNVDEC وFull GPU وNVEncC كلٌ بشكل مستقل، ويستخدم Warm-up + قياسات مكررة بالـMedian، ويعرض CPU/GPU/NVENC utilization، ثم يؤكد أفضل النتائج على مقطع أطول ويحفظ تقريرًا مفصلًا في Google Drive.
+
+
+## 📦 Cell 2: Telegram ↔ Google Drive
+
+**لا تحتاج Notebook جديدة.** افتح [نفس النوت بوك المستقرة على Colab](https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/Smart_Compressor.ipynb) وستجد خلية تشغيل ثانية. الخلية القديمة للضغط لم تتغير. محرك النقل الحقيقي محفوظ في [transfer_engine.py](transfer_engine.py)، ويُحمّل من أحدث commit على الفرع المستقر وقت التشغيل.
+
+- **Drive → Telegram:** اختر الاتجاه، وضع رابط ملف أو مجلد Drive في خانة **المصدر**، واترك وجهة Drive فارغة. ستُنشأ قناة Telegram **خاصة** باسم **📁 Media Lite | File Transfer** عند الحاجة. يمكن تضمين المجلدات الفرعية.
+- **Telegram → Drive:** اختر الاتجاه، واترك **المصدر** فارغًا لقراءة الملفات من قناة النقل أو اكتب قناة أخرى لديك صلاحية الوصول إليها. اترك **مجلد Drive الوجهة** فارغًا لإنشاء/استخدام مجلد **Media Lite Transfers**، أو ضع رابط مجلد وجهة.
+- **معاينة فقط** هي الاختيار الافتراضي الآمن. اختر **تنفيذ النقل** لإرسال الملفات. كل تشغيل يعالج عددًا محدودًا من الملفات ويطبع نجاح/تخطي/فشل كل ملف.
+- **أول تشغيل:** يستخدم المحرك نفس API ID/Hash/phone المحفوظة للضغط، لكنه ينشئ **جلسة Telegram منفصلة** لضمان عدم التعارض. قد يطلب كود دخول جديد وتفويض Google Drive.
+
+### الحفاظ على الملفات والاستكمال
+
+- لا نحذف الملفات الأصلية من Telegram أو Google Drive، ولا نضغطها أثناء النقل.
+- يتم حفظ حالة الاتجاهين منفصلة تحت Telegram_Extreme_Compressor/Media_Lite_Transfer/state_v1.json، وجلسة النقل في المجلد نفسه. ليست هناك رموز سرية في GitHub.
+- عند نهاية التشغيل يظهر زر **Import logs to Drive** لحفظ سجل النقل عند الحاجة، كما في خلية الضغط؛ وفي المجلد نفسه يُحفظ ملخص آخر تشغيل فعلي.
+- يحتفظ الرفع إلى Telegram بعلامة داخل وصف الملف تمنع عودته تلقائيًا إلى Drive، وتساعد على تجنب إعادة إرسال الأجزاء عند انقطاع التشغيل.
+- تتحقق عمليات النقل من أحجام الملفات؛ يتحقق تنزيل Drive ورفعه كذلك باستخدام MD5 عندما يكون متاحًا.
+- يستخدم Telegram حد أجزاء احترازيًا **1.9 GB**؛ الملفات الأكبر تُرسل كأجزاء خام دون فقد مع ملف JSON لإعادة تجميعها. إرسال ملف كبير كأجزاء لا يعني أن الأجزاء نفسها ملفات فيديو قابلة للتشغيل.
+- يتم تصدير Google Docs إلى PDF، وSheets إلى XLSX، وSlides إلى PPTX قبل إرسالها. الأنواع الأخرى غير القابلة للتصدير تظهر كأخطاء واضحة.
+- يعتمد نقل الملفات على مساحة Colab المتاحة وسياسة الاستخدام التفاعلي وحدود Google Drive وTelegram. نقل الملفات غير مضمون بعد انتهاء جلسة Colab، والملف الجاري قد يحتاج إعادة نقل؛ الملفات المكتملة لا تُكرر عادةً.
+
+### اختبارات التطوير
+
+ملف test_transfer_engine.py يغطي روابط Drive غير الموثوقة، وحالة النقل، وتقسيم الملف دون نسخه مرتين، واستكشاف المجلدات؛ ويعمل تلقائيًا في GitHub Actions مع بقية اختبارات الأداة.
