@@ -84,7 +84,7 @@ def parse_drive_id(value: str) -> str:
     if url.scheme != "https" or url.hostname not in {"drive.google.com", "docs.google.com"}:
         raise ValueError("استخدم رابط ملف/مجلد Google Drive أو الـID الصحيح.")
     match = re.search(
-        r"/(?:file/d|drive/folders|folders|document/d|spreadsheets/d|presentation/d)/([A-Za-z0-9_-]{15,})",
+        r"/(?:file(?:/u/\d+)?/d|drive(?:/u/\d+)?/folders|folders|document(?:/u/\d+)?/d|spreadsheets(?:/u/\d+)?/d|presentation(?:/u/\d+)?/d)/([A-Za-z0-9_-]{15,})",
         url.path,
     )
     identifier = match.group(1) if match else parse_qs(url.query).get("id", [""])[0]
