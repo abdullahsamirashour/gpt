@@ -6,6 +6,11 @@ on:
     paths:
       - 'telegram-smart-compressor/**'
       - '.github/workflows/validate-smart-compressor.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'telegram-smart-compressor/**'
+      - '.github/workflows/validate-smart-compressor.yml'
   workflow_dispatch:
 
 jobs:
