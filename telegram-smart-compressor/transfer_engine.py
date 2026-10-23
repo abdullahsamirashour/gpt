@@ -821,7 +821,7 @@ async def authorize_telegram(client, phone: str, login_method: str = "code") -> 
     for attempt in range(8):
         print("📱 افتح Telegram → الإعدادات → الأجهزة → ربط جهاز، وامسح رمز QR.")
         print("لو فاتح Colab على نفس الجهاز، جرّب رابط الموافقة الموجود تحت الـQR.")
-        display(qrcode.make(qr.url))
+        display(qrcode.make(qr.url).get_image())
         display(HTML(
             f'<p><a href="{escape(qr.url, quote=True)}" target="_blank">'
             "🔗 فتح رابط الموافقة في Telegram على نفس الجهاز</a></p>"
