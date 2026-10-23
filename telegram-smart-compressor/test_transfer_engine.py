@@ -51,6 +51,163 @@ class FakeDrive:
 
 
 class TransferEngineTests(unittest.TestCase):
+    def test_drive_folder_link_in_either_form_field(self):
+        fid = "1abcdefghijklmnopqrstuvwxyzABCDE"
+        url = f"https://drive.google.com/drive/u/0/folders/{fid}"
+        self.assertEqual(
+            transfer.normalize_transfer_inputs("drive_to_telegram", url, ""), (url, "")
+        )
+        self.assertEqual(
+            transfer.normalize_transfer_inputs("drive_to_telegram", "", url), (url, "")
+        )
+        self.assertEqual(
+            transfer.normalize_transfer_inputs("telegram_to_drive", "", url), ("", url)
+        )
+        with self.assertRaisesRegex(ValueError, "رابط"):
+            transfer.normalize_transfer_inputs("drive_to_telegram", "", "")
+        with self.assertRaises(ValueError):
+            transfer.normalize_transfer_inputs(
+                "drive_to_telegram", url,
+                "https://drive.google.com/drive/folders/2abcdefghijklmnopqrstuvwxyzABCDE",
+            )
+        with self.assertRaises(ValueError):
+            transfer.normalize_transfer_inputs("drive_to_telegram", "", "not a Drive URL")
+
+    def test_channel_state_resets_when_channel_is_recreated(self):
+        old_path = transfer.STATE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                transfer.STATE_PATH = Path(td) / "transfer_state.json"
+                state = transfer.new_state()
+                state["drive_to_telegram"] = {"somefile": {"done": True}}
+                state["drive_to_telegram_channel_id"] = 111
+                transfer.bind_transfer_channel(state, 222)
+                self.assertEqual(state["drive_to_telegram"], {})
+                self.assertEqual(state["drive_to_telegram_channel_id"], 222)
+                self.assertEqual(transfer.load_json(transfer.STATE_PATH, {})["drive_to_telegram"], {})
+        finally:
+            transfer.STATE_PATH = old_path
+
+    def test_transfer_channel_is_reused_or_created_privately(self):
+        def channel(channel_id):
+            return SimpleNamespace(
+                id=channel_id, title=transfer.CHANNEL_TITLE,
+                creator=True, broadcast=True, username=None, admin_rights=None,
+            )
+
+        class Client:
+            def __init__(self, dialogs, created_channel, cached=None):
+                self.dialogs = dialogs
+                self.created_channel = created_channel
+                self.cached = cached
+                self.requests = []
+
+            async def get_entity(self, _peer):
+                if self.cached is None:
+                    raise ValueError("Not cached")
+                return self.cached
+
+            async def iter_dialogs(self):
+                for entry in self.dialogs:
+                    yield SimpleNamespace(name=transfer.CHANNEL_TITLE, entity=entry)
+
+            async def __call__(self, request):
+                self.requests.append(request)
+                return SimpleNamespace(chats=[self.created_channel])
+
+        old_path = transfer.TRANSFER_CONFIG
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                transfer.TRANSFER_CONFIG = Path(td) / "channel.json"
+                existing = channel(314)
+                c = Client([existing], channel(123))
+                saved = {}
+                entity = asyncio.run(transfer.ensure_channel(c, saved))
+                self.assertEqual(entity.id, 314)
+                self.assertEqual(saved["channel_id"], 314)
+                self.assertFalse(c.requests)
+
+                c = Client([], channel(123), cached=existing)
+                entity = asyncio.run(transfer.ensure_channel(c, {"channel_id": 314}))
+                self.assertEqual(entity.id, 314)
+                self.assertFalse(c.requests)
+
+                c = Client([], channel(888))
+                saved = {}
+                entity = asyncio.run(transfer.ensure_channel(c, saved))
+                self.assertEqual(entity.id, 888)
+                self.assertEqual(saved["channel_id"], 888)
+                self.assertEqual(len(c.requests), 1)
+                self.assertTrue(c.requests[0].broadcast)
+                self.assertFalse(c.requests[0].megagroup)
+
+                c = Client([channel(11), channel(12)], channel(999))
+                with self.assertRaisesRegex(RuntimeError, "أكتر من قناة"):
+                    asyncio.run(transfer.ensure_channel(c, {}))
+                self.assertFalse(c.requests)
+        finally:
+            transfer.TRANSFER_CONFIG = old_path
+
+    def test_limited_batches_advance_and_zero_transfers_every_remaining_file(self):
+        root_id = "1abcdefghijklmnopqrstuvwxyzABCDE"
+        files = [
+            {"id": f"f{i}", "name": f"file{i}.txt", "mimeType": "text/plain",
+             "size": "1", "modifiedTime": "2026-10-01T00:00:00Z"}
+            for i in range(1, 4)
+        ]
+        service = FakeDrive(FakeFiles(
+            metas={root_id: {"id": root_id, "mimeType": "application/vnd.google-apps.folder", "name": "root"}},
+            children={root_id: [{"files": files}]},
+        ))
+
+        class Telegram:
+            def __init__(self):
+                self.sent = []
+            async def iter_messages(self, _channel, limit=None):
+                if False:
+                    yield None
+            async def send_file(self, _channel, file, **_kw):
+                self.sent.append(file)
+                return SimpleNamespace(id=len(self.sent), file=SimpleNamespace(size=Path(file).stat().st_size))
+
+        tg = Telegram()
+        state = transfer.new_state()
+        old_state, old_root = transfer.STATE_PATH, transfer.TEMP_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                transfer.STATE_PATH = Path(td) / "state.json"
+                transfer.TEMP_ROOT = Path(td)
+                def download_file(_drive, meta, filename):
+                    value = meta["id"].encode()[:1]
+                    Path(filename).write_bytes(value)
+                    return len(value), hashlib.sha256(value).hexdigest()
+                with patch.object(transfer, "download_drive_file", side_effect=download_file):
+                    def run(limit):
+                        return asyncio.run(transfer.transfer_drive_to_telegram(
+                            tg, object(), service, state, root_id, True, limit, False
+                        ))
+                    self.assertEqual(run(1)["ok"], 1)
+                    self.assertEqual(run(1)["ok"], 1)  # Must continue to the next file.
+                    last = run(0)  # Unlimited; only one pending file remains.
+                    self.assertEqual(last["ok"], 1)
+                    self.assertEqual(last["skipped"], 2)
+                    self.assertEqual(run(0)["skipped"], 3)
+                    self.assertEqual(len(tg.sent), 3)
+        finally:
+            transfer.STATE_PATH, transfer.TEMP_ROOT = old_state, old_root
+
+    def test_drive_preview_never_logs_in_to_telegram_or_creates_channel(self):
+        root_id = "1abcdefghijklmnopqrstuvwxyzABCDE"
+        service = FakeDrive(FakeFiles(metas={
+            root_id: {"id": root_id, "name": "notes.pdf", "mimeType": "application/pdf", "size": "100"}
+        }))
+        with patch.object(transfer, "load_account_config", side_effect=AssertionError("Unexpected Telegram login")), \
+             patch.object(transfer, "ensure_channel", side_effect=AssertionError("Unexpected channel creation")):
+            result = asyncio.run(transfer._run_transfer(
+                service, "drive_to_telegram", root_id, "", 0, True, True
+            ))
+            self.assertEqual(result["ok"], 0)
+
     def test_no_overlapping_transfer_sessions(self):
         old_dir, old_lock = transfer.APP_DIR, transfer.LOCK_PATH
         try:
