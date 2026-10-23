@@ -780,9 +780,75 @@ async def transfer_telegram_to_drive(
     return counters
 
 
+async def authorize_telegram(client, phone: str, login_method: str = "code") -> None:
+    """Authenticate this transfer session without reusing the compressor's auth key."""
+    if login_method not in {"code", "qr"}:
+        raise ValueError("طريقة تسجيل دخول Telegram غير معروفة.")
+
+    await client.connect()
+    if await client.is_user_authorized():
+        print("✅ جلسة نقل Telegram محفوظة ومفعلة؛ مش محتاج كود جديد.")
+        return
+
+    if login_method == "code":
+        suffix = re.sub(r"\D", "", str(phone))[-2:]
+        print(
+            f"📩 رمز الدخول للحساب المنتهي بـ {suffix} بيظهر غالبًا في محادثة "
+            "Telegram الرسمية (العلامة الزرقاء) داخل التطبيق، مش في SMS."
+        )
+        print("🔎 راجع الأجهزة التانية والأرشيف. لو مفيش كود، أوقف الخلية واختار QR.")
+        await client.start(
+            phone=phone,
+            code_callback=lambda: getpass.getpass("كود الدخول من محادثة Telegram: ").strip(),
+            password=lambda: getpass.getpass("كلمة مرور التحقق بخطوتين: ").strip(),
+        )
+        return
+
+    # An independent QR login is safer than copying a live compressor session,
+    # which can invalidate its Telegram authorization key if used concurrently.
+    try:
+        import qrcode
+    except ImportError:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", "qrcode[pil]"], check=True,
+        )
+        import qrcode
+    from html import escape
+    from IPython.display import HTML, display
+    from telethon.errors import SessionPasswordNeededError
+
+    qr = await client.qr_login()
+    for attempt in range(8):
+        print("📱 افتح Telegram → الإعدادات → الأجهزة → ربط جهاز، وامسح رمز QR.")
+        print("لو فاتح Colab على نفس الجهاز، جرّب رابط الموافقة الموجود تحت الـQR.")
+        display(qrcode.make(qr.url))
+        display(HTML(
+            f'<p><a href="{escape(qr.url, quote=True)}" target="_blank">'
+            "🔗 فتح رابط الموافقة في Telegram على نفس الجهاز</a></p>"
+        ))
+        try:
+            await qr.wait()
+            break
+        except SessionPasswordNeededError:
+            await client.sign_in(
+                password=getpass.getpass("كلمة مرور التحقق بخطوتين: ").strip()
+            )
+            break
+        except asyncio.TimeoutError:
+            if attempt == 7:
+                raise RuntimeError(
+                    "انتهت مدة رموز QR بدون موافقة. أعد تشغيل الخلية للحصول على رمز جديد."
+                ) from None
+            await qr.recreate()
+            print("🔄 رمز QR السابق انتهت صلاحيته؛ ده رمز جديد.")
+    if not await client.is_user_authorized():
+        raise RuntimeError("Telegram لم يؤكد تسجيل الدخول بالـQR.")
+    print("✅ تم تأكيد حساب Telegram بنجاح؛ جلسة النقل هتتحفظ على Drive.")
+
+
 async def _run_transfer(
     service, direction: str, source: str, destination: str,
-    max_files: int, recursive: bool, preview: bool,
+    max_files: int, recursive: bool, preview: bool, login_method: str,
 ) -> dict:
     from telethon import TelegramClient
 
@@ -804,12 +870,8 @@ async def _run_transfer(
         connection_retries=5, request_retries=5,
     )
     try:
-        print("🔐 توصيل Telegram (قد يطلب كودًا مرة واحدة لجلسة النقل المستقلة)...")
-        await client.start(
-            phone=account["phone"],
-            code_callback=lambda: getpass.getpass("كود Telegram: ").strip(),
-            password=lambda: getpass.getpass("كلمة مرور التحقق بخطوتين: ").strip(),
-        )
+        print("🔐 توصيل Telegram بجلسة النقل المستقلة...")
+        await authorize_telegram(client, account["phone"], login_method)
         me = await client.get_me()
         configured_phone = re.sub(r"\D", "", str(account["phone"]))
         actual_phone = re.sub(r"\D", "", str(getattr(me, "phone", "")))
@@ -846,8 +908,11 @@ async def _run_transfer(
 def run_transfer(
     direction: str, source: str = "", destination: str = "",
     max_files: int = 20, recursive: bool = True, preview: bool = True,
+    login_method: str = "code",
 ) -> None:
     """Entry point called by the small GitHub-backed Colab launcher cell."""
+    if login_method not in {"code", "qr"}:
+        raise ValueError("طريقة تسجيل دخول Telegram غير معروفة.")
     source, destination = normalize_transfer_inputs(direction, source, destination)
     max_files = int(max_files)
     if not 0 <= max_files <= 200:
@@ -867,7 +932,7 @@ def run_transfer(
             print("📦 Media Lite — File Transfer | ملفاتك الأصلية لن تُحذف.")
             with single_run():
                 result = asyncio.get_event_loop().run_until_complete(
-                    _run_transfer(service, direction, source, destination, max_files, recursive, preview)
+                    _run_transfer(service, direction, source, destination, max_files, recursive, preview, login_method)
                 )
             print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']} • {time.time()-started:.0f} ثانية")
             if not preview:
