@@ -327,9 +327,15 @@ class TransferEngineTests(unittest.TestCase):
             async def iter_messages(self, _channel, limit=None):
                 if False:
                     yield None
+            async def upload_file(self, file, *, file_size, file_name, part_size_kb, progress_callback):
+                self.assert_part(part_size_kb)
+                self.sent.append((file_name, file_size))
+                return SimpleNamespace(name=file_name, size=file_size)
+            def assert_part(self, part_kb):
+                if part_kb != 512:
+                    raise AssertionError("Expected 512 KiB native part size")
             async def send_file(self, _channel, file, **_kw):
-                self.sent.append(file)
-                return SimpleNamespace(id=len(self.sent), file=SimpleNamespace(size=Path(file).stat().st_size))
+                return SimpleNamespace(id=len(self.sent), file=SimpleNamespace(size=file.size))
 
         tg = Telegram()
         state = transfer.new_state()
@@ -490,16 +496,23 @@ class TransferEngineTests(unittest.TestCase):
         class FakeTelegram:
             def __init__(self):
                 self.messages = []
+                self.uploads = []
             async def iter_messages(self, _channel, limit=0):
                 if False:
                     yield None
             async def get_messages(self, _channel, limit=0):
                 return []
+            async def upload_file(self, file, *, file_size, file_name, part_size_kb, progress_callback):
+                data = Path(file).read_bytes() if isinstance(file, str) else file.read()
+                if len(data) != file_size:
+                    raise AssertionError("A segment leaked bytes into a neighboring part")
+                self.uploads.append((data, file_name, part_size_kb))
+                return SimpleNamespace(name=file_name, size=len(data))
             async def send_file(self, _channel, file, **kwargs):
                 if isinstance(file, str):
-                    size = Path(file).stat().st_size
+                    size = Path(file).stat().st_size  # manifest uses regular send_file
                 else:
-                    size = len(file.read())
+                    size = file.size  # Telegram accepts the native InputFile handle
                 result = SimpleNamespace(id=100 + len(self.messages), file=SimpleNamespace(size=size))
                 self.messages.append((result, kwargs.get("caption", ""), size))
                 return result
@@ -529,6 +542,11 @@ class TransferEngineTests(unittest.TestCase):
                     ))
                     self.assertEqual(result["ok"], 1)
                     self.assertEqual([m[2] for m in telegram.messages[:3]], [3, 3, 2])
+                    self.assertEqual(b"".join(p[0] for p in telegram.uploads), payload)
+                    self.assertEqual([p[2] for p in telegram.uploads], [512, 512, 512])
+                    self.assertEqual([p[1] for p in telegram.uploads], [
+                        "archive.bin.part001", "archive.bin.part002", "archive.bin.part003"
+                    ])
                     self.assertEqual(len(telegram.messages), 4)  # 3 parts and manifest
                     token = transfer.transfer_token(meta)
                     self.assertTrue(state["drive_to_telegram"][token]["done"])
@@ -539,6 +557,34 @@ class TransferEngineTests(unittest.TestCase):
                     self.assertEqual(len(telegram.messages), 4)
         finally:
             transfer.TEMP_ROOT, transfer.STATE_PATH, transfer.MAX_TG_PART = old_root, old_state, old_limit
+
+    def test_native_512kb_uploader_passes_a_preuploaded_file_handle(self):
+        class Client:
+            def __init__(self):
+                self.args = None
+                self.uploaded = None
+            async def upload_file(self, file, **kwargs):
+                self.args = (file, kwargs)
+                self.uploaded = SimpleNamespace(name=kwargs["file_name"], size=kwargs["file_size"])
+                return self.uploaded
+            async def send_file(self, channel, file, **kwargs):
+                self.sent = (channel, file, kwargs)
+                return SimpleNamespace(id=123, file=SimpleNamespace(size=file.size))
+
+        client = Client()
+        callback = lambda current, total: None
+        result = asyncio.run(transfer.send_transfer_document(
+            client, "target_channel", "some/file.mp4", 49000, "file.mp4",
+            "MLTX:0123456789abcdefab:1/1", callback,
+        ))
+        self.assertEqual(result.id, 123)
+        self.assertIs(client.sent[1], client.uploaded)
+        self.assertEqual(client.args[1]["part_size_kb"], 512)
+        self.assertEqual(client.args[1]["file_size"], 49000)
+        self.assertIs(client.args[1]["progress_callback"], callback)
+        self.assertTrue(client.sent[2]["force_document"])
+        self.assertIsNone(client.sent[2]["mime_type"])
+        self.assertEqual(client.sent[2]["attributes"][0].file_name, "file.mp4")
 
     def test_telegram_to_drive_does_not_copy_drive_origin_messages(self):
         class FakeTelegram:
