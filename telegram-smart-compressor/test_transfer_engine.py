@@ -1,0 +1,144 @@
+# -*- coding: utf-8 -*-
+"""Offline regression tests: no Google/Telegram credentials required."""
+import importlib.util
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+ENGINE = Path(__file__).resolve().with_name("transfer_engine.py")
+spec = importlib.util.spec_from_file_location("media_lite_transfer_engine", ENGINE)
+transfer = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(transfer)
+
+
+class Reply:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def execute(self, **_kwargs):
+        return self.payload
+
+
+class FakeFiles:
+    def __init__(self, metas=None, children=None):
+        self.metas = metas or {}
+        self.children = children or {}
+        self.queries = []
+
+    def get(self, fileId, **_kwargs):
+        return Reply(self.metas[fileId])
+
+    def list(self, q, **kwargs):
+        self.queries.append(q)
+        for fid, pages in self.children.items():
+            if f"'{fid}' in parents" in q:
+                page = kwargs.get("pageToken")
+                return Reply(pages[int(page)] if page else pages[0])
+        return Reply({"files": []})
+
+
+class FakeDrive:
+    def __init__(self, files):
+        self.client = files
+
+    def files(self):
+        return self.client
+
+
+class TransferEngineTests(unittest.TestCase):
+    def test_drive_id_parsing_and_untrusted_hosts(self):
+        fid = "1abcdefghijklmnopqrstuvwxyzABCDE"
+        valid = [
+            fid,
+            f"https://drive.google.com/file/d/{fid}/view?usp=sharing",
+            f"https://drive.google.com/drive/folders/{fid}",
+            f"https://drive.google.com/open?id={fid}",
+            f"https://docs.google.com/document/d/{fid}/edit",
+            f"https://docs.google.com/spreadsheets/d/{fid}/edit",
+        ]
+        for source in valid:
+            self.assertEqual(transfer.parse_drive_id(source), fid)
+        for invalid in [
+            "", "https://evil.google.com/file/d/" + fid,
+            "https://drive.google.com.evil.test/file/d/" + fid,
+            "http://drive.google.com/file/d/" + fid,
+            "some path on disk",
+        ]:
+            with self.assertRaises(ValueError):
+                transfer.parse_drive_id(invalid)
+
+    def test_fingerprint_changes_when_content_changes(self):
+        original = {"id": "file01", "md5Checksum": "abc", "size": "50", "modifiedTime": "2026-01-01"}
+        changed = {**original, "md5Checksum": "def"}
+        self.assertEqual(transfer.transfer_token(original), transfer.transfer_token(dict(original)))
+        self.assertNotEqual(transfer.transfer_token(original), transfer.transfer_token(changed))
+        self.assertRegex(transfer.transfer_token(original), r"^[0-9a-f]{18}$")
+
+    def test_atomic_state_and_independent_directions(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "nested" / "state.json"
+            data = transfer.new_state()
+            data["telegram_to_drive"]["-100_55"] = {"drive_id": "xyz"}
+            transfer.save_json(path, data)
+            self.assertEqual(transfer.load_json(path, {})["telegram_to_drive"], data["telegram_to_drive"])
+            self.assertFalse((path.parent / "state.json.tmp").exists())
+            self.assertEqual(transfer.state_section(data, "drive_to_telegram"), {})
+
+    def test_segment_reader_does_not_leak_bytes_from_neighbors(self):
+        content = bytes(range(256)) * 20
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "data.bin"
+            path.write_bytes(content)
+            pieces = []
+            for start, length in [(0, 1800), (1800, 1800), (3600, len(content) - 3600)]:
+                with transfer.SegmentReader(path, start, length, "part") as segment:
+                    self.assertEqual(segment.read(250), content[start:start + 250])
+                    self.assertEqual(segment.tell(), 250)
+                    self.assertEqual(segment.seek(0), 0)
+                    self.assertEqual(segment.read(), content[start:start + length])
+                    self.assertEqual(segment.read(10), b"")
+                    segment.seek(-20, 2)
+                    self.assertEqual(segment.read(1000), content[start + length - 20:start + length])
+                    segment.seek(0)
+                    pieces.append(segment.read())
+            self.assertEqual(b"".join(pieces), content)
+
+    def test_recursive_listing_pagination_and_shortcuts(self):
+        root = "abcdefghijklmnopqrst"
+        child = "uvwxyzabcdefghijklmn"
+        fs = FakeFiles(
+            metas={root: {"id": root, "name": "root", "mimeType": "application/vnd.google-apps.folder"}},
+            children={
+                root: [
+                    {"files": [
+                        {"id": "doc01", "name": "Intro.pdf", "mimeType": "application/pdf", "size": "4"},
+                        {"id": child, "name": "Week 1", "mimeType": "application/vnd.google-apps.folder"},
+                    ], "nextPageToken": "1"},
+                    {"files": [
+                        {"id": "shortcut", "name": "Link", "mimeType": "application/vnd.google-apps.shortcut"},
+                    ]},
+                ],
+                child: [{"files": [
+                    {"id": "doc02", "name": "Slides.pptx", "mimeType": "application/vnd.openxmlformats-officedocument.presentationml.presentation", "size": "10"},
+                ]}],
+            },
+        )
+        drive = FakeDrive(fs)
+        shallow = transfer.list_drive_sources(drive, root, recursive=False)
+        deep = transfer.list_drive_sources(drive, root, recursive=True)
+        self.assertEqual([x["relative_path"] for x in shallow], ["Intro.pdf"])
+        self.assertEqual(
+            [x["relative_path"] for x in deep], ["Intro.pdf", "Week 1/Slides.pptx"]
+        )
+
+    def test_file_export_support_and_provenance_tag(self):
+        self.assertEqual(transfer.EXPORT_TYPES["application/vnd.google-apps.document"][1], ".pdf")
+        tag = "📁 folder/notes.pdf\nMLTX:0123456789abcdefab:2/3"
+        match = transfer.TAG_PATTERN.search(tag)
+        self.assertEqual((match.group(1), match.group(2), match.group(3)), ("0123456789abcdefab", "2", "3"))
+        self.assertEqual(transfer.clean_filename("../notes.pdf"), "notes.pdf")
+
+
+if __name__ == "__main__":
+    unittest.main()
