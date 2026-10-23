@@ -38,6 +38,7 @@ DEFAULT_DRIVE_FOLDER = "Media Lite Transfers"
 MAX_TG_PART = 1_900_000_000
 DISK_RESERVE = 256 * 1024 * 1024
 DRIVE_CHUNK = 8 * 1024 * 1024
+UPLOAD_PART_KB = 512  # Official MTProto maximum; fewer sequential round-trips.
 SCAN_LIMIT = 3000
 LOCK_PATH = APP_DIR / "run.lock"
 TAG_PATTERN = re.compile(r"MLTX:([0-9a-f]{18}):(\d+)/(\d+)")
@@ -279,6 +280,7 @@ def show_log_controls(log_path: Path) -> None:
 
 def ensure_dependencies() -> None:
     try:
+        import cryptg  # Native Telegram encryption, if an earlier Colab cell did not install it.
         import telethon
         import googleapiclient
         import google.auth
@@ -653,12 +655,32 @@ async def cached_part_messages(client, channel) -> dict:
     return result
 
 
+async def send_transfer_document(
+    client, channel, payload, size: int, name: str, caption: str,
+    progress, raw_part: bool = False,
+):
+    """Use Telethon's *own* uploader with fewer 512 KiB MTProto round-trips.
+
+    Unlike the removed experimental parallel uploader, we do not construct
+    Telegram part handles manually or change data ordering.
+    """
+    from telethon.tl.types import DocumentAttributeFilename
+
+    handle = await client.upload_file(
+        payload, file_size=size, file_name=name,
+        part_size_kb=UPLOAD_PART_KB, progress_callback=progress,
+    )
+    return await client.send_file(
+        channel, handle, caption=caption, force_document=True,
+        mime_type="application/octet-stream" if raw_part else None,
+        attributes=[DocumentAttributeFilename(name)],
+    )
+
+
 async def transfer_drive_to_telegram(
     client, channel, service, state: dict, source_id: str, recursive: bool,
     max_files: int, preview: bool,
 ) -> dict:
-    from telethon.tl.types import DocumentAttributeFilename
-
     all_items = list_drive_sources(service, source_id, recursive)
     if not all_items:
         print("📭 مفيش ملفات في المجلد المحدد (أو هو فاضي).")
@@ -717,18 +739,14 @@ async def transfer_drive_to_telegram(
                     caption = f"📁 {meta['relative_path'][-700:]}\n{marker}"
                     progress = Progress(f"⬆️ Telegram [{index}/{len(items)}] {part_name}")
                     if parts == 1:
-                        uploaded = await client.send_file(
-                            channel, str(local), caption=caption, force_document=True,
-                            attributes=[DocumentAttributeFilename(part_name)],
-                            progress_callback=progress,
+                        uploaded = await send_transfer_document(
+                            client, channel, str(local), length, part_name, caption, progress
                         )
                     else:
                         with SegmentReader(local, offset, length, part_name) as segment:
-                            uploaded = await client.send_file(
-                                channel, segment, file_size=length, caption=caption,
-                                force_document=True, mime_type="application/octet-stream",
-                                attributes=[DocumentAttributeFilename(part_name)],
-                                progress_callback=progress,
+                            uploaded = await send_transfer_document(
+                                client, channel, segment, length, part_name, caption,
+                                progress, raw_part=True,
                             )
                     actual = int(getattr(getattr(uploaded, "file", None), "size", 0) or 0)
                     if actual and actual != length:
