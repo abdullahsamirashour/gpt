@@ -76,7 +76,7 @@ jobs:
                   assert 'BRANCH = "beta"' in code
               elif path.name == "Encoder_Benchmark.ipynb":
                   import os
-                  branch = os.environ.get("GITHUB_REF_NAME", "beta")
+                  branch = os.environ.get("GITHUB_BASE_REF") or os.environ.get("GITHUB_REF_NAME", "beta")
                   assert 'ENGINE_REL = "telegram-smart-compressor/benchmark_engine.py"' in code
                   assert f'BRANCH = "{branch}"' in code
                   assert 'run_benchmark()' in code
