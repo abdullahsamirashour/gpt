@@ -222,7 +222,7 @@ def show_log_controls(log_path: Path) -> None:
                 feedback.value = f"❌ تعذر حفظ اللوج: {type(exc).__name__}"
         button.on_click(on_click)
         display(widgets.VBox([button, feedback]))
-    except ImportError:
+    except Exception:
         print(f"📝 سجل التشغيل المحلي: {log_path}")
 
 
@@ -741,7 +741,9 @@ async def _run_transfer(
                 source_entity = await client.get_entity(ref)
             else:
                 source_entity = await ensure_channel(client, transfer_config)
-            dest_id = await asyncio.to_thread(ensure_drive_destination, service, destination)
+            dest_id = "" if preview else await asyncio.to_thread(
+                ensure_drive_destination, service, destination
+            )
             return await transfer_telegram_to_drive(
                 client, source_entity, service, state, dest_id, max_files, preview
             )
