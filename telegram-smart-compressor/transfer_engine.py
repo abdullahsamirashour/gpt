@@ -471,9 +471,9 @@ async def cached_part_messages(client, channel) -> dict:
     async for msg in client.iter_messages(channel, limit=SCAN_LIMIT):
         tag = TAG_PATTERN.search(msg.message or "")
         if tag and getattr(msg, "file", None):
-            result[(tag.group(1), int(tag.group(2)))] = (
-                int(msg.id), int(getattr(msg.file, "size", 0) or 0)
-            )
+            key = (tag.group(1), int(tag.group(2)))
+            if key not in result:  # Telegram returns newest first.
+                result[key] = (int(msg.id), int(getattr(msg.file, "size", 0) or 0))
     return result
 
 
@@ -684,16 +684,19 @@ async def _run_transfer(
         actual_phone = re.sub(r"\D", "", str(getattr(me, "phone", "")))
         if actual_phone and configured_phone != actual_phone:
             raise RuntimeError("جلسة النقل مرتبطة بحساب Telegram مختلف عن الإعدادات؛ لا يمكن استخدامها.")
-        channel = await ensure_channel(client, transfer_config)
         if direction == "drive_to_telegram":
-            if not source.strip():
-                raise ValueError("لازم تحط رابط ملف أو مجلد Drive في خانة المصدر.")
             source_id = parse_drive_id(source)
+            # A preview must not create a channel or upload anything.
+            channel = None if preview else await ensure_channel(client, transfer_config)
             return await transfer_drive_to_telegram(
                 client, channel, service, state, source_id, recursive, max_files, preview
             )
         if direction == "telegram_to_drive":
-            source_entity = await client.get_entity(source.strip()) if source.strip() else channel
+            if source.strip():
+                ref = int(source) if re.fullmatch(r"-?\d+", source.strip()) else source.strip()
+                source_entity = await client.get_entity(ref)
+            else:
+                source_entity = await ensure_channel(client, transfer_config)
             dest_id = await asyncio.to_thread(ensure_drive_destination, service, destination)
             return await transfer_telegram_to_drive(
                 client, source_entity, service, state, dest_id, max_files, preview
@@ -714,6 +717,10 @@ def run_transfer(
     """Entry point called by the small GitHub-backed Colab launcher cell."""
     if direction not in {"drive_to_telegram", "telegram_to_drive"}:
         raise ValueError("اتجاه النقل غير صالح.")
+    if direction == "drive_to_telegram":
+        parse_drive_id(source)  # Reject missing/unsafe links before authentication.
+    if destination:
+        parse_drive_id(destination)
     max_files = int(max_files)
     if not 1 <= max_files <= 200:
         raise ValueError("عدد الملفات في التشغيل لازم يكون بين 1 و200.")
