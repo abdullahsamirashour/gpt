@@ -3,6 +3,8 @@
 import importlib.util
 import asyncio
 import hashlib
+import sys
+import types
 from types import SimpleNamespace
 from unittest.mock import patch
 import json
@@ -51,6 +53,76 @@ class FakeDrive:
 
 
 class TransferEngineTests(unittest.TestCase):
+    def test_qr_login_can_refresh_without_sms(self):
+        images = []
+        links = []
+        fake_qrcode = types.ModuleType("qrcode")
+        fake_qrcode.make = lambda url: images.append(url) or SimpleNamespace(get_image=lambda: "QR IMAGE")
+        fake_ipython = types.ModuleType("IPython")
+        fake_ipython.__path__ = []
+        fake_display = types.ModuleType("IPython.display")
+        fake_display.HTML = lambda value: value
+        fake_display.display = lambda value: links.append(value)
+
+        class FakeQr:
+            url = "tg://login?token=private_login_token"
+            recreations = 0
+            attempts = 0
+            async def wait(self):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise asyncio.TimeoutError
+                client.authorized = True
+            async def recreate(self):
+                self.recreations += 1
+                self.url = "tg://login?token=renewed_token"
+
+        class FakeTelegram:
+            def __init__(self):
+                self.authorized = False
+                self.connected = False
+                self.qr = FakeQr()
+            async def connect(self):
+                self.connected = True
+            async def is_user_authorized(self):
+                return self.authorized
+            async def qr_login(self):
+                return self.qr
+            async def start(self, **_kwargs):
+                raise AssertionError("QR flow must not request an SMS / app code")
+
+        client = FakeTelegram()
+        with patch.dict(sys.modules, {
+            "qrcode": fake_qrcode,
+            "IPython": fake_ipython,
+            "IPython.display": fake_display,
+        }):
+            asyncio.run(transfer.authorize_telegram(client, "+201234567890", "qr"))
+        self.assertTrue(client.connected)
+        self.assertTrue(client.authorized)
+        self.assertEqual(client.qr.recreations, 1)
+        self.assertEqual(images, [
+            "tg://login?token=private_login_token",
+            "tg://login?token=renewed_token",
+        ])
+        self.assertEqual(len(links), 4)  # image and deep link for each QR
+
+    def test_valid_session_skips_telegram_login_method(self):
+        class AuthorizedClient:
+            async def connect(self):
+                pass
+            async def is_user_authorized(self):
+                return True
+            async def start(self, **_kwargs):
+                raise AssertionError("Must not re-login with existing auth")
+            async def qr_login(self):
+                raise AssertionError("Must not create QR with existing auth")
+
+        for method in ("qr", "code"):
+            asyncio.run(transfer.authorize_telegram(AuthorizedClient(), "+201234567890", method))
+        with self.assertRaises(ValueError):
+            asyncio.run(transfer.authorize_telegram(AuthorizedClient(), "+201234567890", "bad"))
+
     def test_drive_folder_link_in_either_form_field(self):
         fid = "1abcdefghijklmnopqrstuvwxyzABCDE"
         url = f"https://drive.google.com/drive/u/0/folders/{fid}"
