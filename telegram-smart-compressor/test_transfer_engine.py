@@ -47,6 +47,21 @@ class FakeDrive:
 
 
 class TransferEngineTests(unittest.TestCase):
+    def test_no_overlapping_transfer_sessions(self):
+        old_dir, old_lock = transfer.APP_DIR, transfer.LOCK_PATH
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                transfer.APP_DIR = Path(td)
+                transfer.LOCK_PATH = transfer.APP_DIR / "run.lock"
+                with transfer.single_run():
+                    self.assertTrue(transfer.LOCK_PATH.exists())
+                    with self.assertRaises(RuntimeError):
+                        with transfer.single_run():
+                            pass
+                self.assertFalse(transfer.LOCK_PATH.exists())
+        finally:
+            transfer.APP_DIR, transfer.LOCK_PATH = old_dir, old_lock
+
     def test_drive_id_parsing_and_untrusted_hosts(self):
         fid = "1abcdefghijklmnopqrstuvwxyzABCDE"
         valid = [
