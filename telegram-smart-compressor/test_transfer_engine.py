@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """Offline regression tests: no Google/Telegram credentials required."""
 import importlib.util
+import asyncio
+import hashlib
+from types import SimpleNamespace
+from unittest.mock import patch
 import json
 import tempfile
 import unittest
@@ -146,6 +150,102 @@ class TransferEngineTests(unittest.TestCase):
         self.assertEqual(
             [x["relative_path"] for x in deep], ["Intro.pdf", "Week 1/Slides.pptx"]
         )
+
+    def test_drive_to_telegram_sends_bounded_parts_and_manifest(self):
+        class FakeTelegram:
+            def __init__(self):
+                self.messages = []
+            async def iter_messages(self, _channel, limit=0):
+                if False:
+                    yield None
+            async def get_messages(self, _channel, limit=0):
+                return []
+            async def send_file(self, _channel, file, **kwargs):
+                if isinstance(file, str):
+                    size = Path(file).stat().st_size
+                else:
+                    size = len(file.read())
+                result = SimpleNamespace(id=100 + len(self.messages), file=SimpleNamespace(size=size))
+                self.messages.append((result, kwargs.get("caption", ""), size))
+                return result
+
+        payload = b"abcdefgh"
+        source_id = "abcdefghijklmnopqrstuvwxyzABCDE"
+        meta = {
+            "id": source_id, "name": "archive.bin", "mimeType": "application/octet-stream",
+            "size": str(len(payload)), "modifiedTime": "2026-10-01T00:00:00Z",
+            "md5Checksum": hashlib.md5(payload).hexdigest(),
+        }
+        telegram = FakeTelegram()
+        state = transfer.new_state()
+        old_root, old_state, old_limit = transfer.TEMP_ROOT, transfer.STATE_PATH, transfer.MAX_TG_PART
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                transfer.TEMP_ROOT = Path(td)
+                transfer.STATE_PATH = Path(td) / "state.json"
+                transfer.MAX_TG_PART = 3
+                def fake_download(_service, _meta, path):
+                    path.write_bytes(payload)
+                    return len(payload), hashlib.sha256(payload).hexdigest()
+                service = FakeDrive(FakeFiles(metas={source_id: meta}))
+                with patch.object(transfer, "download_drive_file", fake_download):
+                    result = asyncio.run(transfer.transfer_drive_to_telegram(
+                        telegram, object(), service, state, source_id, True, 20, False
+                    ))
+                    self.assertEqual(result["ok"], 1)
+                    self.assertEqual([m[2] for m in telegram.messages[:3]], [3, 3, 2])
+                    self.assertEqual(len(telegram.messages), 4)  # 3 parts and manifest
+                    token = transfer.transfer_token(meta)
+                    self.assertTrue(state["drive_to_telegram"][token]["done"])
+                    repeat = asyncio.run(transfer.transfer_drive_to_telegram(
+                        telegram, object(), service, state, source_id, True, 20, False
+                    ))
+                    self.assertEqual(repeat["skipped"], 1)
+                    self.assertEqual(len(telegram.messages), 4)
+        finally:
+            transfer.TEMP_ROOT, transfer.STATE_PATH, transfer.MAX_TG_PART = old_root, old_state, old_limit
+
+    def test_telegram_to_drive_does_not_copy_drive_origin_messages(self):
+        class FakeTelegram:
+            def __init__(self):
+                self.messages = [
+                    SimpleNamespace(
+                        id=22, message="MLTX:0123456789abcdefab:1/1",
+                        file=SimpleNamespace(size=4, name="ignore.mp4", ext=".mp4")
+                    ),
+                    SimpleNamespace(
+                        id=21, message="Original upload",
+                        file=SimpleNamespace(size=4, name="lecture.mp4", ext=".mp4")
+                    ),
+                ]
+            async def iter_messages(self, _channel, limit=0):
+                for msg in self.messages:
+                    yield msg
+            async def download_media(self, _message, file, progress_callback):
+                Path(file).write_bytes(b"1234")
+                progress_callback(4, 4)
+                return file
+
+        old_root, old_state = transfer.TEMP_ROOT, transfer.STATE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                transfer.TEMP_ROOT = Path(td)
+                transfer.STATE_PATH = Path(td) / "state.json"
+                state = transfer.new_state()
+                channel = SimpleNamespace(id=12, title="Lecture Archive")
+                with patch("telethon.utils.get_peer_id", return_value=-10012), \
+                    patch.object(transfer, "ensure_child_folder", return_value="dest-folder"), \
+                    patch.object(transfer, "existing_drive_copy", return_value=None), \
+                    patch.object(transfer, "upload_drive_file", return_value={"id": "drive-file01"}):
+                    result = asyncio.run(transfer.transfer_telegram_to_drive(
+                        FakeTelegram(), channel, object(), state, "dest", 20, False
+                    ))
+                    self.assertEqual(result["ok"], 1)
+                    self.assertEqual(len(state["telegram_to_drive"]), 1)
+                    self.assertIn(transfer.origin_key(-10012, 21), state["telegram_to_drive"])
+                    self.assertNotIn(transfer.origin_key(-10012, 22), state["telegram_to_drive"])
+        finally:
+            transfer.TEMP_ROOT, transfer.STATE_PATH = old_root, old_state
 
     def test_file_export_support_and_provenance_tag(self):
         self.assertEqual(transfer.EXPORT_TYPES["application/vnd.google-apps.document"][1], ".pdf")
