@@ -57,7 +57,7 @@ class TransferEngineTests(unittest.TestCase):
         images = []
         links = []
         fake_qrcode = types.ModuleType("qrcode")
-        fake_qrcode.make = lambda url: images.append(url) or "QR IMAGE"
+        fake_qrcode.make = lambda url: images.append(url) or SimpleNamespace(get_image=lambda: "QR IMAGE")
         fake_ipython = types.ModuleType("IPython")
         fake_ipython.__path__ = []
         fake_display = types.ModuleType("IPython.display")
