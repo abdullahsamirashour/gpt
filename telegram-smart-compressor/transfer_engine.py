@@ -848,7 +848,7 @@ async def authorize_telegram(client, phone: str, login_method: str = "code") -> 
 
 async def _run_transfer(
     service, direction: str, source: str, destination: str,
-    max_files: int, recursive: bool, preview: bool, login_method: str,
+    max_files: int, recursive: bool, preview: bool, login_method: str = "code",
 ) -> dict:
     from telethon import TelegramClient
 
