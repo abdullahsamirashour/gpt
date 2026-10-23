@@ -66,6 +66,19 @@ class TransferEngineTests(unittest.TestCase):
         finally:
             transfer.APP_DIR, transfer.LOCK_PATH = old_dir, old_lock
 
+    def test_log_export_is_opt_in(self):
+        old_dir = transfer.APP_DIR
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                transfer.APP_DIR = Path(td) / "transfer"
+                source = Path(td) / "run.log"
+                source.write_text("one run", encoding="utf-8")
+                exported = transfer.export_run_log(source)
+                self.assertEqual(exported.read_text(encoding="utf-8"), "one run")
+                self.assertTrue(source.exists())
+        finally:
+            transfer.APP_DIR = old_dir
+
     def test_drive_id_parsing_and_untrusted_hosts(self):
         fid = "1abcdefghijklmnopqrstuvwxyzABCDE"
         valid = [
