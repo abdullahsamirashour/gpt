@@ -182,6 +182,50 @@ class Progress:
         print(f"\r{self.title}: {pct:.1f}% — {speed:.1f} MiB/s", end="\n" if current == total else "", flush=True)
 
 
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, message):
+        for out in self.streams:
+            out.write(message)
+            out.flush()
+        return len(message)
+
+    def flush(self):
+        for out in self.streams:
+            out.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.streams[0], name)
+
+
+def export_run_log(log_path: Path) -> Path:
+    target = APP_DIR / "logs" / log_path.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(log_path, target)
+    return target
+
+
+def show_log_controls(log_path: Path) -> None:
+    try:
+        import ipywidgets as widgets
+        from IPython.display import display
+        button = widgets.Button(description="📥 Import logs to Drive", button_style="info")
+        feedback = widgets.HTML("📝 لوج التشغيل محفوظ مؤقتًا في Colab.")
+        def on_click(_):
+            try:
+                target = export_run_log(log_path)
+                button.disabled = True
+                feedback.value = f"✅ تم حفظ اللوج في Google Drive: {target.relative_to(BASE_DIR)}"
+            except Exception as exc:
+                feedback.value = f"❌ تعذر حفظ اللوج: {type(exc).__name__}"
+        button.on_click(on_click)
+        display(widgets.VBox([button, feedback]))
+    except ImportError:
+        print(f"📝 سجل التشغيل المحلي: {log_path}")
+
+
 def ensure_dependencies() -> None:
     try:
         import telethon
@@ -730,19 +774,27 @@ def run_transfer(
     nest_asyncio.apply()
     service = connect_drive()
     started = time.time()
-    print("📦 Media Lite — File Transfer | ملفاتك الأصلية لن تُحذف.")
-    try:
-        with single_run():
-            result = asyncio.get_event_loop().run_until_complete(
-                _run_transfer(service, direction, source, destination, max_files, recursive, preview)
-            )
-        print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']} • {time.time()-started:.0f} ثانية")
-        if not preview:
-            save_json(APP_DIR / "last_run_summary.json", {
-                "direction": direction, "finished": int(time.time()), **result,
-            })
-    except KeyboardInterrupt:
-        print("\n⏹️ تم إيقاف التشغيل. الملفات الأصلية لم تُمس.")
-    except Exception as exc:
-        print(f"\n❌ تعذر بدء النقل: {type(exc).__name__}: {exc}")
-        raise
+    log_path = TEMP_ROOT / f"media_lite_transfer_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    old_out, old_err = sys.stdout, sys.stderr
+    with log_path.open("w", encoding="utf-8") as log:
+        sys.stdout = _Tee(old_out, log)
+        sys.stderr = _Tee(old_err, log)
+        try:
+            print("📦 Media Lite — File Transfer | ملفاتك الأصلية لن تُحذف.")
+            with single_run():
+                result = asyncio.get_event_loop().run_until_complete(
+                    _run_transfer(service, direction, source, destination, max_files, recursive, preview)
+                )
+            print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']} • {time.time()-started:.0f} ثانية")
+            if not preview:
+                save_json(APP_DIR / "last_run_summary.json", {
+                    "direction": direction, "finished": int(time.time()), **result,
+                })
+        except KeyboardInterrupt:
+            print("\n⏹️ تم إيقاف التشغيل. الملفات الأصلية لم تُمس.")
+        except Exception as exc:
+            print(f"\n❌ تعذر بدء النقل: {type(exc).__name__}: {exc}")
+            raise
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+            show_log_controls(log_path)
