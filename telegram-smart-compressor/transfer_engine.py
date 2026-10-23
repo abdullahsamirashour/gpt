@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import getpass
 import hashlib
-import io
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -38,6 +38,7 @@ MAX_TG_PART = 1_900_000_000
 DISK_RESERVE = 256 * 1024 * 1024
 DRIVE_CHUNK = 8 * 1024 * 1024
 SCAN_LIMIT = 3000
+LOCK_PATH = APP_DIR / "run.lock"
 TAG_PATTERN = re.compile(r"MLTX:([0-9a-f]{18}):(\d+)/(\d+)")
 
 
@@ -54,6 +55,24 @@ def load_json(path: Path, default: dict) -> dict:
         return data if isinstance(data, dict) else default.copy()
     except (OSError, ValueError):
         return default.copy()
+
+
+@contextmanager
+def single_run():
+    """Prevent simultaneous Colab runtimes from sharing the transfer session/state."""
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    if LOCK_PATH.exists() and time.time() - LOCK_PATH.stat().st_mtime > 12 * 3600:
+        LOCK_PATH.unlink(missing_ok=True)
+    try:
+        fd = os.open(str(LOCK_PATH), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise RuntimeError("فيه عملية نقل تانية شغالة أو قفل قديم؛ راجع ملف run.lock على Drive.")
+    with os.fdopen(fd, "w", encoding="utf-8") as guard:
+        guard.write(str(os.getpid()))
+    try:
+        yield
+    finally:
+        LOCK_PATH.unlink(missing_ok=True)
 
 
 def parse_drive_id(value: str) -> str:
@@ -75,9 +94,10 @@ def parse_drive_id(value: str) -> str:
 
 
 def transfer_token(metadata: dict) -> str:
-    """A Drive revision gets a new transfer identity; renaming alone does not."""
+    """Prefer the content checksum, falling back to modifiedTime for native Docs."""
+    revision = metadata.get("md5Checksum") or metadata.get("modifiedTime") or ""
     identity = ":".join(
-        str(metadata.get(k, "")) for k in ("id", "md5Checksum", "size", "modifiedTime")
+        str(value) for value in (metadata.get("id", ""), revision, metadata.get("size", ""))
     )
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:18]
 
@@ -659,6 +679,11 @@ async def _run_transfer(
             code_callback=lambda: getpass.getpass("كود Telegram: ").strip(),
             password=lambda: getpass.getpass("كلمة مرور التحقق بخطوتين: ").strip(),
         )
+        me = await client.get_me()
+        configured_phone = re.sub(r"\D", "", str(account["phone"]))
+        actual_phone = re.sub(r"\D", "", str(getattr(me, "phone", "")))
+        if actual_phone and configured_phone != actual_phone:
+            raise RuntimeError("جلسة النقل مرتبطة بحساب Telegram مختلف عن الإعدادات؛ لا يمكن استخدامها.")
         channel = await ensure_channel(client, transfer_config)
         if direction == "drive_to_telegram":
             if not source.strip():
@@ -700,9 +725,10 @@ def run_transfer(
     started = time.time()
     print("📦 Media Lite — File Transfer | ملفاتك الأصلية لن تُحذف.")
     try:
-        result = asyncio.get_event_loop().run_until_complete(
-            _run_transfer(service, direction, source, destination, max_files, recursive, preview)
-        )
+        with single_run():
+            result = asyncio.get_event_loop().run_until_complete(
+                _run_transfer(service, direction, source, destination, max_files, recursive, preview)
+            )
         print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']} • {time.time()-started:.0f} ثانية")
         if not preview:
             save_json(APP_DIR / "last_run_summary.json", {
