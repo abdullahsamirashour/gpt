@@ -83,14 +83,28 @@ jobs:
                   assert code.count("#@param") >= 5
               compile(code, str(path), "exec")
               if path.name == "Smart_Compressor.ipynb":
-                  assert len(code_cells) == 2
-                  transfer_code = "".join(code_cells[1].get("source", []))
-                  assert 'transfer_engine.py' in transfer_code
-                  assert '_transfer_module.run_transfer(' in transfer_code
-                  assert 'drive_to_telegram' in transfer_code
-                  assert 'telegram_to_drive' in transfer_code
-                  assert '"main"' in transfer_code
-                  compile(transfer_code, "Media-Lite transfer cell", "exec")
+                  assert len(code_cells) == 3
+                  assert len(markdown_cells) == 3
+                  drive_code = "".join(code_cells[1].get("source", []))
+                  telegram_code = "".join(code_cells[2].get("source", []))
+                  assert 'ENGINE_REL = "telegram-smart-compressor/engine.py"' in code
+                  assert 'direction="drive_to_telegram"' in drive_code
+                  assert 'source=رابط_Drive.strip()' in drive_code
+                  assert 'destination=""' in drive_code
+                  assert 'direction="telegram_to_drive"' in telegram_code
+                  assert 'source=قناة_Telegram_المصدر.strip()' in telegram_code
+                  assert 'destination=فولدر_Drive_للحفظ.strip()' in telegram_code
+                  assert 'عدد_الملفات = 0 #@param' in drive_code
+                  assert 'عدد_الملفات = 0 #@param' in telegram_code
+                  for transfer_code in (drive_code, telegram_code):
+                      assert 'transfer_engine.py' in transfer_code
+                      assert '_transfer_module.run_transfer(' in transfer_code
+                      assert '"main"' in transfer_code
+                      assert 'preview=التشغيل == "معاينة فقط"' in transfer_code
+                      assert code.count("#@param") >= 2
+                      compile(transfer_code, "Media-Lite transfer cell", "exec")
+                  assert 'telegram_to_drive' not in drive_code
+                  assert 'drive_to_telegram' not in telegram_code
               print("OK notebook:", path)
 
           assert found >= 1
