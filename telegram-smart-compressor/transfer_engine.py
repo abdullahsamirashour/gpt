@@ -203,6 +203,8 @@ def inferred_extension(path: Path, mime_type: str) -> str:
         return ".avi"
     if header.startswith(b"PK\x03\x04") and mime in MEDIA_SUFFIXES:
         return MEDIA_SUFFIXES[mime]
+    if mime in MEDIA_SUFFIXES and not mime.startswith(("audio/", "video/")):
+        return MEDIA_SUFFIXES[mime]
 
     # For unnamed audio/video recordings, inspect the actual container and
     # stream type. A generic MP4 audio recording should be .m4a, not .mp4.
@@ -223,15 +225,16 @@ def inferred_extension(path: Path, mime_type: str) -> str:
                     return ".mov" if mime == "video/quicktime" else ".mp4"
                 if "audio" in stream_types:
                     return ".m4a"
+            if "matroska" in formats or "webm" in formats:
+                if b"webm" in header.lower() or mime.endswith("/webm"):
+                    return ".webm"
+                return ".mka" if mime == "audio/x-matroska" else ".mkv"
             for fmt, ext in (
                 ("ogg", ".ogg"), ("mp3", ".mp3"), ("wav", ".wav"),
                 ("flac", ".flac"), ("aac", ".aac"), ("amr", ".amr"),
-                ("webm", ".webm"), ("matroska", ".mkv"),
                 ("avi", ".avi"), ("mpegts", ".ts"),
             ):
                 if fmt in formats:
-                    if fmt == "matroska" and b"webm" in header.lower():
-                        return ".webm"
                     return ext
     except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, OSError):
         pass
