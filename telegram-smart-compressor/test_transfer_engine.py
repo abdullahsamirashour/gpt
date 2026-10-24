@@ -242,8 +242,10 @@ class TransferEngineTests(unittest.TestCase):
                 state = transfer.new_state()
                 state["drive_to_telegram"] = {"somefile": {"done": True}}
                 state["drive_to_telegram_channel_id"] = 111
+                state["reupload_batches"] = {"old-channel-batch": {"completed": ["somefile"]}}
                 transfer.bind_transfer_channel(state, 222)
                 self.assertEqual(state["drive_to_telegram"], {})
+                self.assertNotIn("reupload_batches", state)
                 self.assertEqual(state["drive_to_telegram_channel_id"], 222)
                 self.assertEqual(transfer.load_json(transfer.STATE_PATH, {})["drive_to_telegram"], {})
         finally:
@@ -731,6 +733,182 @@ class TransferEngineTests(unittest.TestCase):
                     ))
                     self.assertEqual(second["skipped"], 1)
                     self.assertEqual(len(tg.upload_names), 1)
+        finally:
+            transfer.TEMP_ROOT, transfer.STATE_PATH = old_root, old_state
+
+    def test_reupload_number_parser_is_precise_and_rejects_unsafe_ranges(self):
+        self.assertEqual(transfer.parse_file_numbers("1-7", 8), list(range(1, 8)))
+        self.assertEqual(transfer.parse_file_numbers("1,3,5-8", 8), [1, 3, 5, 6, 7, 8])
+        self.assertEqual(transfer.parse_file_numbers("7، 1، 1", 8), [1, 7])
+        for invalid in ["", "0", "9", "8-3", "1,,3", "all", "1;8", "-1", "1-300"]:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                transfer.parse_file_numbers(invalid, 8)
+
+    def test_selective_reupload_seven_of_eight_keeps_other_file_and_old_receipts(self):
+        folder = "abcdefghijklmnopqrstuvwxyzABCDE"
+        metadata = [
+            {"id": f"source_file_{i:02d}", "name": f"Lec{i}",
+             "mimeType": "application/octet-stream", "size": "5",
+             "modifiedTime": "2026-10-01T00:00:00Z"}
+            for i in range(1, 9)
+        ]
+        drive = FakeDrive(FakeFiles(
+            metas={folder: {"id": folder, "name": "course",
+                            "mimeType": "application/vnd.google-apps.folder"}},
+            children={folder: [{"files": metadata}]},
+        ))
+        state = transfer.new_state()
+
+        class Telegram:
+            def __init__(self):
+                self.old = []
+                self.new = []
+                self.payloads = []
+                for idx, meta in enumerate(metadata, 1):
+                    token = transfer.transfer_token(meta)
+                    self.old.append(SimpleNamespace(
+                        id=idx, message=f"📁 Lec{idx}\nMLTX:{token}:1/1",
+                        file=SimpleNamespace(size=5)
+                    ))
+                    state["drive_to_telegram"][token] = {
+                        "done": True, "parts": {"1": idx}, "name": f"Lec{idx}", "size": 5,
+                    }
+            async def iter_messages(self, _channel, limit=None):
+                for msg in reversed(self.new + self.old):
+                    yield msg
+            async def upload_file(self, path, *, file_size, file_name, part_size_kb, progress_callback):
+                payload = Path(path).read_bytes()
+                self.payloads.append((payload, file_name))
+                self.assert_size = (len(payload), file_size, part_size_kb)
+                return SimpleNamespace(size=file_size, name=file_name)
+            async def send_file(self, channel, file, **kwargs):
+                msg = SimpleNamespace(
+                    id=100 + len(self.new),
+                    message=kwargs["caption"],
+                    file=SimpleNamespace(size=file.size),
+                )
+                self.new.append(msg)
+                return msg
+
+        telegram = Telegram()
+        old_root, old_state = transfer.TEMP_ROOT, transfer.STATE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                transfer.TEMP_ROOT = Path(td)
+                transfer.STATE_PATH = Path(td) / "state.json"
+                def download_file(_service, meta, local):
+                    payload = b"OggS" + bytes([int(meta["name"][3:])])
+                    local.write_bytes(payload)
+                    return len(payload), hashlib.sha256(payload).hexdigest()
+                with patch.object(transfer, "download_drive_file", side_effect=download_file):
+                    preview = asyncio.run(transfer.transfer_drive_to_telegram(
+                        None, None, drive, state, folder, True, 0, True
+                    ))
+                    self.assertEqual(preview["skipped"], 8)
+                    forced = asyncio.run(transfer.transfer_drive_to_telegram(
+                        telegram, object(), drive, state, folder, True, 0, False,
+                        reupload_selected=True, selected_numbers="1-7",
+                    ))
+                    self.assertEqual(forced["ok"], 7)
+                    self.assertEqual(forced["failed"], 0)
+                    self.assertEqual(len(telegram.new), 7)
+                    self.assertEqual([name for _, name in telegram.payloads], [
+                        f"Lec{i}.ogg" for i in range(1, 8)
+                    ])
+                    self.assertEqual(telegram.assert_size, (5, 5, 512))
+                    self.assertEqual(len(telegram.old), 8)
+                    for i, meta in enumerate(metadata, 1):
+                        token = transfer.transfer_token(meta)
+                        record = state["drive_to_telegram"][token]
+                        if i < 8:
+                            self.assertEqual(record["name"], f"Lec{i}.ogg")
+                            self.assertEqual(record["history"][-1]["parts"]["1"], i)
+                            self.assertGreater(record["parts"]["1"], 100 - 1)
+                            self.assertNotIn("reupload", record)
+                            self.assertNotIn(f"MLTX:{token}:1/1", telegram.new[i - 1].message)
+                        else:
+                            self.assertEqual(record["name"], "Lec8")
+                            self.assertEqual(record["parts"]["1"], 8)
+                            self.assertNotIn("history", record)
+                    normal = asyncio.run(transfer.transfer_drive_to_telegram(
+                        telegram, object(), drive, state, folder, True, 0, False
+                    ))
+                    self.assertEqual(normal["skipped"], 8)
+                    self.assertEqual(len(telegram.new), 7)
+        finally:
+            transfer.TEMP_ROOT, transfer.STATE_PATH = old_root, old_state
+
+    def test_interrupted_reupload_resumes_same_selection_without_duplicates(self):
+        folder = "abcdefghijklmnopqrstuvwxyzABCDE"
+        metadata = [
+            {"id": f"file_{i}", "name": f"Lesson{i}.pdf", "mimeType": "application/pdf",
+             "size": "5", "modifiedTime": "2026-10-01"}
+            for i in range(1, 4)
+        ]
+        drive = FakeDrive(FakeFiles(
+            metas={folder: {"id": folder, "name": "x",
+                            "mimeType": "application/vnd.google-apps.folder"}},
+            children={folder: [{"files": metadata}]},
+        ))
+        state = transfer.new_state()
+        for idx, meta in enumerate(metadata, 1):
+            state["drive_to_telegram"][transfer.transfer_token(meta)] = {
+                "done": True, "parts": {"1": idx}, "name": meta["name"],
+            }
+
+        class Telegram:
+            def __init__(self):
+                self.new = []
+                self.fail_once = True
+            async def iter_messages(self, _channel, limit=None):
+                for msg in reversed(self.new):
+                    yield msg
+            async def upload_file(self, path, *, file_size, file_name, part_size_kb, progress_callback):
+                return SimpleNamespace(name=file_name, size=file_size)
+            async def send_file(self, _channel, handle, **kwargs):
+                if self.fail_once and "Lesson2" in handle.name:
+                    self.fail_once = False
+                    raise RuntimeError("transient Telegram failure")
+                msg = SimpleNamespace(
+                    id=100 + len(self.new), message=kwargs["caption"],
+                    file=SimpleNamespace(size=handle.size)
+                )
+                self.new.append(msg)
+                return msg
+
+        client = Telegram()
+        old_root, old_state = transfer.TEMP_ROOT, transfer.STATE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                transfer.TEMP_ROOT = Path(td)
+                transfer.STATE_PATH = Path(td) / "state.json"
+                def download_file(_service, meta, local):
+                    payload = b"%PDF-"
+                    local.write_bytes(payload)
+                    return len(payload), hashlib.sha256(payload).hexdigest()
+                with patch.object(transfer, "download_drive_file", side_effect=download_file):
+                    first = asyncio.run(transfer.transfer_drive_to_telegram(
+                        client, object(), drive, state, folder, True, 0, False,
+                        reupload_selected=True, selected_numbers="1-3",
+                    ))
+                    self.assertEqual((first["ok"], first["failed"]), (2, 1))
+                    self.assertEqual(len(client.new), 2)
+                    failed_record = state["drive_to_telegram"][transfer.transfer_token(metadata[1])]
+                    self.assertTrue(failed_record["done"])  # Old working copy kept.
+                    self.assertIn("reupload", failed_record)
+                    second = asyncio.run(transfer.transfer_drive_to_telegram(
+                        client, object(), drive, state, folder, True, 0, False,
+                        reupload_selected=True, selected_numbers="1-3",
+                    ))
+                    self.assertEqual((second["ok"], second["skipped"], second["failed"]), (1, 2, 0))
+                    self.assertEqual(len(client.new), 3)
+                    self.assertTrue(next(iter(state["reupload_batches"].values()))["done"])
+                    self.assertNotIn(
+                        "reupload", state["drive_to_telegram"][transfer.transfer_token(metadata[1])]
+                    )
+                    self.assertEqual(
+                        len({m.message.split("MLTX:")[-1] for m in client.new}), 3
+                    )
         finally:
             transfer.TEMP_ROOT, transfer.STATE_PATH = old_root, old_state
 
