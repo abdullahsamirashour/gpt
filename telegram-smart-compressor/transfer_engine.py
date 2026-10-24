@@ -141,6 +141,7 @@ def bind_transfer_channel(state: dict, channel_id: int, previous_channel_id=None
     old_id = state.get("drive_to_telegram_channel_id") or previous_channel_id
     if old_id is not None and int(old_id) != channel_id:
         state["drive_to_telegram"] = {}
+        state.pop("reupload_batches", None)
         print("📣 قناة النقل اتغيرت؛ هراجع الملفات كأنها أول مرة للقناة الجديدة.")
     state["drive_to_telegram_channel_id"] = channel_id
     save_json(STATE_PATH, state)
