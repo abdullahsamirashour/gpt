@@ -160,6 +160,111 @@ def clean_filename(name: str) -> str:
     return name[:180] or "unnamed_file"
 
 
+# Exact, common Drive MIME types. Generic application/octet-stream needs
+# content probing rather than a guessed audio/video suffix.
+MEDIA_SUFFIXES = {
+    "audio/ogg": ".ogg", "application/ogg": ".ogg",
+    "audio/opus": ".ogg", "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/m4a": ".m4a",
+    "video/mp4": ".mp4", "video/quicktime": ".mov",
+    "video/webm": ".webm", "audio/webm": ".webm",
+    "video/x-matroska": ".mkv", "audio/x-matroska": ".mka",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/flac": ".flac",
+    "audio/aac": ".aac", "video/x-msvideo": ".avi",
+    "application/pdf": ".pdf", "application/zip": ".zip",
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+}
+
+
+def inferred_extension(path: Path, mime_type: str) -> str:
+    """Find a missing extension from file contents, then reliable Drive MIME."""
+    mime = str(mime_type or "").split(";", 1)[0].strip().lower()
+    with path.open("rb") as fp:
+        header = fp.read(512)
+
+    if header.startswith(b"%PDF-"):
+        return ".pdf"
+    if header.startswith(b"OggS"):
+        return ".ogg"
+    if header.startswith(b"fLaC"):
+        return ".flac"
+    if header.startswith(b"ID3"):
+        return ".mp3"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if header[:4] == b"RIFF" and header[8:12] == b"WAVE":
+        return ".wav"
+    if header[:4] == b"RIFF" and header[8:12] == b"AVI ":
+        return ".avi"
+    if header.startswith(b"PK\x03\x04") and mime in MEDIA_SUFFIXES:
+        return MEDIA_SUFFIXES[mime]
+    if mime in MEDIA_SUFFIXES and not mime.startswith(("audio/", "video/")):
+        return MEDIA_SUFFIXES[mime]
+
+    # For unnamed audio/video recordings, inspect the actual container and
+    # stream type. A generic MP4 audio recording should be .m4a, not .mp4.
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=format_name:stream=codec_type", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if probe.returncode == 0:
+            data = json.loads(probe.stdout)
+            formats = set(str(data.get("format", {}).get("format_name", "")).split(","))
+            stream_types = {
+                s.get("codec_type") for s in data.get("streams", [])
+            }
+            if "mov" in formats or "mp4" in formats:
+                if "video" in stream_types:
+                    return ".mov" if mime == "video/quicktime" else ".mp4"
+                if "audio" in stream_types:
+                    return ".m4a"
+            if "matroska" in formats or "webm" in formats:
+                if b"webm" in header.lower() or mime.endswith("/webm"):
+                    return ".webm"
+                return ".mka" if mime == "audio/x-matroska" else ".mkv"
+            for fmt, ext in (
+                ("ogg", ".ogg"), ("mp3", ".mp3"), ("wav", ".wav"),
+                ("flac", ".flac"), ("aac", ".aac"), ("amr", ".amr"),
+                ("avi", ".avi"), ("mpegts", ".ts"),
+            ):
+                if fmt in formats:
+                    return ext
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, OSError):
+        pass
+
+    if header[4:8] == b"ftyp":
+        return ".m4a" if mime in {"audio/mp4", "audio/x-m4a", "audio/m4a"} else ".mp4"
+    if header.startswith(b"PK\x03\x04"):
+        return ".zip"
+    return MEDIA_SUFFIXES.get(mime, "")
+
+
+def telegram_transfer_filename(metadata: dict, local: Path) -> str:
+    """Preserve existing names; append a real extension only when missing."""
+    name = clean_filename(metadata.get("name", ""))
+    mime = metadata.get("mimeType", "")
+    if mime in EXPORT_TYPES:
+        extension = EXPORT_TYPES[mime][1]
+        return name if name.lower().endswith(extension) else name[:180 - len(extension)] + extension
+    if Path(name).suffix:
+        return name
+
+    extension = inferred_extension(local, mime)
+    if not extension:
+        print(f"⚠️ مش قادر أحدد صيغة {name} بثقة؛ هحتفظ بالاسم الأصلي.")
+        return name
+    fixed = name[:180 - len(extension)] + extension
+    print(f"🏷️ الاسم على Telegram: {name} → {fixed}")
+    return fixed
+
+
 def new_state() -> dict:
     return {"telegram_to_drive": {}, "drive_to_telegram": {}}
 
@@ -712,16 +817,11 @@ async def transfer_drive_to_telegram(
         if previous.get("done"):
             counters["skipped"] += 1
             continue
-        name = clean_filename(meta["name"])
-        if meta["mimeType"] in EXPORT_TYPES:
-            suffix = EXPORT_TYPES[meta["mimeType"]][1]
-            if not name.lower().endswith(suffix):
-                name += suffix
-
         try:
             with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as td:
-                local = Path(td) / name
+                local = Path(td) / clean_filename(meta["name"])
                 size, digest = await asyncio.to_thread(download_drive_file, service, meta, local)
+                name = telegram_transfer_filename(meta, local)
                 parts = max(1, math.ceil(size / MAX_TG_PART))
                 existing = previous.get("parts", {})
                 for part_no in range(1, parts + 1):
@@ -791,7 +891,7 @@ async def transfer_drive_to_telegram(
                 print(f"✅ [{index}/{len(items)}] {name}")
         except Exception as exc:
             counters["failed"] += 1
-            print(f"❌ [{index}/{len(items)}] {name}: {type(exc).__name__}: {exc}")
+            print(f"❌ [{index}/{len(items)}] {clean_filename(meta['name'])}: {type(exc).__name__}: {exc}")
     return counters
 
 
