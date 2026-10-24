@@ -1123,6 +1123,7 @@ async def authorize_telegram(client, phone: str, login_method: str = "code") -> 
 async def _run_transfer(
     service, direction: str, source: str, destination: str,
     max_files: int, recursive: bool, preview: bool, login_method: str = "code",
+    reupload_selected: bool = False, selected_numbers: str = "",
 ) -> dict:
     from telethon import TelegramClient
 
@@ -1156,7 +1157,8 @@ async def _run_transfer(
             channel = await ensure_channel(client, transfer_config)
             bind_transfer_channel(state, int(channel.id), previous_id)
             return await transfer_drive_to_telegram(
-                client, channel, service, state, parse_drive_id(source), recursive, max_files, False
+                client, channel, service, state, parse_drive_id(source), recursive, max_files,
+                False, reupload_selected=reupload_selected, selected_numbers=selected_numbers,
             )
         if direction == "telegram_to_drive":
             if source.strip():
@@ -1182,12 +1184,17 @@ async def _run_transfer(
 def run_transfer(
     direction: str, source: str = "", destination: str = "",
     max_files: int = 20, recursive: bool = True, preview: bool = True,
-    login_method: str = "code",
+    login_method: str = "code", reupload_selected: bool = False,
+    selected_numbers: str = "",
 ) -> None:
     """Entry point called by the small GitHub-backed Colab launcher cell."""
     if login_method not in {"code", "qr"}:
         raise ValueError("طريقة تسجيل دخول Telegram غير معروفة.")
     source, destination = normalize_transfer_inputs(direction, source, destination)
+    if reupload_selected:
+        if direction != "drive_to_telegram" or preview:
+            raise ValueError("إعادة الرفع المحدد متاحة فقط مع تنفيذ Drive → Telegram.")
+        parse_file_numbers(selected_numbers, 200)
     max_files = int(max_files)
     if not 0 <= max_files <= 200:
         raise ValueError("عدد الملفات لازم يكون 0 (كل الملفات) أو رقم من 1 إلى 200.")
@@ -1206,12 +1213,18 @@ def run_transfer(
             print("📦 Media Lite — File Transfer | ملفاتك الأصلية لن تُحذف.")
             with single_run():
                 result = asyncio.get_event_loop().run_until_complete(
-                    _run_transfer(service, direction, source, destination, max_files, recursive, preview, login_method)
+                    _run_transfer(
+                        service, direction, source, destination, max_files, recursive,
+                        preview, login_method, reupload_selected, selected_numbers,
+                    )
                 )
             print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']} • {time.time()-started:.0f} ثانية")
             if not preview:
                 save_json(APP_DIR / "last_run_summary.json", {
-                    "direction": direction, "finished": int(time.time()), **result,
+                    "direction": direction, "finished": int(time.time()),
+                    "reupload_selected": bool(reupload_selected),
+                    "selected_numbers": selected_numbers if reupload_selected else "",
+                    **result,
                 })
         except KeyboardInterrupt:
             print("\n⏹️ تم إيقاف التشغيل. الملفات الأصلية لم تُمس.")
