@@ -321,9 +321,33 @@ def mount_drive():
         from google.colab import drive
     except Exception as exc:
         raise AppError("E101", "هذا الملف مخصص للعمل داخل Google Colab.", str(exc))
-    print("☁️ توصيل Google Drive...")
-    drive.mount("/content/drive", force_remount=False)
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Shared with the transfer cell: don't trigger another Colab consent flow
+    # while the existing Drive mount is already available.
+    if os.path.ismount("/content/drive"):
+        print("✅ Google Drive متوصل بالفعل؛ مش هنعيد طلب صلاحياته.")
+    else:
+        print("☁️ توصيل Google Drive...")
+        try:
+            drive.mount("/content/drive", force_remount=False)
+        except Exception as exc:
+            raise AppError(
+                "E102",
+                "تعذر توصيل Google Drive من Colab. افتح Files ← Mount Drive، "
+                "ووافق على الأذونات. لو التفويض بيفشل، جرّب صفحة Colab جديدة "
+                "أو متصفحًا آخر.",
+                f"{type(exc).__name__}: {exc}",
+            ) from exc
+
+    try:
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+    except (OSError, RuntimeError) as exc:
+        raise AppError(
+            "E103",
+            "Google Drive غير قابل للوصول أو الكتابة رغم ظهور الاتصال. "
+            "افتح Files وتأكد إن MyDrive بيظهر، ثم جرّب إعادة التوصيل.",
+            f"{type(exc).__name__}: {exc}",
+        ) from exc
     TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -2208,32 +2232,45 @@ def run():
         loop.run_until_complete(app())
 
     except AppError as exc:
+        _log_debug(f"app-error {exc.code}: {exc.details or exc.message}")
+        saved_to_drive = False
         if exc.details:
             try:
                 BASE_DIR.mkdir(parents=True, exist_ok=True)
                 ERROR_LOG.write_text(exc.details, encoding="utf-8")
+                saved_to_drive = True
             except Exception:
                 pass
         print()
         print(f"❌ {exc.code}")
         print(exc.message)
-        print("إذا استمرت المشكلة، أرسل كود الخطأ فقط.")
+        if exc.details:
+            print(f"📋 نوع الخطأ: {exc.details.split(':', 1)[0][:90]}")
+        if not saved_to_drive and log_path is not None:
+            print("📝 سجل التشغيل محفوظ في Colab محليًا؛ زر Import logs to Drive اختياري.")
 
     except KeyboardInterrupt:
         print()
         print("⏹️ تم إيقاف التشغيل. الملفات الأصلية لم تتأثر.")
 
-    except Exception:
+    except Exception as exc:
         details = traceback.format_exc()
+        _log_debug(details)
+        saved_to_drive = False
         try:
             BASE_DIR.mkdir(parents=True, exist_ok=True)
             ERROR_LOG.write_text(details, encoding="utf-8")
+            saved_to_drive = True
         except Exception:
             pass
         print()
-        print("❌ E999")
-        print("حصل خطأ غير متوقع. تم حفظ التفاصيل في Google Drive.")
-        print("إذا استمرت المشكلة، أرسل كود الخطأ E999.")
+        print(f"❌ E999 — {type(exc).__name__}")
+        if saved_to_drive:
+            print("التفاصيل اتحفظت في Google Drive.")
+        elif log_path is not None:
+            print("Drive مش متاح لحفظ تفاصيل الخطأ؛ التفاصيل محفوظة في سجل Colab المحلي.")
+        else:
+            print("تعذر حفظ تفاصيل الخطأ؛ افتح سجل مخرجات Colab للتحقق.")
 
     finally:
         if use_run_log:

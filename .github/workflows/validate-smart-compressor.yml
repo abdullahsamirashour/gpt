@@ -242,6 +242,59 @@ jobs:
           sys.modules[spec.name] = engine
           spec.loader.exec_module(engine)
 
+          # Drive is shared with the transfer cell. Reusing a valid mount must
+          # never create a second Colab authentication prompt; failures should
+          # carry actionable, typed codes rather than generic E999.
+          import types
+          from unittest.mock import Mock, patch
+
+          google = types.ModuleType("google")
+          google.__path__ = []
+          colab = types.ModuleType("google.colab")
+          colab.drive = types.SimpleNamespace(mount=Mock())
+          google.colab = colab
+          with patch.dict(sys.modules, {"google": google, "google.colab": colab}):
+              with tempfile.TemporaryDirectory() as td:
+                  td = Path(td)
+                  base = td / "mounted" / "Telegram_Extreme_Compressor"
+                  temp = td / "compressor_tmp"
+                  with patch.object(engine, "BASE_DIR", base), patch.object(engine, "TMP_DIR", temp):
+                      with patch.object(engine.os.path, "ismount", return_value=True):
+                          engine.mount_drive()
+                          colab.drive.mount.assert_not_called()
+                          assert base.is_dir() and temp.is_dir()
+
+                      with patch.object(engine.os.path, "ismount", return_value=False):
+                          engine.mount_drive()
+                          colab.drive.mount.assert_called_once_with(
+                              "/content/drive", force_remount=False
+                          )
+
+                      colab.drive.mount.reset_mock()
+                      colab.drive.mount.side_effect = RuntimeError("credential propagation failed")
+                      with patch.object(engine.os.path, "ismount", return_value=False):
+                          try:
+                              engine.mount_drive()
+                          except engine.AppError as error:
+                              assert error.code == "E102"
+                              assert "Mount Drive" in error.message
+                              assert "RuntimeError" in error.details
+                          else:
+                              raise AssertionError("Drive mount failure should be classified E102")
+
+                      blocked = td / "blocked"
+                      blocked.write_text("file prevents making a Drive directory")
+                      with patch.object(engine, "BASE_DIR", blocked / "child"):
+                          with patch.object(engine.os.path, "ismount", return_value=True):
+                              try:
+                                  engine.mount_drive()
+                              except engine.AppError as error:
+                                  assert error.code == "E103"
+                                  assert "NotADirectoryError" in error.details
+                              else:
+                                  raise AssertionError("Drive IO failure should be classified E103")
+          print("OK compressor Drive mount isolation")
+
           assert engine.ENGINE_BUNDLE_VERSION.startswith("5.5.")
           assert engine.WORKSPACE_TITLE == "🗜️ اضغطها | Media Lite"
           assert engine.APP_NAME == "اضغطها | Media Lite"
