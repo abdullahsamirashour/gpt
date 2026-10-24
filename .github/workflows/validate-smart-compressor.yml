@@ -96,6 +96,11 @@ jobs:
                   assert 'destination=فولدر_Drive_للحفظ.strip()' in telegram_code
                   assert 'عدد_الملفات = 0 #@param' in drive_code
                   assert 'عدد_الملفات = 0 #@param' in telegram_code
+                  assert 'ارقام_الملفات_لإعادة_الرفع = "" #@param' in drive_code
+                  assert '"إعادة رفع المحدد"' in drive_code
+                  assert 'reupload_selected=التشغيل == "إعادة رفع المحدد"' in drive_code
+                  assert 'selected_numbers=ارقام_الملفات_لإعادة_الرفع.strip()' in drive_code
+                  assert 'reupload_selected=' not in telegram_code
                   for transfer_code in (drive_code, telegram_code):
                       assert 'طريقة_الدخول = "QR بدون كود" #@param' in transfer_code
                       assert 'login_method="qr" if طريقة_الدخول' in transfer_code
