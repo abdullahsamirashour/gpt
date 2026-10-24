@@ -828,13 +828,30 @@ async def transfer_drive_to_telegram(
         print("💡 لإعادة رفع ملفات معينة، اختار «إعادة رفع المحدد» واكتب أرقامها مثل 1-7.")
         return {"ok": 0, "skipped": total_done, "failed": 0}
 
+    redo_batch = None
     if reupload_selected:
         numbers = parse_file_numbers(selected_numbers, min(len(all_items), 200))
-        items = [all_items[i - 1] for i in numbers]
-        skipped = 0
-        print(f"🔁 إعادة رفع محددة: {len(items)} ملف، مع الاحتفاظ برسائل Telegram القديمة.")
-        for number, meta in zip(numbers, items):
-            print(f"  {number}. {meta['relative_path']}")
+        selected_items = [all_items[i - 1] for i in numbers]
+        batch_fingerprint = hashlib.sha256(
+            (source_id + "|" + "|".join(transfer_token(m) for m in selected_items)).encode()
+        ).hexdigest()[:18]
+        batches = state.setdefault("reupload_batches", {})
+        redo_batch = batches.get(batch_fingerprint)
+        if not isinstance(redo_batch, dict) or redo_batch.get("done"):
+            redo_batch = {"completed": [], "done": False, "started_at": int(time.time())}
+            batches[batch_fingerprint] = redo_batch
+            save_json(STATE_PATH, state)
+        completed = set(redo_batch.get("completed", []))
+        items = [m for m in selected_items if transfer_token(m) not in completed]
+        skipped = len(selected_items) - len(items)
+        print(
+            f"🔁 إعادة رفع محددة: {len(selected_items)} ملف | "
+            f"اكتمل من نفس المحاولة: {skipped} | متبقي: {len(items)}"
+        )
+        print("🛡️ النسخ القديمة ورسائلها محفوظة، ومش هنلمس الملفات التانية.")
+        for number, meta in zip(numbers, selected_items):
+            marker = "✅ اتعملت في المحاولة" if transfer_token(meta) in completed else "⬆️ هتترفع"
+            print(f"  {number}. {marker} — {meta['relative_path']}")
     else:
         pending = [m for m in all_items if not records.get(transfer_token(m), {}).get("done")]
         items = pending[:max_files] if max_files else pending
@@ -848,7 +865,12 @@ async def transfer_drive_to_telegram(
             print(" •", meta["relative_path"])
 
     if not items:
-        print("✅ مفيش ملفات جديدة محتاجة رفع.")
+        if redo_batch is not None:
+            redo_batch["done"] = True
+            save_json(STATE_PATH, state)
+            print("✅ كل الملفات المحددة اكتملت في محاولة إعادة الرفع دي.")
+        else:
+            print("✅ مفيش ملفات جديدة محتاجة رفع.")
         return {"ok": 0, "skipped": skipped, "failed": 0}
 
     sent = await cached_part_messages(client, channel)
@@ -977,6 +999,10 @@ async def transfer_drive_to_telegram(
                 else:
                     final_record.pop("manifest_id", None)
                 records[token] = final_record
+                if redo_batch is not None:
+                    completed_now = set(redo_batch.get("completed", []))
+                    completed_now.add(token)
+                    redo_batch["completed"] = sorted(completed_now)
                 save_json(STATE_PATH, state)
                 counters["ok"] += 1
                 print(f"✅ [{index}/{len(items)}] {name}")
@@ -986,6 +1012,9 @@ async def transfer_drive_to_telegram(
                 f"❌ [{index}/{len(items)}] {clean_filename(meta['name'])}: "
                 f"{type(exc).__name__}: {exc}"
             )
+    if redo_batch is not None and counters["failed"] == 0:
+        redo_batch["done"] = True
+        save_json(STATE_PATH, state)
     return counters
 
 
