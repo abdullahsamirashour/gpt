@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -782,57 +783,125 @@ async def send_transfer_document(
     )
 
 
+def parse_file_numbers(spec: str, total: int) -> list[int]:
+    """Parse human-facing 1-based file numbers: 1,3,5-8."""
+    text = str(spec or "").strip().replace("،", ",")
+    if not text:
+        raise ValueError("اكتب أرقام الملفات اللي عايز تعيد رفعها، مثل 1-7 أو 1,3,5-8.")
+    numbers = set()
+    for field in text.split(","):
+        match = re.fullmatch(r"\s*(\d+)(?:\s*-\s*(\d+))?\s*", field)
+        if not match:
+            raise ValueError("صيغة الأرقام غير صحيحة. مثال: 1-7 أو 1,3,5-8.")
+        first = int(match.group(1))
+        last = int(match.group(2) or match.group(1))
+        if not 1 <= first <= last <= total:
+            raise ValueError(f"أرقام الملفات لازم تكون من 1 إلى {total} (بنفس ترتيب المعاينة).")
+        if last - first > 200:
+            raise ValueError("أقصى عدد ملفات لإعادة الرفع في المرة الواحدة هو 200.")
+        numbers.update(range(first, last + 1))
+        if len(numbers) > 200:
+            raise ValueError("اختار 200 ملف على الأكثر في كل تشغيل.")
+    return sorted(numbers)
+
+
 async def transfer_drive_to_telegram(
     client, channel, service, state: dict, source_id: str, recursive: bool,
-    max_files: int, preview: bool,
+    max_files: int, preview: bool, reupload_selected: bool = False,
+    selected_numbers: str = "",
 ) -> dict:
     all_items = list_drive_sources(service, source_id, recursive)
     if not all_items:
         print("📭 مفيش ملفات في المجلد المحدد (أو هو فاضي).")
         return {"ok": 0, "skipped": 0, "failed": 0}
+
     records = state_section(state, "drive_to_telegram")
-    pending = [m for m in all_items if not records.get(transfer_token(m), {}).get("done")]
-    already_done = len(all_items) - len(pending)
-    items = pending[:max_files] if max_files else pending
-    count_bytes = sum(int(x.get("size") or 0) for x in items)
-    print(
-        f"📦 Drive → Telegram | إجمالي المجلد: {len(all_items)} ملف | "
-        f"اتنقل قبل كده: {already_done} | هيتنقل دلوقتي: {len(items)} "
-        f"({count_bytes / 1024**2:.1f} MiB)"
-    )
-    for item in items[:10]:
-        print(" •", item["relative_path"])
+    total_done = sum(bool(records.get(transfer_token(m), {}).get("done")) for m in all_items)
     if preview:
-        print("👁️ معاينة فقط — لم يتم نقل ملفات أو إنشاء قناة.")
-        return {"ok": 0, "skipped": already_done, "failed": 0}
+        print(f"📋 المجلد فيه {len(all_items)} ملف | اتنقل قبل كده: {total_done}")
+        for idx, meta in enumerate(all_items[:200], 1):
+            done = bool(records.get(transfer_token(meta), {}).get("done"))
+            print(f"  {idx:>3}. {'✅ مكتمل' if done else '🆕 جديد'} — {meta['relative_path']}")
+        if len(all_items) > 200:
+            print("⚠️ عرضت أول 200 ملف فقط. اختار فولدر أصغر لو عايز تعيد ملفات بعد كده.")
+        print("👁️ معاينة فقط — مفيش رفع ولا إنشاء قناة.")
+        print("💡 لإعادة رفع ملفات معينة، اختار «إعادة رفع المحدد» واكتب أرقامها مثل 1-7.")
+        return {"ok": 0, "skipped": total_done, "failed": 0}
+
+    if reupload_selected:
+        numbers = parse_file_numbers(selected_numbers, min(len(all_items), 200))
+        items = [all_items[i - 1] for i in numbers]
+        skipped = 0
+        print(f"🔁 إعادة رفع محددة: {len(items)} ملف، مع الاحتفاظ برسائل Telegram القديمة.")
+        for number, meta in zip(numbers, items):
+            print(f"  {number}. {meta['relative_path']}")
+    else:
+        pending = [m for m in all_items if not records.get(transfer_token(m), {}).get("done")]
+        items = pending[:max_files] if max_files else pending
+        skipped = total_done
+        print(
+            f"📦 Drive → Telegram | إجمالي المجلد: {len(all_items)} ملف | "
+            f"اتنقل قبل كده: {total_done} | هيتنقل دلوقتي: {len(items)} "
+            f"({sum(int(x.get('size') or 0) for x in items) / 1024**2:.1f} MiB)"
+        )
+        for meta in items[:10]:
+            print(" •", meta["relative_path"])
+
     if not items:
-        print("✅ كل ملفات المجلد اتنقلت بالفعل إلى قناة Telegram.")
-        return {"ok": 0, "skipped": already_done, "failed": 0}
+        print("✅ مفيش ملفات جديدة محتاجة رفع.")
+        return {"ok": 0, "skipped": skipped, "failed": 0}
 
     sent = await cached_part_messages(client, channel)
-    counters = {"ok": 0, "skipped": already_done, "failed": 0}
+    counters = {"ok": 0, "skipped": skipped, "failed": 0}
     for index, meta in enumerate(items, 1):
         token = transfer_token(meta)
         previous = records.get(token, {})
-        if previous.get("done"):
+        previously_done = bool(previous.get("done"))
+        repairing = reupload_selected and previously_done
+        if previously_done and not repairing:
             counters["skipped"] += 1
             continue
+
+        if repairing:
+            # A fresh marker intentionally bypasses the old Telegram receipts.
+            # Persist it before sending so a failed retry can resume safely.
+            repair = previous.get("reupload")
+            if not isinstance(repair, dict) or not re.fullmatch(
+                r"[0-9a-f]{18}", str(repair.get("tag", ""))
+            ):
+                repair = {"tag": uuid.uuid4().hex[:18], "parts": {}}
+                previous["reupload"] = repair
+                records[token] = previous
+                save_json(STATE_PATH, state)
+            receipt_token = repair["tag"]
+            existing = dict(repair.get("parts", {}))
+        else:
+            repair = None
+            receipt_token = token
+            existing = dict(previous.get("parts", {}))
+
+        def record_part(part_no: int, message_id: int) -> None:
+            existing[str(part_no)] = int(message_id)
+            if repairing:
+                repair["parts"] = existing
+                records[token] = previous
+            else:
+                records[token] = {"parts": existing, "done": False}
+            save_json(STATE_PATH, state)
+
         try:
             with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as td:
                 local = Path(td) / clean_filename(meta["name"])
                 size, digest = await asyncio.to_thread(download_drive_file, service, meta, local)
                 name = telegram_transfer_filename(meta, local)
                 parts = max(1, math.ceil(size / MAX_TG_PART))
-                existing = previous.get("parts", {})
                 for part_no in range(1, parts + 1):
                     offset = (part_no - 1) * MAX_TG_PART
                     length = min(MAX_TG_PART, size - offset)
-                    marker = f"MLTX:{token}:{part_no}/{parts}"
-                    cached = sent.get((token, part_no))
+                    marker = f"MLTX:{receipt_token}:{part_no}/{parts}"
+                    cached = sent.get((receipt_token, part_no))
                     if cached and cached[1] == length:
-                        existing[str(part_no)] = cached[0]
-                        records[token] = {"parts": existing, "done": False}
-                        save_json(STATE_PATH, state)
+                        record_part(part_no, cached[0])
                         continue
 
                     part_name = name if parts == 1 else f"{name}.part{part_no:03d}"
@@ -851,11 +920,10 @@ async def transfer_drive_to_telegram(
                     actual = int(getattr(getattr(uploaded, "file", None), "size", 0) or 0)
                     if actual and actual != length:
                         raise RuntimeError("Telegram أرسل حجمًا غير مطابق للجزء.")
-                    existing[str(part_no)] = int(uploaded.id)
-                    sent[(token, part_no)] = (int(uploaded.id), length)
-                    records[token] = {"parts": existing, "done": False}
-                    save_json(STATE_PATH, state)
+                    record_part(part_no, int(uploaded.id))
+                    sent[(receipt_token, part_no)] = (int(uploaded.id), length)
 
+                manifest_id = None
                 if parts > 1:
                     manifest = {
                         "format": "media-lite-parts-v1", "name": name,
@@ -867,31 +935,57 @@ async def transfer_drive_to_telegram(
                     }
                     manifest_path = Path(td) / f"{name}.parts.json"
                     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-                    manifest_tag = f"MLTX:{token}:manifest"
-                    already_sent = previous.get("manifest_id")
-                    if not already_sent:
+                    manifest_tag = f"MLTX:{receipt_token}:manifest"
+                    manifest_id = (
+                        repair.get("manifest_id") if repairing else previous.get("manifest_id")
+                    )
+                    if not manifest_id:
                         for message in await client.get_messages(channel, limit=SCAN_LIMIT):
                             if manifest_tag in (message.message or "") and getattr(message, "file", None):
-                                already_sent = int(message.id)
+                                manifest_id = int(message.id)
                                 break
-                    if not already_sent:
+                    if not manifest_id:
                         receipt = await client.send_file(
                             channel, str(manifest_path), force_document=True,
                             caption=f"📋 خريطة تجميع الأجزاء\n{manifest_tag}",
                         )
-                        already_sent = int(receipt.id)
-                    records[token]["manifest_id"] = already_sent
+                        manifest_id = int(receipt.id)
+                    if repairing:
+                        repair["manifest_id"] = manifest_id
+                        save_json(STATE_PATH, state)
+                    else:
+                        records[token]["manifest_id"] = manifest_id
 
-                records[token] = {
-                    **records[token], "done": True, "file_id": meta["id"],
+                if repairing:
+                    history = previous.get("history", [])
+                    history.append({
+                        "parts": previous.get("parts", {}).copy(),
+                        "manifest_id": previous.get("manifest_id"),
+                        "name": previous.get("name"),
+                    })
+                    previous["history"] = history[-50:]
+                    previous.pop("reupload", None)
+                    final_record = previous
+                else:
+                    final_record = records.get(token, {})
+                final_record.update({
+                    "parts": existing, "done": True, "file_id": meta["id"],
                     "size": size, "sha256": digest, "name": name,
-                }
+                })
+                if manifest_id:
+                    final_record["manifest_id"] = manifest_id
+                else:
+                    final_record.pop("manifest_id", None)
+                records[token] = final_record
                 save_json(STATE_PATH, state)
                 counters["ok"] += 1
                 print(f"✅ [{index}/{len(items)}] {name}")
         except Exception as exc:
             counters["failed"] += 1
-            print(f"❌ [{index}/{len(items)}] {clean_filename(meta['name'])}: {type(exc).__name__}: {exc}")
+            print(
+                f"❌ [{index}/{len(items)}] {clean_filename(meta['name'])}: "
+                f"{type(exc).__name__}: {exc}"
+            )
     return counters
 
 
