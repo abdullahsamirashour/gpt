@@ -242,8 +242,10 @@ class TransferEngineTests(unittest.TestCase):
                 state = transfer.new_state()
                 state["drive_to_telegram"] = {"somefile": {"done": True}}
                 state["drive_to_telegram_channel_id"] = 111
+                state["reupload_batches"] = {"old-channel-batch": {"completed": ["somefile"]}}
                 transfer.bind_transfer_channel(state, 222)
                 self.assertEqual(state["drive_to_telegram"], {})
+                self.assertNotIn("reupload_batches", state)
                 self.assertEqual(state["drive_to_telegram_channel_id"], 222)
                 self.assertEqual(transfer.load_json(transfer.STATE_PATH, {})["drive_to_telegram"], {})
         finally:
