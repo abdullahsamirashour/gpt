@@ -628,6 +628,112 @@ class TransferEngineTests(unittest.TestCase):
         finally:
             transfer.TEMP_ROOT, transfer.STATE_PATH = old_root, old_state
 
+    def test_extensionless_recordings_use_actual_format_and_original_is_preserved(self):
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "Lec1"
+            media.write_bytes(b"OggS" + b"\0" * 60)
+            original = {"name": "Lec1", "mimeType": "application/octet-stream"}
+            self.assertEqual(transfer.telegram_transfer_filename(original, media), "Lec1.ogg")
+            self.assertEqual(original["name"], "Lec1")
+            self.assertEqual(transfer.telegram_transfer_filename(
+                {"name": "Lec1.mp4", "mimeType": "audio/ogg"}, media
+            ), "Lec1.mp4")  # Do not overwrite any existing extension.
+            self.assertEqual(transfer.telegram_transfer_filename(
+                {"name": "Lec1", "mimeType": "application/vnd.google-apps.document"}, media
+            ), "Lec1.pdf")
+            media.write_bytes(b"%PDF-1.7\nfile")
+            self.assertEqual(transfer.telegram_transfer_filename(
+                {"name": "Slides", "mimeType": "application/octet-stream"}, media
+            ), "Slides.pdf")
+            media.write_bytes(b"unknown bytes and not a recognized container")
+            with patch.object(transfer.subprocess, "run", side_effect=FileNotFoundError):
+                self.assertEqual(transfer.telegram_transfer_filename(
+                    {"name": "Unrecognized", "mimeType": "application/octet-stream"}, media
+                ), "Unrecognized")
+
+    def test_m4a_and_mp4_extension_distinguished_using_media_streams(self):
+        with tempfile.TemporaryDirectory() as td:
+            local = Path(td) / "Lec2"
+            local.write_bytes(b"\0\0\0\x18ftypisom" + b"\0" * 24)
+            for stream, expected in [("audio", "Lec2.m4a"), ("video", "Lec2.mp4")]:
+                probe = SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+                        "streams": [{"codec_type": stream}],
+                    }),
+                )
+                with patch.object(transfer.subprocess, "run", return_value=probe) as run:
+                    self.assertEqual(transfer.telegram_transfer_filename(
+                        {"name": "Lec2", "mimeType": "application/octet-stream"}, local
+                    ), expected)
+                    self.assertEqual(run.call_args.kwargs["timeout"], 15)
+
+    def test_webm_and_mkv_distinction_is_not_guessed_from_ffprobe_format_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            media = Path(td) / "Lec3"
+            probe = SimpleNamespace(returncode=0, stdout=json.dumps({
+                "format": {"format_name": "matroska,webm"}, "streams": [{"codec_type": "video"}]
+            }))
+            with patch.object(transfer.subprocess, "run", return_value=probe):
+                media.write_bytes(b"\x1a\x45\xdf\xa3" + b"matroska" + b"\0" * 16)
+                self.assertEqual(transfer.inferred_extension(media, "application/octet-stream"), ".mkv")
+                media.write_bytes(b"\x1a\x45\xdf\xa3" + b"webm" + b"\0" * 16)
+                self.assertEqual(transfer.inferred_extension(media, "application/octet-stream"), ".webm")
+
+    def test_extensionless_drive_file_is_named_correctly_in_telegram_upload(self):
+        class FakeTelegram:
+            def __init__(self):
+                self.upload_names = []
+            async def iter_messages(self, channel, limit):
+                if False:
+                    yield None
+            async def upload_file(self, path, *, file_size, file_name, part_size_kb, progress_callback):
+                self.upload_names.append(file_name)
+                self.uploaded_bytes = Path(path).read_bytes()
+                return SimpleNamespace(name=file_name, size=file_size)
+            async def send_file(self, channel, handle, **kwargs):
+                self.docname = kwargs["attributes"][0].file_name
+                return SimpleNamespace(id=31, file=SimpleNamespace(size=handle.size))
+
+        root = "123456789abcdefghijklmnopqrstuvwxyz"
+        original = {
+            "id": root, "name": "Lec1", "mimeType": "application/octet-stream",
+            "size": "32", "modifiedTime": "2026-10-24T00:00:00Z",
+        }
+        tg = FakeTelegram()
+        state = transfer.new_state()
+        old_root, old_state = transfer.TEMP_ROOT, transfer.STATE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                transfer.TEMP_ROOT = Path(td)
+                transfer.STATE_PATH = Path(td) / "state.json"
+                sample = b"OggS" + b"\0" * 28
+                def download(_service, _meta, path):
+                    path.write_bytes(sample)
+                    return len(sample), hashlib.sha256(sample).hexdigest()
+                with patch.object(transfer, "download_drive_file", side_effect=download):
+                    first = asyncio.run(transfer.transfer_drive_to_telegram(
+                        tg, object(), FakeDrive(FakeFiles(metas={root: original})),
+                        state, root, True, 0, False
+                    ))
+                    self.assertEqual(first["ok"], 1)
+                    self.assertEqual(tg.upload_names, ["Lec1.ogg"])
+                    self.assertEqual(tg.docname, "Lec1.ogg")
+                    self.assertEqual(tg.uploaded_bytes, sample)
+                    self.assertEqual(
+                        state["drive_to_telegram"][transfer.transfer_token(original)]["name"],
+                        "Lec1.ogg",
+                    )
+                    second = asyncio.run(transfer.transfer_drive_to_telegram(
+                        tg, object(), FakeDrive(FakeFiles(metas={root: original})),
+                        state, root, True, 0, False
+                    ))
+                    self.assertEqual(second["skipped"], 1)
+                    self.assertEqual(len(tg.upload_names), 1)
+        finally:
+            transfer.TEMP_ROOT, transfer.STATE_PATH = old_root, old_state
+
     def test_file_export_support_and_provenance_tag(self):
         self.assertEqual(transfer.EXPORT_TYPES["application/vnd.google-apps.document"][1], ".pdf")
         tag = "📁 folder/notes.pdf\nMLTX:0123456789abcdefab:2/3"
