@@ -68,7 +68,7 @@ jobs:
 
               assert code_cell.get("metadata", {}).get("cellView") == "form"
               assert "#@title" in code
-              assert code.count("#@param") >= 2
+              assert code.count("#@param") >= (1 if path.name == "Smart_Compressor.ipynb" else 2)
               assert "\\n" not in md
               assert "re.search(r'ENGINE_BUNDLE_VERSION" not in code
               if path.name == "launcher-beta.ipynb":
@@ -88,6 +88,10 @@ jobs:
                   drive_code = "".join(code_cells[1].get("source", []))
                   telegram_code = "".join(code_cells[2].get("source", []))
                   assert 'ENGINE_REL = "telegram-smart-compressor/engine.py"' in code
+                  assert 'UI_REL = "telegram-smart-compressor/media_studio_ui.py"' in code
+                  assert 'ui.show_studio(engine)' in code
+                  assert 'TSC_UI_ONLY' in code
+                  assert code.count('#@param') == 1
                   assert 'direction="drive_to_telegram"' in drive_code
                   assert 'source=رابط_Drive.strip()' in drive_code
                   assert 'destination=""' in drive_code
@@ -108,7 +112,7 @@ jobs:
                       assert '_transfer_module.run_transfer(' in transfer_code
                       assert '"main"' in transfer_code
                       assert 'preview=التشغيل == "معاينة فقط"' in transfer_code
-                      assert code.count("#@param") >= 2
+                      assert code.count("#@param") >= 1
                       compile(transfer_code, "Media-Lite transfer cell", "exec")
                   assert 'telegram_to_drive' not in drive_code
                   assert 'drive_to_telegram' not in telegram_code
@@ -116,6 +120,13 @@ jobs:
 
           assert found >= 1
           PY
+
+      - name: Compile Studio UI and validate preferences without credentials
+        env:
+          TSC_TEST_MODE: '1'
+        run: |
+          python -m py_compile telegram-smart-compressor/media_studio_ui.py
+          python -m unittest discover -s telegram-smart-compressor -p 'test_media_studio.py' -v
 
       - name: Bidirectional transfer regression tests
         run: |
