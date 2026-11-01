@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.5.5"
+ENGINE_BUNDLE_VERSION = "5.5.6"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -73,6 +73,134 @@ PROFILE = PROFILE_FROM_UI.get(
     os.environ.get("TSC_PROFILE", "SMART_AUTO"),
 )
 TARGET_SIZE_TEXT = os.environ.get("TSC_TARGET_SIZE_MB", "").strip()
+
+# Studio UI preferences contain encoding options only (never Telegram credentials).
+# Legacy launchers intentionally keep their original behaviour unless the
+# interactive Studio explicitly calls apply_studio_settings().
+STUDIO_SETTINGS_VERSION = 1
+STUDIO_FACTORY_SETTINGS = {
+    "source": "auto",
+    "audio_preset": "speech",
+    "audio_codec": "opus",
+    "audio_kbps": 24,
+    "audio_channels": "mono",
+    "audio_sample_rate": "24000",
+    "audio_noise": "off",
+    "video_preset": "balanced",
+    "video_codec": "h264",
+    "video_resolution": "720",
+    "video_fps": "auto",
+    "video_crf": 28,
+    "video_speed": "balanced",
+    "video_audio_kbps": 64,
+    "video_rate_mode": "quality",
+    "video_target_mb": 80,
+    "skip_if_no_saving": True,
+}
+STUDIO_AUDIO_PRESETS = {
+    "tiny": {"audio_codec": "opus", "audio_kbps": 8, "audio_channels": "mono", "audio_sample_rate": "12000", "audio_noise": "off"},
+    "speech": {"audio_codec": "opus", "audio_kbps": 24, "audio_channels": "mono", "audio_sample_rate": "24000", "audio_noise": "off"},
+    "clear": {"audio_codec": "opus", "audio_kbps": 32, "audio_channels": "mono", "audio_sample_rate": "48000", "audio_noise": "off"},
+    "music": {"audio_codec": "opus", "audio_kbps": 96, "audio_channels": "stereo", "audio_sample_rate": "48000", "audio_noise": "off"},
+}
+STUDIO_VIDEO_PRESETS = {
+    "balanced": {"video_codec": "h264", "video_resolution": "720", "video_fps": "auto", "video_crf": 28, "video_speed": "balanced", "video_audio_kbps": 64, "video_rate_mode": "quality"},
+    "presentation": {"video_codec": "h264", "video_resolution": "1080", "video_fps": "15", "video_crf": 24, "video_speed": "slow", "video_audio_kbps": 64, "video_rate_mode": "quality"},
+    "small": {"video_codec": "h264", "video_resolution": "540", "video_fps": "12", "video_crf": 32, "video_speed": "slow", "video_audio_kbps": 48, "video_rate_mode": "quality"},
+    "fast": {"video_codec": "h264", "video_resolution": "720", "video_fps": "24", "video_crf": 30, "video_speed": "fast", "video_audio_kbps": 64, "video_rate_mode": "quality"},
+}
+ACTIVE_STUDIO_SETTINGS = None
+
+
+def studio_settings_path():
+    return BASE_DIR / "Media_Lite_Studio" / "preferences_v1.json"
+
+
+def normalize_studio_settings(value):
+    """Strict, allowlisted validation; malformed Drive JSON cannot reach FFmpeg."""
+    if not isinstance(value, dict):
+        raise ValueError("إعدادات Studio يجب أن تكون كائنًا.")
+    result = dict(STUDIO_FACTORY_SETTINGS)
+    for key, item in value.items():
+        if key in result:
+            result[key] = item
+    allowed = {
+        "source": {"auto", "audio", "video"},
+        "audio_preset": set(STUDIO_AUDIO_PRESETS),
+        "audio_codec": {"opus", "aac", "mp3"},
+        "audio_channels": {"mono", "stereo"},
+        "audio_sample_rate": {"auto", "12000", "16000", "24000", "48000"},
+        "audio_noise": {"off", "light"},
+        "video_preset": set(STUDIO_VIDEO_PRESETS),
+        "video_codec": {"h264", "h265"},
+        "video_resolution": {"source", "480", "540", "720", "1080"},
+        "video_fps": {"auto", "source", "12", "15", "24", "30"},
+        "video_speed": {"fast", "balanced", "slow"},
+        "video_rate_mode": {"quality", "target"},
+    }
+    for key, choices in allowed.items():
+        if not isinstance(result[key], str) or result[key] not in choices:
+            raise ValueError(f"إعداد غير معروف أو غير مدعوم: {key}")
+    limits = {"audio_kbps": (8, 192), "video_crf": (18, 35),
+              "video_audio_kbps": (32, 192), "video_target_mb": (4, 4096)}
+    for key, (minimum, maximum) in limits.items():
+        val = result[key]
+        if isinstance(val, bool) or not isinstance(val, int) or not minimum <= val <= maximum:
+            raise ValueError(f"قيمة {key} يجب أن تكون من {minimum} إلى {maximum}.")
+    if not isinstance(result["skip_if_no_saving"], bool):
+        raise ValueError("skip_if_no_saving يجب أن تكون True أو False")
+    if result["audio_codec"] == "mp3" and result["audio_kbps"] < 32:
+        raise ValueError("MP3 يحتاج Bitrate لا يقل عن 32 kbps؛ استخدم Opus للأحجام الصغيرة.")
+    if result["video_rate_mode"] == "target" and result["video_codec"] != "h264":
+        raise ValueError("الحجم المستهدف متاح حاليًا مع H.264 فقط.")
+    return result
+
+
+def apply_studio_settings(settings):
+    global ACTIVE_STUDIO_SETTINGS
+    ACTIVE_STUDIO_SETTINGS = normalize_studio_settings(settings)
+    return dict(ACTIVE_STUDIO_SETTINGS)
+
+
+def load_studio_preferences():
+    path = studio_settings_path()
+    payload = load_json(path, {})
+    if not isinstance(payload, dict):
+        payload = {}
+    def safe(value):
+        try:
+            return normalize_studio_settings(value)
+        except (TypeError, ValueError):
+            return dict(STUDIO_FACTORY_SETTINGS)
+    return {
+        "version": STUDIO_SETTINGS_VERSION,
+        "default": safe(payload.get("default")),
+        "last_used": safe(payload.get("last_used") or payload.get("default")),
+        "last_saved_at": payload.get("last_saved_at"),
+        "default_saved_at": payload.get("default_saved_at"),
+    }
+
+
+def save_studio_preferences(settings, *, save_default=False):
+    """Autosave last-used only when Run is pressed; explicit pin saves default."""
+    approved = normalize_studio_settings(settings)
+    record = load_studio_preferences()
+    record["last_used"] = approved
+    record["last_saved_at"] = int(time.time())
+    if save_default:
+        record["default"] = dict(approved)
+        record["default_saved_at"] = record["last_saved_at"]
+    path = studio_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        temp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    return record
+
 
 
 class AppError(Exception):
@@ -2280,5 +2408,5 @@ def run():
                 show_log_controls(log_path)
 
 
-if os.environ.get("TSC_TEST_MODE") != "1":
+if os.environ.get("TSC_TEST_MODE") != "1" and os.environ.get("TSC_UI_ONLY") != "1":
     run()
