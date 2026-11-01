@@ -1093,6 +1093,7 @@ class LiveProgress:
         )
 
     def update(self, current, total, speed_override=None, force=False):
+        check_stop()
         now = time.time()
         current = float(current or 0)
         total = float(total or 0)
@@ -1180,6 +1181,7 @@ class LiveProgress:
 
 
 def run_ffmpeg(cmd, duration: float, label: str):
+    check_stop()
     full = [cmd[0], "-y", "-nostdin", "-hide_banner", "-loglevel", "error", *cmd[1:-1], "-progress", "pipe:1", "-nostats", cmd[-1]]
     _log_debug(
         f"ffmpeg-start label={label} cmd={json.dumps([str(x) for x in full], ensure_ascii=False)}"
@@ -1196,34 +1198,46 @@ def run_ffmpeg(cmd, duration: float, label: str):
     current_seconds = 0.0
     speed_x = None
 
-    if proc.stdout:
-        for raw in proc.stdout:
-            line = raw.strip()
-            lines.append(line)
+    _register_subprocess(proc)
+    try:
+        if proc.stdout:
+            for raw in proc.stdout:
+                line = raw.strip()
+                lines.append(line)
 
-            if line.startswith("speed="):
-                raw_speed = line.split("=", 1)[1].rstrip("x").strip()
-                try:
-                    speed_x = float(raw_speed)
-                except Exception:
-                    speed_x = None
+                if line.startswith("speed="):
+                    raw_speed = line.split("=", 1)[1].rstrip("x").strip()
+                    try:
+                        speed_x = float(raw_speed)
+                    except Exception:
+                        speed_x = None
 
-            if line.startswith("out_time_ms=") and duration > 0:
-                try:
-                    current_seconds = int(line.split("=", 1)[1]) / 1_000_000
-                    progress.update(current_seconds, duration, speed_override=speed_x)
-                except Exception:
-                    pass
+                if line.startswith("out_time_ms=") and duration > 0:
+                    try:
+                        current_seconds = int(line.split("=", 1)[1]) / 1_000_000
+                        progress.update(current_seconds, duration, speed_override=speed_x)
+                    except Exception:
+                        pass
 
-    code = proc.wait()
-    if code != 0:
-        tail = "\n".join(lines[-30:])
-        _log_debug(f"ffmpeg-failed label={label} rc={code} tail={tail}")
-        raise AppError("E420", "فشل ضغط الملف.", tail)
+        code = proc.wait()
+        check_stop()
+        if code != 0:
+            tail = "\n".join(lines[-30:])
+            _log_debug(f"ffmpeg-failed label={label} rc={code} tail={tail}")
+            raise AppError("E420", "فشل ضغط الملف.", tail)
 
-    _log_debug(f"ffmpeg-ok label={label} duration={duration:.3f} speed={speed_x}")
-    progress.finish(duration, speed_override=speed_x)
+        _log_debug(f"ffmpeg-ok label={label} duration={duration:.3f} speed={speed_x}")
+        progress.finish(duration, speed_override=speed_x)
 
+    except BaseException:
+        if proc.poll() is None:
+            proc.terminate()
+        _wait_for_subprocess(proc)
+        raise
+    finally:
+        _unregister_subprocess(proc)
+        if proc.stdout is not None:
+            proc.stdout.close()
 
 async def download_media_fast(client, msg, path: Path):
     size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
