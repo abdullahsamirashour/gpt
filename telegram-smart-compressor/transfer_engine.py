@@ -1059,148 +1059,183 @@ async def transfer_drive_to_telegram(
 
     sent = await cached_part_messages(client, channel)
     counters = {"ok": 0, "skipped": skipped, "failed": 0}
-    for index, meta in enumerate(items, 1):
-        token = transfer_token(meta)
-        previous = records.get(token, {})
-        previously_done = bool(previous.get("done"))
-        repairing = reupload_selected and previously_done
-        if previously_done and not repairing:
-            counters["skipped"] += 1
-            continue
+    uploader = TelegramParallelUploader(client) if TelegramParallelUploader.supported(client) else None
+    prefetch_task = None
+    print(f"⚡ Telegram upload: {TG_UPLOAD_CONNECTIONS} اتصالات للملفات من 5 MiB؛ "
+          "تجهيز الملف التالي أثناء رفع الحالي.")
+    try:
+        for index, meta in enumerate(items, 1):
+            token = transfer_token(meta)
+            previous = records.get(token, {})
+            previously_done = bool(previous.get("done"))
+            repairing = reupload_selected and previously_done
+            if previously_done and not repairing:
+                counters["skipped"] += 1
+                continue
 
-        if repairing:
-            # A fresh marker intentionally bypasses the old Telegram receipts.
-            # Persist it before sending so a failed retry can resume safely.
-            repair = previous.get("reupload")
-            if not isinstance(repair, dict) or not re.fullmatch(
-                r"[0-9a-f]{18}", str(repair.get("tag", ""))
-            ):
-                repair = {"tag": uuid.uuid4().hex[:18], "parts": {}}
-                previous["reupload"] = repair
-                records[token] = previous
-                save_json(STATE_PATH, state)
-            receipt_token = repair["tag"]
-            existing = dict(repair.get("parts", {}))
-        else:
-            repair = None
-            receipt_token = token
-            existing = dict(previous.get("parts", {}))
-
-        def record_part(part_no: int, message_id: int) -> None:
-            existing[str(part_no)] = int(message_id)
             if repairing:
-                repair["parts"] = existing
-                records[token] = previous
+                # A fresh marker intentionally bypasses the old Telegram receipts.
+                # Persist it before sending so a failed retry can resume safely.
+                repair = previous.get("reupload")
+                if not isinstance(repair, dict) or not re.fullmatch(
+                    r"[0-9a-f]{18}", str(repair.get("tag", ""))
+                ):
+                    repair = {"tag": uuid.uuid4().hex[:18], "parts": {}}
+                    previous["reupload"] = repair
+                    records[token] = previous
+                    save_json(STATE_PATH, state)
+                receipt_token = repair["tag"]
+                existing = dict(repair.get("parts", {}))
             else:
-                records[token] = {"parts": existing, "done": False}
-            save_json(STATE_PATH, state)
+                repair = None
+                receipt_token = token
+                existing = dict(previous.get("parts", {}))
 
-        try:
-            with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as td:
-                local = Path(td) / clean_filename(meta["name"])
-                size, digest = await asyncio.to_thread(download_drive_file, service, meta, local)
-                name = telegram_transfer_filename(meta, local)
-                parts = max(1, math.ceil(size / MAX_TG_PART))
-                for part_no in range(1, parts + 1):
-                    offset = (part_no - 1) * MAX_TG_PART
-                    length = min(MAX_TG_PART, size - offset)
-                    marker = f"MLTX:{receipt_token}:{part_no}/{parts}"
-                    cached = sent.get((receipt_token, part_no))
-                    if cached and cached[1] == length:
-                        record_part(part_no, cached[0])
-                        continue
-
-                    part_name = name if parts == 1 else f"{name}.part{part_no:03d}"
-                    caption = f"📁 {meta['relative_path'][-700:]}\n{marker}"
-                    progress = Progress(f"⬆️ Telegram [{index}/{len(items)}] {part_name}")
-                    if parts == 1:
-                        uploaded = await send_transfer_document(
-                            client, channel, str(local), length, part_name, caption, progress
-                        )
-                    else:
-                        with SegmentReader(local, offset, length, part_name) as segment:
-                            uploaded = await send_transfer_document(
-                                client, channel, segment, length, part_name, caption,
-                                progress, raw_part=True,
-                            )
-                    actual = int(getattr(getattr(uploaded, "file", None), "size", 0) or 0)
-                    if actual and actual != length:
-                        raise RuntimeError("Telegram أرسل حجمًا غير مطابق للجزء.")
-                    record_part(part_no, int(uploaded.id))
-                    sent[(receipt_token, part_no)] = (int(uploaded.id), length)
-
-                manifest_id = None
-                if parts > 1:
-                    manifest = {
-                        "format": "media-lite-parts-v1", "name": name,
-                        "relative_path": meta["relative_path"], "size": size,
-                        "sha256": digest, "part_size": MAX_TG_PART,
-                        "parts": [{"name": f"{name}.part{i:03d}", "message_id": existing[str(i)]}
-                                  for i in range(1, parts + 1)],
-                        "restore": "Concatenate the .part files in ascending order (binary mode).",
-                    }
-                    manifest_path = Path(td) / f"{name}.parts.json"
-                    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-                    manifest_tag = f"MLTX:{receipt_token}:manifest"
-                    manifest_id = (
-                        repair.get("manifest_id") if repairing else previous.get("manifest_id")
-                    )
-                    if not manifest_id:
-                        for message in await client.get_messages(channel, limit=SCAN_LIMIT):
-                            if manifest_tag in (message.message or "") and getattr(message, "file", None):
-                                manifest_id = int(message.id)
-                                break
-                    if not manifest_id:
-                        receipt = await client.send_file(
-                            channel, str(manifest_path), force_document=True,
-                            caption=f"📋 خريطة تجميع الأجزاء\n{manifest_tag}",
-                        )
-                        manifest_id = int(receipt.id)
-                    if repairing:
-                        repair["manifest_id"] = manifest_id
-                        save_json(STATE_PATH, state)
-                    else:
-                        records[token]["manifest_id"] = manifest_id
-
+            def record_part(part_no: int, message_id: int) -> None:
+                existing[str(part_no)] = int(message_id)
                 if repairing:
-                    history = previous.get("history", [])
-                    history.append({
-                        "parts": previous.get("parts", {}).copy(),
-                        "manifest_id": previous.get("manifest_id"),
-                        "name": previous.get("name"),
-                    })
-                    previous["history"] = history[-50:]
-                    previous.pop("reupload", None)
-                    final_record = previous
+                    repair["parts"] = existing
+                    records[token] = previous
                 else:
-                    final_record = records.get(token, {})
-                final_record.update({
-                    "parts": existing, "done": True, "file_id": meta["id"],
-                    "size": size, "sha256": digest, "name": name,
-                })
-                if manifest_id:
-                    final_record["manifest_id"] = manifest_id
-                else:
-                    final_record.pop("manifest_id", None)
-                records[token] = final_record
-                if redo_batch is not None:
-                    completed_now = set(redo_batch.get("completed", []))
-                    completed_now.add(token)
-                    redo_batch["completed"] = sorted(completed_now)
+                    records[token] = {"parts": existing, "done": False}
                 save_json(STATE_PATH, state)
-                counters["ok"] += 1
-                print(f"✅ [{index}/{len(items)}] {name}")
-        except Exception as exc:
-            counters["failed"] += 1
-            print(
-                f"❌ [{index}/{len(items)}] {clean_filename(meta['name'])}: "
-                f"{type(exc).__name__}: {exc}"
-            )
-    if redo_batch is not None and counters["failed"] == 0:
-        redo_batch["done"] = True
-        save_json(STATE_PATH, state)
-    return counters
 
+            try:
+                with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as td:
+                    local = Path(td) / clean_filename(meta["name"])
+                    if prefetch_task is not None:
+                        staged = None
+                        try:
+                            staged = await prefetch_task
+                            staged_dir, staged_path, size, digest, name = staged
+                            os.replace(staged_path, local)
+                        finally:
+                            prefetch_task = None
+                            if staged is not None:
+                                staged[0].cleanup()
+                    else:
+                        size, digest = await asyncio.to_thread(download_drive_file, service, meta, local)
+                        name = telegram_transfer_filename(meta, local)
+
+                    if index < len(items) and can_prefetch_drive_file(items[index]):
+                        next_meta = items[index]
+                        prefetch_task = asyncio.create_task(prepare_drive_upload(service, next_meta))
+                        print(f"⏩ تجهيز الملف التالي أثناء رفع الحالي: {next_meta['relative_path']}")
+                    parts = max(1, math.ceil(size / MAX_TG_PART))
+                    for part_no in range(1, parts + 1):
+                        offset = (part_no - 1) * MAX_TG_PART
+                        length = min(MAX_TG_PART, size - offset)
+                        marker = f"MLTX:{receipt_token}:{part_no}/{parts}"
+                        cached = sent.get((receipt_token, part_no))
+                        if cached and cached[1] == length:
+                            record_part(part_no, cached[0])
+                            continue
+
+                        part_name = name if parts == 1 else f"{name}.part{part_no:03d}"
+                        caption = f"📁 {meta['relative_path'][-700:]}\n{marker}"
+                        progress = Progress(f"⬆️ Telegram [{index}/{len(items)}] {part_name}")
+                        if parts == 1:
+                            uploaded = await send_transfer_document(
+                                client, channel, str(local), length, part_name, caption, progress,
+                                parallel_uploader=uploader,
+                            )
+                        else:
+                            with SegmentReader(local, offset, length, part_name) as segment:
+                                uploaded = await send_transfer_document(
+                                    client, channel, segment, length, part_name, caption,
+                                    progress, raw_part=True, parallel_uploader=uploader,
+                                )
+                        actual = int(getattr(getattr(uploaded, "file", None), "size", 0) or 0)
+                        if actual and actual != length:
+                            raise RuntimeError("Telegram أرسل حجمًا غير مطابق للجزء.")
+                        record_part(part_no, int(uploaded.id))
+                        sent[(receipt_token, part_no)] = (int(uploaded.id), length)
+
+                    manifest_id = None
+                    if parts > 1:
+                        manifest = {
+                            "format": "media-lite-parts-v1", "name": name,
+                            "relative_path": meta["relative_path"], "size": size,
+                            "sha256": digest, "part_size": MAX_TG_PART,
+                            "parts": [{"name": f"{name}.part{i:03d}", "message_id": existing[str(i)]}
+                                      for i in range(1, parts + 1)],
+                            "restore": "Concatenate the .part files in ascending order (binary mode).",
+                        }
+                        manifest_path = Path(td) / f"{name}.parts.json"
+                        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+                        manifest_tag = f"MLTX:{receipt_token}:manifest"
+                        manifest_id = (
+                            repair.get("manifest_id") if repairing else previous.get("manifest_id")
+                        )
+                        if not manifest_id:
+                            for message in await client.get_messages(channel, limit=SCAN_LIMIT):
+                                if manifest_tag in (message.message or "") and getattr(message, "file", None):
+                                    manifest_id = int(message.id)
+                                    break
+                        if not manifest_id:
+                            receipt = await client.send_file(
+                                channel, str(manifest_path), force_document=True,
+                                caption=f"📋 خريطة تجميع الأجزاء\n{manifest_tag}",
+                            )
+                            manifest_id = int(receipt.id)
+                        if repairing:
+                            repair["manifest_id"] = manifest_id
+                            save_json(STATE_PATH, state)
+                        else:
+                            records[token]["manifest_id"] = manifest_id
+
+                    if repairing:
+                        history = previous.get("history", [])
+                        history.append({
+                            "parts": previous.get("parts", {}).copy(),
+                            "manifest_id": previous.get("manifest_id"),
+                            "name": previous.get("name"),
+                        })
+                        previous["history"] = history[-50:]
+                        previous.pop("reupload", None)
+                        final_record = previous
+                    else:
+                        final_record = records.get(token, {})
+                    final_record.update({
+                        "parts": existing, "done": True, "file_id": meta["id"],
+                        "size": size, "sha256": digest, "name": name,
+                    })
+                    if manifest_id:
+                        final_record["manifest_id"] = manifest_id
+                    else:
+                        final_record.pop("manifest_id", None)
+                    records[token] = final_record
+                    if redo_batch is not None:
+                        completed_now = set(redo_batch.get("completed", []))
+                        completed_now.add(token)
+                        redo_batch["completed"] = sorted(completed_now)
+                    save_json(STATE_PATH, state)
+                    counters["ok"] += 1
+                    print(f"✅ [{index}/{len(items)}] {name}")
+            except Exception as exc:
+                counters["failed"] += 1
+                print(
+                    f"❌ [{index}/{len(items)}] {clean_filename(meta['name'])}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if type(exc).__name__ in ("FloodWaitError", "FloodPremiumWaitError"):
+                    print("⏸️ Telegram طلب الانتظار؛ تم إيقاف الدفعة لحماية الحساب.")
+                    break
+        if redo_batch is not None and counters["failed"] == 0:
+            redo_batch["done"] = True
+            save_json(STATE_PATH, state)
+        return counters
+
+    finally:
+        if prefetch_task is not None:
+            # Drain and clean any prepared file even if the current upload fails.
+            try:
+                unused = await prefetch_task
+                unused[0].cleanup()
+            except BaseException:
+                pass
+        if uploader is not None:
+            await uploader.close()
 
 # Telegram -> Drive: use independent MTProto download connections for files
 # >= 5 MiB, and keep Telethon's native path as the safe fallback.
@@ -1420,7 +1455,7 @@ async def transfer_telegram_to_drive(
     source_name = clean_filename(getattr(channel, "title", "") or "Telegram")
     dst_folder = ensure_child_folder(service, folder_id, source_name, folder_cache)
     downloader = TelegramParallelDownloader(client) if TelegramParallelDownloader.supported(client) else None
-    print("⚡ Telegram parallel download: من 5 MiB، {TG_PARALLEL_CONNECTIONS} اتصالات؛ fallback تلقائي.")
+    print(f"⚡ Telegram parallel download: من 5 MiB، {TG_PARALLEL_CONNECTIONS} اتصالات؛ fallback تلقائي.")
     for index, msg in enumerate(jobs, 1):
         key = origin_key(peer_id, int(msg.id))
         size = int(getattr(msg.file, "size", 0) or 0)
