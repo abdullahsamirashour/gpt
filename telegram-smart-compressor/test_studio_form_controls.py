@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
 """Native Colab Form tests. No widgets, Telegram session or Google Drive needed."""
 import ast
+import asyncio
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ["TSC_TEST_MODE"] = "1"
@@ -91,6 +95,144 @@ class NativeStudioFormTests(unittest.TestCase):
         telegram = "".join(NOTEBOOK["cells"][5]["source"])
         self.assertIn('direction="drive_to_telegram"', drive)
         self.assertIn('direction="telegram_to_drive"', telegram)
+
+    def test_audio_only_choice_for_video_is_explicit_and_preserves_old_labels(self):
+        self.assertIn("🎧 صوت فقط — حتى الفيديو يتحول لصوت", CODE)
+        self.assertIn("🎧 صوت فقط — حتى الفيديو يتحول لصوت", forms.CONTENT_KINDS)
+        for label in ("🎧 صوت فقط — حتى الفيديو يتحول لصوت", "صوت فقط"):
+            settings = forms.collect_form_settings(
+                engine, {**FORM, "content_kind": label})
+            self.assertEqual(settings["source"], "audio")
+            engine.apply_studio_settings(settings)
+            video_message = SimpleNamespace(
+                file=SimpleNamespace(mime_type="video/mp4"),
+                video=True, audio=None, voice=None,
+            )
+            self.assertEqual(engine.resolve_profile(video_message), "AUDIO_CUSTOM")
+        self.assertEqual(forms.collect_form_settings(engine, FORM)["source"], "auto")
+
+    def test_form_hourly_size_table_uses_kilobits_not_kilobytes(self):
+        self.assertIn("📊 حجم ساعة واحدة من الصوت", CODE)
+        for kbps in (8, 16, 24, 32, 48, 64, 96, 128, 192):
+            decimal_mb = kbps * 3600 / 8 / 1000
+            line = f"#@markdown | {kbps} kbps | {decimal_mb:.1f} MB |"
+            self.assertIn(line, CODE)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
+                         "Real FFmpeg is required")
+    def test_real_video_is_converted_to_audio_only_mp3_and_uploaded_as_audio(self):
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            src = temp / "classroom.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=15",
+                "-f", "lavfi", "-i", "sine=frequency=650:sample_rate=44100",
+                "-t", "1.25", "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac", "-b:a", "96k", str(src),
+            ], check=True, timeout=30)
+
+            settings = forms.collect_form_settings(engine, {
+                **FORM,
+                "content_kind": "🎧 صوت فقط — حتى الفيديو يتحول لصوت",
+                "advanced_audio": True,
+                "audio_codec": "MP3",
+                "audio_kbps": "64",
+                "audio_channels": "Mono",
+                "audio_sample_rate": "24000",
+            })
+            engine.apply_studio_settings(settings)
+            info = engine.ffprobe(src)
+            self.assertTrue(info.has_audio and info.has_video)
+            message = SimpleNamespace(
+                id=777, file=SimpleNamespace(name="classroom.mp4", mime_type="video/mp4"),
+                video=True, voice=False, audio=False,
+            )
+            captures = []
+
+            class FakeClient:
+                async def send_file(self, _channel, output, **kwargs):
+                    output_info = engine.ffprobe(Path(output))
+                    captures.append({
+                        "suffix": Path(output).suffix,
+                        "has_audio": output_info.has_audio,
+                        "has_video": output_info.has_video,
+                        "mime": kwargs.get("mime_type"),
+                        "attrs": kwargs.get("attributes"),
+                        "reply_to": kwargs.get("reply_to"),
+                    })
+                    return SimpleNamespace(id=991)
+
+                async def send_message(self, *args, **kwargs):
+                    raise AssertionError("Video with audio should not fail")
+
+            prepared = {
+                "job": {"source": message, "command": None, "profile": None,
+                        "target_mb": None, "rerun": False},
+                "msg": message,
+                "name": "classroom.mp4", "src": src, "info": info,
+                "started_at": 0.0, "download_seconds": 0.0,
+                "probe_seconds": 0.0, "error": None,
+            }
+            state = engine.default_state()
+            with patch.object(engine, "TMP_DIR", temp), \
+                 patch.object(engine, "STATE_PATH", temp / "state.json"), \
+                 patch.object(engine, "ERROR_LOG", temp / "error.log"):
+                result = asyncio.run(engine.process_job(
+                    FakeClient(), object(), state, prepared, False, 1, 1))
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(len(captures), 1)
+            self.assertEqual(captures[0]["suffix"], ".mp3")
+            self.assertEqual(captures[0]["mime"], "audio/mpeg")
+            self.assertTrue(captures[0]["has_audio"])
+            self.assertFalse(captures[0]["has_video"])
+            self.assertEqual(captures[0]["reply_to"], 777)
+            self.assertEqual(state["lineage"]["991"]["profile"], "AUDIO_CUSTOM")
+            self.assertEqual(state["lineage"]["991"]["media_settings"]["source"], "audio")
+            self.assertIn(777, state["processed_source_ids"])
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
+                         "Real FFmpeg is required")
+    def test_silent_video_is_not_uploaded_or_marked_processed_as_audio(self):
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            src = temp / "silent.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=10",
+                "-t", "0.8", "-c:v", "libx264", "-preset", "ultrafast", str(src),
+            ], check=True, timeout=30)
+            engine.apply_studio_settings(forms.collect_form_settings(
+                engine, {**FORM, "content_kind": "🎧 صوت فقط — حتى الفيديو يتحول لصوت"}))
+            msg = SimpleNamespace(
+                id=778, file=SimpleNamespace(name="silent.mp4", mime_type="video/mp4"),
+                video=True, voice=False, audio=False,
+            )
+            errors = []
+
+            class FakeClient:
+                async def send_file(self, *_args, **_kwargs):
+                    raise AssertionError("Silent video must never upload bogus audio")
+
+                async def send_message(self, _channel, text, **_kwargs):
+                    errors.append(text)
+
+            state = engine.default_state()
+            prepared = {
+                "job": {"source": msg, "command": None, "profile": None,
+                        "target_mb": None, "rerun": False},
+                "msg": msg, "name": "silent.mp4", "src": src,
+                "info": engine.ffprobe(src), "started_at": 0.0,
+                "download_seconds": 0.0, "probe_seconds": 0.0, "error": None,
+            }
+            with patch.object(engine, "TMP_DIR", temp), \
+                 patch.object(engine, "STATE_PATH", temp / "state.json"), \
+                 patch.object(engine, "ERROR_LOG", temp / "error.log"):
+                result = asyncio.run(engine.process_job(
+                    FakeClient(), object(), state, prepared, False, 1, 1))
+            self.assertFalse(result["ok"])
+            self.assertFalse(state["processed_source_ids"])
+            self.assertTrue(any("E412" in error for error in errors))
 
     def test_quick_presets_override_hidden_advanced_fields(self):
         chosen = {**FORM, "audio_preset": "أصغر حجم (8 kbps)",
