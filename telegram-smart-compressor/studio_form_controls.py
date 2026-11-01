@@ -25,7 +25,15 @@ VIDEO_PRESETS = {
     "أصغر حجم": "small",
     "أسرع معالجة": "fast",
 }
-CONTENT_KINDS = {"تلقائي": "auto", "صوت فقط": "audio", "فيديو فقط": "video"}
+# Display labels explain the *output*, not which input media are accepted.
+CONTENT_KINDS = {
+    "تلقائي": "auto",  # Compatibility with older saved notebooks.
+    "صوت فقط": "audio",
+    "فيديو فقط": "video",
+    "تلقائي — حسب الملف": "auto",
+    "🎧 صوت فقط — حتى الفيديو يتحول لصوت": "audio",
+    "🎬 فيديو — احتفظ بالصورة": "video",
+}
 AUDIO_CODECS = {"Opus / OGG": "opus", "AAC / M4A": "aac", "MP3": "mp3"}
 VIDEO_CODECS = {"H.264 (الأكثر توافقًا)": "h264", "H.265 (HEVC)": "h265"}
 RATE_MODES = {"جودة CRF": "quality", "Bitrate يدوي": "bitrate", "حجم مستهدف": "target"}
@@ -105,7 +113,12 @@ def pick_studio_settings(engine, source, values):
 def show_settings(settings, origin):
     """Compact text summary that works in Colab mobile and classic output."""
     print(f"📋 مصدر الإعدادات: {origin}")
-    print(f"🎯 المحتوى: {settings['source']} | Telegram: 6 اتصالات تنزيل")
+    output_labels = {
+        "auto": "تلقائي: الفيديو يفضل فيديو والصوت يفضل صوت",
+        "audio": "🎧 صوت فقط: أي فيديو يتحول لملف صوت من غير صورة",
+        "video": "🎬 فيديو: الحفاظ على الصورة في الملفات المرئية",
+    }
+    print(f"🎯 الناتج: {output_labels[settings['source']]} | Telegram: 6 اتصالات تنزيل")
     print(f"🎧 صوت: {settings['audio_codec'].upper()} | {settings['audio_kbps']} kbps | {settings['audio_channels']}")
     video_mode = settings["video_rate_mode"]
     video_quality = (
