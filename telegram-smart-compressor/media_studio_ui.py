@@ -6,6 +6,7 @@ user explicitly clicks Run. It only stores validated encoding preferences.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from html import escape
 
@@ -41,6 +42,7 @@ def show_studio(engine):
         }
 
     selected = engine.normalize_studio_settings(record["last_used"])
+    selected["download_connections"] = "6"  # temporarily fixed until benchmarking
     # Each widget owns an independent Layout. Sharing a Layout here makes
     # hiding one control accidentally hide unrelated controls (notably mobile).
     def wide_layout():
@@ -100,15 +102,8 @@ def show_studio(engine):
         style={"button_width": "120px"},
     )
     download_connections = w.Dropdown(
-        options=[
-            ("تلقائي حسب حجم الملف (السلوك الحالي)", "auto"),
-            ("6 اتصالات — اختبار مبدئي", "6"),
-            ("8 اتصالات — اختبار متوسط", "8"),
-            ("12 اتصال", "12"),
-            ("18 اتصال — مقارنة مع الصورة", "18"),
-            ("4 اتصالات — أقل ضغط", "4"),
-        ],
-        value=selected["download_connections"], description="عدد الاتصالات",
+        options=[("6 اتصالات — مثبت حاليًا", "6")],
+        value="6", disabled=True, description="تنزيل Telegram",
         layout=wide_layout(), style={"description_width": "115px"},
     )
     audio_presets = w.Dropdown(
@@ -236,9 +231,9 @@ def show_studio(engine):
     network_advanced = w.VBox([
         title_html(
             "⬇️ تنزيل Telegram — سرعة الاتصال",
-            "الاتصالات ليست عدد أجزاء الملف. التنزيل المتوازي متاح للملفات من 8 MiB. "
-            "ابدأ بمقارنة 6 و8 والعدد التلقائي على ملفات متقاربة؛ "
-            "الزيادة ليست ضمانًا لسرعة أعلى. ملفات Drive ↔ Telegram لها محرك منفصل."
+            "ثبّتنا تنزيل Telegram على 6 اتصالات للملفات من 8 MiB مؤقتًا. "
+            "ده غير حجم الأجزاء (512 KiB). المقارنة بين 6/8/18 هتبقى في اختبار لاحق؛ "
+            "خلايا نقل Drive ↔ Telegram ليها محرك مستقل."
         ),
         download_connections,
     ], layout=w.Layout(width="100%", padding="7px"))
@@ -320,7 +315,7 @@ def show_studio(engine):
         changing["presets"] = True
         try:
             for key, control in controls.items():
-                control.value = values[key]
+                control.value = "6" if key == "download_connections" else values[key]
         finally:
             changing["presets"] = False
         refresh()
