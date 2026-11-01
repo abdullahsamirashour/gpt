@@ -205,6 +205,32 @@ class StudioPreferencesTests(unittest.TestCase):
                     bitrate = next(item for item in audio_controls
                                    if getattr(item, "description", "") == "جودة الصوت")
 
+                    # Responsive UX regression: hiding video leaves audio visible.
+                    mode = next(item for item in dashboard.children
+                                if isinstance(item, widgets.ToggleButtons))
+                    quick_audio, quick_video = dashboard.children[4], dashboard.children[5]
+                    mode.value = "audio"
+                    self.assertNotEqual(quick_audio.layout.display, "none")
+                    self.assertEqual(quick_video.layout.display, "none")
+                    mode.value = "video"
+                    self.assertEqual(quick_audio.layout.display, "none")
+                    self.assertNotEqual(quick_video.layout.display, "none")
+                    mode.value = "auto"
+                    self.assertEqual(len(accordion.children), 2)
+
+                    video_widgets = accordion.children[1].children
+                    rate_mode = next(item for item in video_widgets
+                                     if isinstance(item, widgets.ToggleButtons))
+                    video_bitrate = next(item for item in video_widgets
+                                         if getattr(item, "description", "") == "Video kbps")
+                    video_crf = next(item for item in video_widgets
+                                     if getattr(item, "description", "") == "جودة CRF")
+                    rate_mode.value = "bitrate"
+                    self.assertNotEqual(video_bitrate.layout.display, "none")
+                    self.assertEqual(video_crf.layout.display, "none")
+                    self.assertNotEqual(codec.layout.display, "none")
+                    rate_mode.value = "quality"
+
                     codec.value = "mp3"
                     bitrate.value = 64
                     pin_button.click()
