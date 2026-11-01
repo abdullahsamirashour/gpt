@@ -1450,7 +1450,7 @@ def classify_video_complexity(src: Path, info: MediaInfo, timings=None) -> str:
     return "DETAIL"
 
 
-def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb: int | None, nvenc: bool, timings=None):
+def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb: int | None, nvenc: bool, timings=None, settings=None):
     if not info.has_video:
         raise AppError("E411", "هذا الملف لا يحتوي على فيديو.")
 
@@ -1461,6 +1461,88 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
         finally:
             if timings is not None:
                 timings["encode"] = timings.get("encode", 0.0) + (time.time() - started)
+
+    if profile == "VIDEO_CUSTOM":
+        studio = normalize_studio_settings(settings or STUDIO_FACTORY_SETTINGS)
+        # Preserve source aspect ratio, never upscale small source videos.
+        if studio["video_resolution"] == "source":
+            vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        else:
+            height = int(studio["video_resolution"])
+            max_width = {480: 854, 540: 960, 720: 1280, 1080: 1920}[height]
+            vf = (f"scale='min({max_width},iw)':'min({height},ih)':"
+                  "force_original_aspect_ratio=decrease:force_divisible_by=2")
+        fps_value = studio["video_fps"]
+        if fps_value == "auto":
+            complexity = classify_video_complexity(src, info, timings=timings)
+            fps_cap = {"STATIC": 12, "NORMAL": 15, "DETAIL": 18}[complexity]
+            print(f"🎞️ Smart FPS: {fps_cap} (تقدير حسب حركة الفيديو)")
+        elif fps_value == "source":
+            fps_cap = None
+        else:
+            fps_cap = int(fps_value)
+        if fps_cap:
+            fps_cap = min(float(fps_cap), info.fps) if info.fps > 0 else float(fps_cap)
+            vf += f",fps={fps_cap:.3f}"
+
+        audio_flags = (
+            ["-c:a", "aac", "-b:a", f"{studio['video_audio_kbps']}k"]
+            if info.has_audio else ["-an"]
+        )
+        base = ["ffmpeg", "-y", "-i", str(src), "-vf", vf]
+        tail = ["-pix_fmt", "yuv420p", *audio_flags, "-movflags", "+faststart", str(dst)]
+
+        if studio["video_rate_mode"] == "target":
+            if info.duration <= 0:
+                raise AppError("E413", "تعذر معرفة مدة الفيديو لحساب الحجم المستهدف.")
+            # libx264 two-pass gives a predictable approximate size; target
+            # mode deliberately does not use NVENC or HEVC.
+            target = int(studio["video_target_mb"])
+            kbps_total = (target * 1024 * 1024 * 8 / info.duration) / 1000
+            audio_k = studio["video_audio_kbps"] if info.has_audio else 0
+            video_k = int(kbps_total * 0.96 - audio_k)
+            if video_k < 100:
+                recommended = math.ceil(
+                    info.duration * (100 + audio_k) * 1000 / 8 / 1024 / 1024 / 0.96
+                )
+                raise AppError("E414", f"الحجم أصغر من الممكن بهذه الإعدادات. جرّب {recommended} MiB أو أكثر.")
+            passlog = str(TMP_DIR / f"studio_pass_{int(time.time() * 1000)}")
+            preset = {"fast": "veryfast", "balanced": "medium", "slow": "slow"}[studio["video_speed"]]
+            first = [*base, "-an", "-c:v", "libx264", "-preset", preset,
+                     "-b:v", f"{video_k}k", "-pass", "1",
+                     "-passlogfile", passlog, "-f", "null", os.devnull]
+            second = [*base, "-c:v", "libx264", "-preset", preset,
+                      "-b:v", f"{video_k}k", "-pass", "2",
+                      "-passlogfile", passlog, *tail]
+            try:
+                timed_run(first, "تحليل الحجم")
+                timed_run(second, "ضغط الفيديو")
+            finally:
+                for leftover in TMP_DIR.glob(Path(passlog).name + "*"):
+                    try:
+                        leftover.unlink()
+                    except FileNotFoundError:
+                        pass
+            return "STUDIO_TARGET"
+
+        codec = "libx264" if studio["video_codec"] == "h264" else "libx265"
+        preset = {"fast": "veryfast", "balanced": "medium", "slow": "slow"}[studio["video_speed"]]
+        crf = str(studio["video_crf"])
+        extra = ["-tag:v", "hvc1"] if studio["video_codec"] == "h265" else []
+        cpu = [*base, "-c:v", codec, "-preset", preset, "-crf", crf, *extra, *tail]
+        if nvenc:
+            gpu_codec = "h264_nvenc" if studio["video_codec"] == "h264" else "hevc_nvenc"
+            gpu_preset = {"fast": "p3", "balanced": "p4", "slow": "p6"}[studio["video_speed"]]
+            gpu = [*base, "-c:v", gpu_codec, "-preset", gpu_preset,
+                   "-rc", "vbr", "-cq", crf, "-b:v", "0", *extra, *tail]
+            try:
+                timed_run(gpu, "ضغط الفيديو GPU")
+                return "STUDIO_GPU"
+            except AppError:
+                print("↪️ GPU غير متوافق مع الإعدادات؛ هنرجع تلقائيًا لـCPU.")
+                dst.unlink(missing_ok=True)
+        timed_run(cpu, "ضغط الفيديو CPU")
+        return "STUDIO_CPU"
 
     if profile == "VIDEO_SMALLEST":
         vf = video_filter(info, 960, 540, 12)
