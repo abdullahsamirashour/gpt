@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.5.5"
+ENGINE_BUNDLE_VERSION = "5.5.6"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -73,6 +73,136 @@ PROFILE = PROFILE_FROM_UI.get(
     os.environ.get("TSC_PROFILE", "SMART_AUTO"),
 )
 TARGET_SIZE_TEXT = os.environ.get("TSC_TARGET_SIZE_MB", "").strip()
+
+# Studio UI preferences contain encoding options only (never Telegram credentials).
+# Legacy launchers intentionally keep their original behaviour unless the
+# interactive Studio explicitly calls apply_studio_settings().
+STUDIO_SETTINGS_VERSION = 1
+STUDIO_FACTORY_SETTINGS = {
+    "source": "auto",
+    "audio_preset": "speech",
+    "audio_codec": "opus",
+    "audio_kbps": 24,
+    "audio_channels": "mono",
+    "audio_sample_rate": "24000",
+    "audio_noise": "off",
+    "video_preset": "balanced",
+    "video_codec": "h264",
+    "video_resolution": "720",
+    "video_fps": "auto",
+    "video_crf": 28,
+    "video_bitrate_kbps": 1400,
+    "video_speed": "balanced",
+    "video_audio_kbps": 64,
+    "video_rate_mode": "quality",
+    "video_target_mb": 80,
+    "skip_if_no_saving": True,
+}
+STUDIO_AUDIO_PRESETS = {
+    "tiny": {"audio_codec": "opus", "audio_kbps": 8, "audio_channels": "mono", "audio_sample_rate": "12000", "audio_noise": "off"},
+    "speech": {"audio_codec": "opus", "audio_kbps": 24, "audio_channels": "mono", "audio_sample_rate": "24000", "audio_noise": "off"},
+    "clear": {"audio_codec": "opus", "audio_kbps": 32, "audio_channels": "mono", "audio_sample_rate": "48000", "audio_noise": "off"},
+    "music": {"audio_codec": "opus", "audio_kbps": 96, "audio_channels": "stereo", "audio_sample_rate": "48000", "audio_noise": "off"},
+}
+STUDIO_VIDEO_PRESETS = {
+    "balanced": {"video_codec": "h264", "video_resolution": "720", "video_fps": "auto", "video_crf": 28, "video_speed": "balanced", "video_audio_kbps": 64, "video_rate_mode": "quality"},
+    "presentation": {"video_codec": "h264", "video_resolution": "1080", "video_fps": "15", "video_crf": 24, "video_speed": "slow", "video_audio_kbps": 64, "video_rate_mode": "quality"},
+    "small": {"video_codec": "h264", "video_resolution": "540", "video_fps": "12", "video_crf": 32, "video_speed": "slow", "video_audio_kbps": 48, "video_rate_mode": "quality"},
+    "fast": {"video_codec": "h264", "video_resolution": "720", "video_fps": "24", "video_crf": 30, "video_speed": "fast", "video_audio_kbps": 64, "video_rate_mode": "quality"},
+}
+ACTIVE_STUDIO_SETTINGS = None
+
+
+def studio_settings_path():
+    return BASE_DIR / "Media_Lite_Studio" / "preferences_v1.json"
+
+
+def normalize_studio_settings(value):
+    """Strict, allowlisted validation; malformed Drive JSON cannot reach FFmpeg."""
+    if not isinstance(value, dict):
+        raise ValueError("إعدادات Studio يجب أن تكون كائنًا.")
+    result = dict(STUDIO_FACTORY_SETTINGS)
+    for key, item in value.items():
+        if key in result:
+            result[key] = item
+    allowed = {
+        "source": {"auto", "audio", "video"},
+        "audio_preset": set(STUDIO_AUDIO_PRESETS),
+        "audio_codec": {"opus", "aac", "mp3"},
+        "audio_channels": {"mono", "stereo"},
+        "audio_sample_rate": {"auto", "12000", "16000", "24000", "48000"},
+        "audio_noise": {"off", "light"},
+        "video_preset": set(STUDIO_VIDEO_PRESETS),
+        "video_codec": {"h264", "h265"},
+        "video_resolution": {"source", "480", "540", "720", "1080"},
+        "video_fps": {"auto", "source", "12", "15", "24", "30"},
+        "video_speed": {"fast", "balanced", "slow"},
+        "video_rate_mode": {"quality", "bitrate", "target"},
+    }
+    for key, choices in allowed.items():
+        if not isinstance(result[key], str) or result[key] not in choices:
+            raise ValueError(f"إعداد غير معروف أو غير مدعوم: {key}")
+    limits = {"audio_kbps": (8, 192), "video_crf": (18, 35),
+              "video_audio_kbps": (32, 192), "video_bitrate_kbps": (100, 20000),
+              "video_target_mb": (4, 4096)}
+    for key, (minimum, maximum) in limits.items():
+        val = result[key]
+        if isinstance(val, bool) or not isinstance(val, int) or not minimum <= val <= maximum:
+            raise ValueError(f"قيمة {key} يجب أن تكون من {minimum} إلى {maximum}.")
+    if not isinstance(result["skip_if_no_saving"], bool):
+        raise ValueError("skip_if_no_saving يجب أن تكون True أو False")
+    if result["audio_codec"] == "mp3" and result["audio_kbps"] < 32:
+        raise ValueError("MP3 يحتاج Bitrate لا يقل عن 32 kbps؛ استخدم Opus للأحجام الصغيرة.")
+    if result["video_rate_mode"] == "target" and result["video_codec"] != "h264":
+        raise ValueError("الحجم المستهدف متاح حاليًا مع H.264 فقط.")
+    return result
+
+
+def apply_studio_settings(settings):
+    global ACTIVE_STUDIO_SETTINGS
+    ACTIVE_STUDIO_SETTINGS = normalize_studio_settings(settings)
+    return dict(ACTIVE_STUDIO_SETTINGS)
+
+
+def load_studio_preferences():
+    path = studio_settings_path()
+    payload = load_json(path, {})
+    if not isinstance(payload, dict):
+        payload = {}
+    def safe(value):
+        try:
+            return normalize_studio_settings(value)
+        except (TypeError, ValueError):
+            return dict(STUDIO_FACTORY_SETTINGS)
+    return {
+        "version": STUDIO_SETTINGS_VERSION,
+        "default": safe(payload.get("default")),
+        "last_used": safe(payload.get("last_used") or payload.get("default")),
+        "last_saved_at": payload.get("last_saved_at"),
+        "default_saved_at": payload.get("default_saved_at"),
+    }
+
+
+def save_studio_preferences(settings, *, save_default=False):
+    """Autosave last-used only when Run is pressed; explicit pin saves default."""
+    approved = normalize_studio_settings(settings)
+    record = load_studio_preferences()
+    record["last_used"] = approved
+    record["last_saved_at"] = int(time.time())
+    if save_default:
+        record["default"] = dict(approved)
+        record["default_saved_at"] = record["last_saved_at"]
+    path = studio_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        temp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, path)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    return record
+
 
 
 class AppError(Exception):
@@ -1173,41 +1303,41 @@ def _encode_audio_once(
     stream_index: int,
     audio_filter: str,
     label: str,
+    settings=None,
 ):
+    codec_options = [
+        "-c:a", "libopus", "-b:a", "8k", "-ac", "1", "-ar", "12000",
+        "-application", "voip", "-frame_duration", "60",
+        "-compression_level", "0", "-vbr", "on",
+    ]
+    if settings is not None:
+        codec_map = {"opus": "libopus", "mp3": "libmp3lame", "aac": "aac"}
+        chosen = settings["audio_codec"]
+        codec_options = [
+            "-c:a", codec_map[chosen],
+            "-b:a", f"{settings['audio_kbps']}k",
+            "-ac", "1" if settings["audio_channels"] == "mono" else "2",
+        ]
+        if settings["audio_sample_rate"] != "auto":
+            codec_options.extend(["-ar", settings["audio_sample_rate"]])
+        if chosen == "opus":
+            codec_options.extend([
+                "-application", "audio" if settings["audio_preset"] == "music" else "voip",
+                "-frame_duration", "60" if settings["audio_preset"] == "tiny" else "20",
+                "-compression_level", "6", "-vbr", "on",
+            ])
+        if settings["audio_noise"] == "light":
+            audio_filter += ",afftdn=nr=10"
+
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(src),
-        "-map",
-        f"0:{stream_index}",
-        "-vn",
-        "-sn",
-        "-dn",
-        "-af",
-        audio_filter,
-        "-c:a",
-        "libopus",
-        "-b:a",
-        "8k",
-        "-ac",
-        "1",
-        "-ar",
-        "12000",
-        "-application",
-        "voip",
-        "-frame_duration",
-        "60",
-        "-compression_level",
-        "0",
-        "-vbr",
-        "on",
-        str(dst),
+        "ffmpeg", "-y", "-i", str(src), "-map", f"0:{stream_index}",
+        "-vn", "-sn", "-dn", "-af", audio_filter,
+        *codec_options, str(dst),
     ]
     run_ffmpeg(cmd, info.duration, label)
 
 
-def encode_audio(src: Path, dst: Path, info: MediaInfo):
+def encode_audio(src: Path, dst: Path, info: MediaInfo, settings=None):
     if not info.has_audio:
         raise AppError("E412", "هذا الفيديو لا يحتوي على مسار صوتي يمكن ضغطه.")
 
@@ -1219,6 +1349,7 @@ def encode_audio(src: Path, dst: Path, info: MediaInfo):
         stream["index"],
         "aresample=async=1:first_pts=0",
         "ضغط الصوت",
+        settings=settings,
     )
     output_peak = _audio_output_peak(dst)
     if output_peak > -70.0:
@@ -1246,6 +1377,7 @@ def encode_audio(src: Path, dst: Path, info: MediaInfo):
                 stream["index"],
                 f"pan=mono|c0=c{channel},aresample=async=1:first_pts=0",
                 "إصلاح قناة الصوت",
+                settings=settings,
             )
             retry_peak = _audio_output_peak(dst)
             if retry_peak > -70.0:
@@ -1320,7 +1452,7 @@ def classify_video_complexity(src: Path, info: MediaInfo, timings=None) -> str:
     return "DETAIL"
 
 
-def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb: int | None, nvenc: bool, timings=None):
+def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb: int | None, nvenc: bool, timings=None, settings=None):
     if not info.has_video:
         raise AppError("E411", "هذا الملف لا يحتوي على فيديو.")
 
@@ -1331,6 +1463,99 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
         finally:
             if timings is not None:
                 timings["encode"] = timings.get("encode", 0.0) + (time.time() - started)
+
+    if profile == "VIDEO_CUSTOM":
+        studio = normalize_studio_settings(settings or STUDIO_FACTORY_SETTINGS)
+        # Preserve source aspect ratio, never upscale small source videos.
+        if studio["video_resolution"] == "source":
+            vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        else:
+            height = int(studio["video_resolution"])
+            max_width = {480: 854, 540: 960, 720: 1280, 1080: 1920}[height]
+            vf = (f"scale='min({max_width},iw)':'min({height},ih)':"
+                  "force_original_aspect_ratio=decrease:force_divisible_by=2")
+        fps_value = studio["video_fps"]
+        if fps_value == "auto":
+            complexity = classify_video_complexity(src, info, timings=timings)
+            fps_cap = {"STATIC": 12, "NORMAL": 15, "DETAIL": 18}[complexity]
+            print(f"🎞️ Smart FPS: {fps_cap} (تقدير حسب حركة الفيديو)")
+        elif fps_value == "source":
+            fps_cap = None
+        else:
+            fps_cap = int(fps_value)
+        if fps_cap:
+            fps_cap = min(float(fps_cap), info.fps) if info.fps > 0 else float(fps_cap)
+            vf += f",fps={fps_cap:.3f}"
+
+        audio_flags = (
+            ["-c:a", "aac", "-b:a", f"{studio['video_audio_kbps']}k"]
+            if info.has_audio else ["-an"]
+        )
+        base = ["ffmpeg", "-y", "-i", str(src), "-vf", vf]
+        tail = ["-pix_fmt", "yuv420p", *audio_flags, "-movflags", "+faststart", str(dst)]
+
+        if studio["video_rate_mode"] == "target":
+            if info.duration <= 0:
+                raise AppError("E413", "تعذر معرفة مدة الفيديو لحساب الحجم المستهدف.")
+            # libx264 two-pass gives a predictable approximate size; target
+            # mode deliberately does not use NVENC or HEVC.
+            target = int(studio["video_target_mb"])
+            kbps_total = (target * 1024 * 1024 * 8 / info.duration) / 1000
+            audio_k = studio["video_audio_kbps"] if info.has_audio else 0
+            video_k = int(kbps_total * 0.96 - audio_k)
+            if video_k < 100:
+                recommended = math.ceil(
+                    info.duration * (100 + audio_k) * 1000 / 8 / 1024 / 1024 / 0.96
+                )
+                raise AppError("E414", f"الحجم أصغر من الممكن بهذه الإعدادات. جرّب {recommended} MiB أو أكثر.")
+            passlog = str(TMP_DIR / f"studio_pass_{int(time.time() * 1000)}")
+            preset = {"fast": "veryfast", "balanced": "medium", "slow": "slow"}[studio["video_speed"]]
+            first = [*base, "-an", "-c:v", "libx264", "-preset", preset,
+                     "-b:v", f"{video_k}k", "-pass", "1",
+                     "-passlogfile", passlog, "-f", "null", os.devnull]
+            second = [*base, "-c:v", "libx264", "-preset", preset,
+                      "-b:v", f"{video_k}k", "-pass", "2",
+                      "-passlogfile", passlog, *tail]
+            try:
+                timed_run(first, "تحليل الحجم")
+                timed_run(second, "ضغط الفيديو")
+            finally:
+                for leftover in TMP_DIR.glob(Path(passlog).name + "*"):
+                    try:
+                        leftover.unlink()
+                    except FileNotFoundError:
+                        pass
+            return "STUDIO_TARGET"
+
+        codec = "libx264" if studio["video_codec"] == "h264" else "libx265"
+        preset = {"fast": "veryfast", "balanced": "medium", "slow": "slow"}[studio["video_speed"]]
+        crf = str(studio["video_crf"])
+        extra = ["-tag:v", "hvc1"] if studio["video_codec"] == "h265" else []
+        if studio["video_rate_mode"] == "bitrate":
+            kbps = studio["video_bitrate_kbps"]
+            rate_flags = ["-b:v", f"{kbps}k", "-maxrate", f"{int(kbps * 1.3)}k",
+                          "-bufsize", f"{kbps * 2}k"]
+        else:
+            rate_flags = ["-crf", crf]
+        cpu = [*base, "-c:v", codec, "-preset", preset, *rate_flags, *extra, *tail]
+        if nvenc:
+            gpu_codec = "h264_nvenc" if studio["video_codec"] == "h264" else "hevc_nvenc"
+            gpu_preset = {"fast": "p3", "balanced": "p4", "slow": "p6"}[studio["video_speed"]]
+            gpu_rate = (
+                ["-rc", "vbr", "-b:v", f"{studio['video_bitrate_kbps']}k"]
+                if studio["video_rate_mode"] == "bitrate" else
+                ["-rc", "vbr", "-cq", crf, "-b:v", "0"]
+            )
+            gpu = [*base, "-c:v", gpu_codec, "-preset", gpu_preset,
+                   *gpu_rate, *extra, *tail]
+            try:
+                timed_run(gpu, "ضغط الفيديو GPU")
+                return "STUDIO_GPU"
+            except AppError:
+                print("↪️ GPU غير متوافق مع الإعدادات؛ هنرجع تلقائيًا لـCPU.")
+                dst.unlink(missing_ok=True)
+        timed_run(cpu, "ضغط الفيديو CPU")
+        return "STUDIO_CPU"
 
     if profile == "VIDEO_SMALLEST":
         vf = video_filter(info, 960, 540, 12)
@@ -1495,6 +1720,11 @@ def looks_like_generated_output(msg):
 def resolve_profile(msg, explicit=None):
     if explicit:
         return explicit
+    if ACTIVE_STUDIO_SETTINGS is not None:
+        selected = ACTIVE_STUDIO_SETTINGS["source"]
+        if selected == "audio" or (selected == "auto" and message_media_kind(msg) != "video"):
+            return "AUDIO_CUSTOM"
+        return "VIDEO_CUSTOM"
     if PROFILE == "SMART_AUTO":
         return "VIDEO_BALANCED" if message_media_kind(msg) == "video" else "AUDIO_TINY"
     return PROFILE
@@ -1881,29 +2111,61 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
     version = int(parent_lineage.get("version", 0)) + 1
 
     try:
-        profile = resolve_profile(msg, job["profile"])
+        # "1" must replay the original output settings, not today's dashboard.
+        studio_for_job = ACTIVE_STUDIO_SETTINGS
+        replay_profile = None
+        if job["rerun"]:
+            if job["profile"] is None:
+                saved_studio = parent_lineage.get("media_settings")
+                if isinstance(saved_studio, dict):
+                    try:
+                        studio_for_job = normalize_studio_settings(saved_studio)
+                    except ValueError:
+                        studio_for_job = None
+                else:
+                    studio_for_job = None
+                    replay_profile = parent_lineage.get("profile")
+            else:
+                # Commands 2, 3 and numeric size explicitly override the saved profile.
+                studio_for_job = None
+
+        profile = replay_profile or resolve_profile(msg, job["profile"])
+        if studio_for_job is not None and job["profile"] is None:
+            wanted = studio_for_job["source"]
+            profile = ("AUDIO_CUSTOM" if wanted == "audio"
+                       or (wanted == "auto" and message_media_kind(msg) != "video")
+                       else "VIDEO_CUSTOM")
         target_mb = job["target_mb"]
         if profile == "VIDEO_TARGET_SIZE" and target_mb is None:
-            target_mb = target_size_from_ui()
+            target_mb = (
+                parent_lineage.get("target_mb")
+                if job["rerun"] and job["profile"] is None else None
+            ) or target_size_from_ui()
 
         if profile.startswith("VIDEO_") and not info.has_video:
-            print("ℹ️ الملف صوتي؛ هنستخدم ضغط الصوت.")
-            profile = "AUDIO_TINY"
+            print("ℹ️ الملف صوتي؛ هنستخدم إعدادات الصوت.")
+            profile = "AUDIO_CUSTOM" if studio_for_job is not None else "AUDIO_TINY"
 
-        if profile == "AUDIO_TINY":
-            dst = TMP_DIR / f"{src.stem}_compressed.ogg"
-            label = "صوت صغير جدًا"
+        if profile in ("AUDIO_TINY", "AUDIO_CUSTOM"):
+            selected_audio = studio_for_job if profile == "AUDIO_CUSTOM" else None
+            suffix = {"opus": ".ogg", "aac": ".m4a", "mp3": ".mp3"}[
+                selected_audio["audio_codec"] if selected_audio else "opus"
+            ]
+            dst = TMP_DIR / f"{src.stem}_compressed{suffix}"
+            label = ("صوت صغير جدًا" if selected_audio is None else
+                     f"صوت • {selected_audio['audio_codec'].upper()} "
+                     f"{selected_audio['audio_kbps']} kbps")
             print(f"🎧 {label}")
 
             encode_started = time.time()
             try:
-                encode_audio(src, dst, info)
+                encode_audio(src, dst, info, settings=selected_audio)
             finally:
                 timings["encode"] += time.time() - encode_started
 
             out_info = ffprobe(dst)
 
-            if dst.stat().st_size >= src.stat().st_size * 0.98:
+            if (selected_audio is None or selected_audio["skip_if_no_saving"]) and dst.stat().st_size >= src.stat().st_size * 0.98:
                 raise AppError("E430", "الملف مضغوط بالفعل تقريبًا؛ إعادة الضغط مش هتوفر مساحة مفيدة.")
 
             title = Path(name).stem[:60]
@@ -1931,7 +2193,9 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
                     f"{human_size(original_size)} → {human_size(final_size)} • وفر {saved_pct:.0f}%"
                 ),
                 attributes=attrs,
-                mime_type="audio/ogg",
+                mime_type={"opus": "audio/ogg", "aac": "audio/mp4", "mp3": "audio/mpeg"}[
+                    selected_audio["audio_codec"] if selected_audio else "opus"
+                ],
                 voice_note=False,
                 force_document=False,
                 reply_to=msg.id,
@@ -1947,14 +2211,20 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
                 "VIDEO_FAST": "فيديو سريع",
                 "VIDEO_SMALLEST": "أصغر حجم",
                 "VIDEO_TARGET_SIZE": f"حجم مستهدف {target_mb} MB",
+                "VIDEO_CUSTOM": (
+                    f"حجم مستهدف {studio_for_job['video_target_mb']} MiB"
+                    if studio_for_job["video_rate_mode"] == "target" else
+                    f"فيديو • {studio_for_job['video_codec'].upper()} "
+                    f"CRF {studio_for_job['video_crf']}"
+                ) if studio_for_job is not None else "فيديو متقدم",
             }
             label = labels.get(profile, profile)
             print(f"🎬 {label}")
             if profile in ("VIDEO_BALANCED", "VIDEO_FAST") and nvenc:
                 print("⚡ كارت الشاشة متاح للترميز.")
 
-            encode_video(src, dst, info, profile, target_mb, nvenc, timings=timings)
-            if dst.stat().st_size >= src.stat().st_size * 0.98:
+            encode_video(src, dst, info, profile, target_mb, nvenc, timings=timings, settings=studio_for_job)
+            if (studio_for_job is None or studio_for_job["skip_if_no_saving"]) and dst.stat().st_size >= src.stat().st_size * 0.98:
                 raise AppError("E430", "الملف مضغوط بالفعل تقريبًا؛ إعادة الضغط مش هتوفر مساحة مفيدة.")
 
             out_info = ffprobe(dst)
@@ -1999,6 +2269,8 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
             "parent_id": int(msg.id),
             "version": version,
             "profile": profile,
+            "target_mb": target_mb if profile == "VIDEO_TARGET_SIZE" else None,
+            "media_settings": dict(studio_for_job) if studio_for_job is not None and profile in ("AUDIO_CUSTOM", "VIDEO_CUSTOM") else None,
             "created_at": int(time.time()),
         }
 
@@ -2280,5 +2552,5 @@ def run():
                 show_log_controls(log_path)
 
 
-if os.environ.get("TSC_TEST_MODE") != "1":
+if os.environ.get("TSC_TEST_MODE") != "1" and os.environ.get("TSC_UI_ONLY") != "1":
     run()
