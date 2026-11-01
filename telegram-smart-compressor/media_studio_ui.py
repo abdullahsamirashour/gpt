@@ -395,6 +395,7 @@ def show_studio(engine):
                 clear_output(wait=True)
                 print("🗜️ Media Lite Studio — الإعدادات الحالية محفوظة على Drive.")
                 engine.run()
+            display_status("✓ انتهى تشغيل المحرك. راجع نتائج الملفات والأخطاء — إن وُجدت — في سجل التشغيل أدناه.")
         except Exception as exc:
             display_status("حدث خطأ أثناء التشغيل: " + str(exc), False)
         finally:
