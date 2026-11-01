@@ -4,6 +4,8 @@ import importlib.util
 import json
 import os
 import sys
+import shutil
+import subprocess
 import tempfile
 import types
 import unittest
@@ -220,6 +222,52 @@ class StudioPreferencesTests(unittest.TestCase):
                     self.assertEqual(bitrate.value, 64)
             finally:
                 engine.BASE_DIR = original_base
+
+
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg unavailable")
+    def test_real_ffmpeg_media_studio_encode_smoke(self):
+        """Encode short synthetic media without cloud or Telegram credentials."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=15",
+                "-f", "lavfi", "-i", "sine=frequency=750:sample_rate=44100",
+                "-t", "1.3", "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac", "-b:a", "96k", str(source),
+            ], check=True, timeout=30)
+            info = engine.ffprobe(source)
+            self.assertTrue(info.has_video and info.has_audio)
+
+            for codec, suffix, kbps in (
+                ("opus", ".ogg", 24), ("aac", ".m4a", 64), ("mp3", ".mp3", 64)
+            ):
+                settings = engine.normalize_studio_settings({
+                    "audio_codec": codec,
+                    "audio_kbps": kbps,
+                    "audio_sample_rate": "24000",
+                })
+                dst = root / ("audio-" + codec + suffix)
+                engine.encode_audio(source, dst, info, settings=settings)
+                self.assertTrue(dst.exists() and dst.stat().st_size > 300)
+                self.assertTrue(engine.ffprobe(dst).has_audio)
+
+            options = engine.normalize_studio_settings({
+                "video_rate_mode": "bitrate",
+                "video_bitrate_kbps": 700,
+                "video_resolution": "480",
+                "video_fps": "15",
+            })
+            output = root / "advanced-video.mp4"
+            with patch.object(engine, "TMP_DIR", root):
+                result = engine.encode_video(
+                    source, output, info, "VIDEO_CUSTOM", None, False, settings=options
+                )
+            self.assertEqual(result, "STUDIO_CPU")
+            self.assertTrue(output.exists() and output.stat().st_size > 500)
+            self.assertTrue(engine.ffprobe(output).has_video)
 
 
 if __name__ == "__main__":
