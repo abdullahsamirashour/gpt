@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.5.6"
+ENGINE_BUNDLE_VERSION = "5.5.7"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -1190,7 +1190,7 @@ async def download_media_fast(client, msg, path: Path):
                   f"{elapsed:.1f}s")
             return str(path), "turbo", elapsed
 
-        except Exception:
+        except Exception as exc:
             try:
                 if downloader is not None and getattr(downloader, "senders", None):
                     await downloader._cleanup()
@@ -1200,7 +1200,7 @@ async def download_media_fast(client, msg, path: Path):
                 path.unlink()
             except FileNotFoundError:
                 pass
-            if type(sys.exc_info()[1]).__name__ in ("FloodWaitError", "FloodPremiumWaitError"):
+            if type(exc).__name__ in ("FloodWaitError", "FloodPremiumWaitError"):
                 print("⏸️ Telegram طلب الانتظار. لن نعيد التحميل فورًا حتى لا نزيد الحظر.")
                 raise
             print("↪️ تعذر التنزيل السريع؛ هنكمل تلقائيًا بالطريقة العادية.")
