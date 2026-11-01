@@ -971,8 +971,9 @@ class LiveProgress:
         self.last_current = 0.0
         self.speed = 0.0
         self.last_render = 0.0
-        self.handle = None
+        self.widget = None
         self.terminal_started = False
+        self._fallback_bucket = -1
 
     def _metrics(self, current, total, speed_override=None):
         total = float(total or 0)
@@ -987,7 +988,7 @@ class LiveProgress:
         else:
             eta = (total - current) / self.speed if total > current and self.speed > 0 else 0
             detail = f"{human_size(int(current))} / {human_size(int(total))}"
-            speed_text = f"{self.speed / 1024 / 1024:.1f} MB/s" if self.speed > 0 else "..."
+            speed_text = f"{self.speed / 1024 / 1024:.1f} MiB/s" if self.speed > 0 else "..."
 
         eta_text = _format_duration(eta) if eta > 0 else "..."
         return pct, detail, speed_text, eta_text
@@ -1027,16 +1028,24 @@ class LiveProgress:
         pct, detail, speed_text, eta_text = self._metrics(current, total, speed_override)
 
         try:
-            from IPython.display import HTML, display
-            card = HTML(self._card(pct, detail, speed_text, eta_text))
-            if self.handle is None:
-                self.handle = display(card, display_id=True)
+            import ipywidgets as widgets
+            from IPython.display import display
+            markup = self._card(pct, detail, speed_text, eta_text)
+            if self.widget is None:
+                widget = widgets.HTML(value=markup, layout=widgets.Layout(width="100%"))
+                display(widget)
+                self.widget = widget
             else:
-                self.handle.update(card)
+                self.widget.value = markup
         except Exception:
-            line = f"{self.icon} {self.label} — {pct:.1f}% • {detail} • {speed_text} • باقي {eta_text}"
-            print("\r" + line + " " * 8, end="", flush=True)
-            self.terminal_started = True
+            # Colab mobile may not coalesce carriage-return output. Bound the
+            # text-only fallback to 10% milestones instead of hundreds of cards.
+            bucket = max(0, min(10, int(pct // 10)))
+            if bucket > self._fallback_bucket or pct >= 100:
+                line = f"{self.icon} {self.label} — {pct:.1f}% • {detail} • {speed_text} • باقي {eta_text}"
+                print(line, flush=True)
+                self.terminal_started = True
+                self._fallback_bucket = bucket
 
     def callback(self, *args, **kwargs):
         current = kwargs.get("done")
@@ -1053,7 +1062,7 @@ class LiveProgress:
 
         if self.mode == "bytes":
             avg_speed = total / elapsed if total > 0 else 0.0
-            speed_text = f"{avg_speed / 1024 / 1024:.1f} MB/s" if avg_speed > 0 else "..."
+            speed_text = f"{avg_speed / 1024 / 1024:.1f} MiB/s" if avg_speed > 0 else "..."
         else:
             avg_x = speed_override if speed_override and speed_override > 0 else (
                 total / elapsed if total > 0 else 0.0
@@ -1070,14 +1079,15 @@ class LiveProgress:
         )
 
         try:
-            from IPython.display import HTML, display
-            if self.handle is None:
-                self.handle = display(HTML(compact), display_id=True)
+            import ipywidgets as widgets
+            from IPython.display import display
+            if self.widget is None:
+                widget = widgets.HTML(value=compact, layout=widgets.Layout(width="100%"))
+                display(widget)
+                self.widget = widget
             else:
-                self.handle.update(HTML(compact))
+                self.widget.value = compact
         except Exception:
-            if self.terminal_started:
-                print()
             print(f"✅ {self.label} — {_format_duration(elapsed)} • {speed_text}")
 
         return elapsed
