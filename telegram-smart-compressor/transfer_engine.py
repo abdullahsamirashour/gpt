@@ -1019,6 +1019,192 @@ async def transfer_drive_to_telegram(
     return counters
 
 
+# Telegram -> Drive: use independent MTProto download connections for files
+# >= 5 MiB, and keep Telethon's native path as the safe fallback.
+TG_PARALLEL_MIN_BYTES = 5 * 1024 * 1024
+TG_PARALLEL_CONNECTIONS = 4
+TG_PARALLEL_PART_BYTES = 512 * 1024
+
+
+class TelegramParallelDownloader:
+    """One file at a time, using independent MTProto senders and offset writes.
+
+    This uses Telethon 1.45's private sender API, so callers must preserve a
+    normal download_media fallback for version differences and RPC errors.
+    """
+
+    def __init__(self, client):
+        self.client = client
+        self.foreign_keys = {}  # Memory-only DC auth cache; never persist auth keys.
+
+    @staticmethod
+    def supported(client):
+        required = ("_get_dc", "_connection", "_call", "_log", "_proxy",
+                    "_init_request", "_borrow_sender_lock", "session")
+        return hasattr(os, "pwrite") and all(hasattr(client, key) for key in required)
+
+    async def _connect_one(self, dc_id, auth_key, opened=None):
+        from telethon.network import MTProtoSender
+        dc = await self.client._get_dc(dc_id)
+        sender = MTProtoSender(auth_key, loggers=self.client._log)
+        try:
+            await sender.connect(self.client._connection(
+                dc.ip_address, dc.port, dc.id,
+                loggers=self.client._log, proxy=self.client._proxy,
+                local_addr=getattr(self.client, "_local_addr", None),
+            ))
+            if opened is not None:
+                opened.append(sender)
+            return sender
+        except BaseException:
+            await sender.disconnect()
+            raise
+
+    async def _connect_many(self, dc_id, auth_key, amount, opened):
+        results = await asyncio.gather(
+            *(self._connect_one(dc_id, auth_key, opened) for _ in range(amount)),
+            return_exceptions=True,
+        )
+        errors = [item for item in results if isinstance(item, BaseException)]
+        if errors:
+            raise errors[0]
+
+    async def _senders(self, dc_id, opened):
+        from telethon.tl.alltlobjects import LAYER
+        from telethon.tl.functions import InvokeWithLayerRequest
+        from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
+
+        home_dc = self.client.session.dc_id
+        target_dc = dc_id or home_dc
+        if target_dc == home_dc:
+            await self._connect_many(target_dc, self.client.session.auth_key,
+                                     TG_PARALLEL_CONNECTIONS, opened)
+            return
+
+        key = self.foreign_keys.get(target_dc)
+        if key is None:
+            first = await self._connect_one(target_dc, None, opened)
+            async with self.client._borrow_sender_lock:
+                original_query = self.client._init_request.query
+                try:
+                    exported = await self.client(ExportAuthorizationRequest(target_dc))
+                    self.client._init_request.query = ImportAuthorizationRequest(
+                        id=exported.id, bytes=exported.bytes)
+                    await first.send(InvokeWithLayerRequest(LAYER, self.client._init_request))
+                finally:
+                    self.client._init_request.query = original_query
+            key = first.auth_key
+            self.foreign_keys[target_dc] = key
+            extra = TG_PARALLEL_CONNECTIONS - 1
+        else:
+            extra = TG_PARALLEL_CONNECTIONS
+        if extra:
+            await self._connect_many(target_dc, key, extra, opened)
+
+    @staticmethod
+    def _write_all(fd, chunk, offset):
+        view = memoryview(chunk)
+        done = 0
+        while done < len(view):
+            wrote = os.pwrite(fd, view[done:], offset + done)
+            if wrote <= 0:
+                raise OSError("Telegram parallel download: zero-byte disk write")
+            done += wrote
+
+    async def download(self, message, path: Path, expected_size: int, progress) -> None:
+        from telethon import utils
+        from telethon.tl.functions.upload import GetFileRequest
+        if not self.supported(self.client):
+            raise RuntimeError("Telethon parallel sender API unavailable")
+        dc_id, location = utils.get_input_location(message)
+        senders = []
+        fd = -1
+        tasks = []
+        downloaded = 0
+        stride = TG_PARALLEL_CONNECTIONS * TG_PARALLEL_PART_BYTES
+        try:
+            await self._senders(dc_id, senders)
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY |
+                         getattr(os, "O_NOFOLLOW", 0), 0o600)
+            os.ftruncate(fd, expected_size)
+
+            async def worker(index, sender):
+                nonlocal downloaded
+                for offset in range(index * TG_PARALLEL_PART_BYTES, expected_size, stride):
+                    packet = await self.client._call(sender, GetFileRequest(
+                        location, offset=offset, limit=TG_PARALLEL_PART_BYTES))
+                    data = packet.bytes
+                    required = min(TG_PARALLEL_PART_BYTES, expected_size - offset)
+                    if len(data) != required:
+                        raise IOError(f"Telegram part {offset}: received {len(data)}, expected {required}")
+                    self._write_all(fd, data, offset)
+                    downloaded += required
+                    progress(downloaded, expected_size)
+
+            tasks = [asyncio.create_task(worker(i, sender))
+                     for i, sender in enumerate(senders)]
+            await asyncio.gather(*tasks)
+            if downloaded != expected_size or path.stat().st_size != expected_size:
+                raise IOError("Telegram parallel download size/coverage mismatch")
+            os.fsync(fd)
+        except BaseException:
+            if dc_id is not None and dc_id != self.client.session.dc_id:
+                self.foreign_keys.pop(dc_id, None)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if fd != -1:
+                os.close(fd)
+                fd = -1
+            path.unlink(missing_ok=True)
+            raise
+        finally:
+            if fd != -1:
+                os.close(fd)
+            for sender in senders:
+                try:
+                    await sender.disconnect()
+                except Exception:
+                    pass
+
+
+async def fetch_telegram_message(client, channel, msg, local: Path, size: int, downloader) -> None:
+    """Try parallel MTProto for files >=5 MiB; safely fall back to Telethon."""
+    started = time.monotonic()
+    title = f"⬇️ Telegram: {local.name}"
+    mode = "عادي"
+    completed = False
+    if downloader is not None and size >= TG_PARALLEL_MIN_BYTES:
+        print(f"⚡ Parallel Telegram: 4 اتصالات × 512 KiB — {local.name}")
+        try:
+            await downloader.download(msg, local, size, Progress(title))
+            completed = True
+            mode = "متوازي"
+        except Exception as exc:
+            # Never immediately retry a rate-limited transfer through another path.
+            if type(exc).__name__ in ("FloodWaitError", "FloodPremiumWaitError"):
+                raise
+            local.unlink(missing_ok=True)
+            print(f"↩️ تعذر التنزيل المتوازي ({type(exc).__name__})؛ الرجوع للتنزيل العادي.")
+            if type(exc).__name__ in ("FileReferenceExpiredError", "FileReferenceEmptyError"):
+                try:
+                    refreshed = await client.get_messages(channel, ids=msg.id)
+                    if refreshed and getattr(refreshed, "file", None):
+                        msg = refreshed
+                except Exception:
+                    pass
+
+    if not completed:
+        got = await client.download_media(msg, file=str(local), progress_callback=Progress(title))
+        if not got:
+            raise RuntimeError("تنزيل Telegram لم يُرجع ملفًا.")
+    if not local.exists() or local.stat().st_size != size:
+        raise RuntimeError("تنزيل Telegram غير مكتمل أو حجمه غير مطابق.")
+    elapsed = max(time.monotonic() - started, 0.001)
+    print(f"⏱️ Telegram {mode}: {elapsed:.1f} ثانية — {size / elapsed / (1024 * 1024):.2f} MiB/s")
+
+
 async def transfer_telegram_to_drive(
     client, channel, service, state: dict, folder_id: str, max_files: int, preview: bool,
 ) -> dict:
@@ -1050,6 +1236,8 @@ async def transfer_telegram_to_drive(
     folder_cache = {}
     source_name = clean_filename(getattr(channel, "title", "") or "Telegram")
     dst_folder = ensure_child_folder(service, folder_id, source_name, folder_cache)
+    downloader = TelegramParallelDownloader(client) if TelegramParallelDownloader.supported(client) else None
+    print("⚡ Telegram parallel download: من 5 MiB، أربع اتصالات؛ fallback تلقائي.")
     for index, msg in enumerate(jobs, 1):
         key = origin_key(peer_id, int(msg.id))
         size = int(getattr(msg.file, "size", 0) or 0)
@@ -1069,10 +1257,7 @@ async def transfer_telegram_to_drive(
                 raise OSError("مساحة Colab غير كافية؛ لم يبدأ تنزيل الملف.")
             with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as td:
                 local = Path(td) / name
-                progress = Progress(f"⬇️ Telegram [{index}/{len(jobs)}] {name}")
-                got = await client.download_media(msg, file=str(local), progress_callback=progress)
-                if not got or not local.exists() or local.stat().st_size != size:
-                    raise RuntimeError("تنزيل Telegram غير مكتمل أو حجمه غير مطابق.")
+                await fetch_telegram_message(client, channel, msg, local, size, downloader)
                 uploaded = await asyncio.to_thread(upload_drive_file, service, local, dst_folder, name, key)
                 records[key] = {"drive_id": uploaded["id"], "size": size, "name": name}
                 save_json(STATE_PATH, state)
