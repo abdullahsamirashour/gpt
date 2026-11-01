@@ -170,6 +170,41 @@ class StudioPreferencesTests(unittest.TestCase):
 
 
 
+
+    def test_download_connection_count_is_configurable_and_legacy_auto_is_unchanged(self):
+        size = int(87.9 * 1024**2)
+        self.assertEqual(engine.transfer_connection_count(size), 18)
+        self.assertEqual(engine.normalize_studio_settings({})["download_connections"], "auto")
+        engine.apply_studio_settings({"download_connections": "6"})
+        self.assertEqual(engine.transfer_connection_count(size), 6)
+        engine.apply_studio_settings({"download_connections": "8"})
+        self.assertEqual(engine.transfer_connection_count(size), 8)
+        engine.apply_studio_settings({"download_connections": "18"})
+        self.assertEqual(engine.transfer_connection_count(size), 18)
+        engine.apply_studio_settings({"download_connections": "auto"})
+        self.assertEqual(engine.transfer_connection_count(size), 18)
+        with self.assertRaises(ValueError):
+            engine.normalize_studio_settings({"download_connections": "999"})
+
+    def test_single_progress_html_widget_is_updated_in_place(self):
+        import ipywidgets as widgets
+        with patch("IPython.display.display") as display:
+            progress = engine.LiveProgress("تنزيل", "⬇️")
+            progress.update(10, 100, force=True)
+            self.assertEqual(display.call_count, 1)
+            widget = display.call_args.args[0]
+            self.assertIsInstance(widget, widgets.HTML)
+            self.assertIn("10.0%", widget.value)
+            progress.update(45, 100, force=True)
+            progress.update(75, 100, force=True)
+            self.assertIn("75.0%", widget.value)
+            self.assertEqual(display.call_count, 1)
+            progress.finish(100)
+            self.assertIn("✅", widget.value)
+            self.assertEqual(display.call_count, 1)
+            self.assertIs(progress.widget, widget)
+
+
     def test_interactive_ui_can_pin_run_and_restore_settings(self):
         """Widget buttons actually persist last-used and pinned-default separately."""
         import ipywidgets as widgets
@@ -198,7 +233,7 @@ class StudioPreferencesTests(unittest.TestCase):
                         if isinstance(item, widgets.Accordion)
                     )
                     self.assertEqual(accordion.selected_index, None)
-                    self.assertEqual(len(accordion.children), 2)
+                    self.assertEqual(len(accordion.children), 3)
                     audio_controls = accordion.children[0].children
                     codec = next(item for item in audio_controls
                                  if getattr(item, "description", "") == "الصيغة")
@@ -216,7 +251,7 @@ class StudioPreferencesTests(unittest.TestCase):
                     self.assertEqual(quick_audio.layout.display, "none")
                     self.assertNotEqual(quick_video.layout.display, "none")
                     mode.value = "auto"
-                    self.assertEqual(len(accordion.children), 2)
+                    self.assertEqual(len(accordion.children), 3)
 
                     video_widgets = accordion.children[1].children
                     rate_mode = next(item for item in video_widgets
@@ -231,11 +266,16 @@ class StudioPreferencesTests(unittest.TestCase):
                     self.assertNotEqual(codec.layout.display, "none")
                     rate_mode.value = "quality"
 
+                    connections = next(item for item in accordion.children[2].children
+                                       if getattr(item, "description", "") == "عدد الاتصالات")
+                    connections.value = "6"
                     codec.value = "mp3"
                     bitrate.value = 64
                     pin_button.click()
+                    self.assertEqual(engine.load_studio_preferences()["default"]["download_connections"], "6")
                     self.assertEqual(engine.load_studio_preferences()["default"]["audio_kbps"], 64)
 
+                    connections.value = "auto"
                     codec.value = "opus"
                     bitrate.value = 24
                     run_button.click()
@@ -246,6 +286,7 @@ class StudioPreferencesTests(unittest.TestCase):
                     restore_button.click()
                     self.assertEqual(codec.value, "mp3")
                     self.assertEqual(bitrate.value, 64)
+                    self.assertEqual(connections.value, "6")
             finally:
                 engine.BASE_DIR = original_base
 
