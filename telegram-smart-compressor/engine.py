@@ -1240,6 +1240,7 @@ def run_ffmpeg(cmd, duration: float, label: str):
             proc.stdout.close()
 
 async def download_media_fast(client, msg, path: Path):
+    check_stop()
     size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
     progress = LiveProgress("تنزيل", "⬇️")
 
@@ -1265,6 +1266,7 @@ async def download_media_fast(client, msg, path: Path):
             async with aiofiles.open(str(path), "wb") as out:
                 done = 0
                 async for chunk in chunks:
+                    check_stop()
                     await out.write(chunk)
                     done += len(chunk)
                     progress.update(done, size)
@@ -1278,6 +1280,13 @@ async def download_media_fast(client, msg, path: Path):
                   f"{elapsed:.1f}s")
             return str(path), "turbo", elapsed
 
+        except (StopRequested, asyncio.CancelledError):
+            try:
+                if downloader is not None and getattr(downloader, "senders", None):
+                    await downloader._cleanup()
+            finally:
+                path.unlink(missing_ok=True)
+            raise
         except Exception as exc:
             try:
                 if downloader is not None and getattr(downloader, "senders", None):
@@ -1294,11 +1303,13 @@ async def download_media_fast(client, msg, path: Path):
             print("↪️ تعذر التنزيل السريع؛ هنكمل تلقائيًا بالطريقة العادية.")
             progress = LiveProgress("تنزيل", "⬇️")
 
+    check_stop()
     downloaded = await client.download_media(
         msg,
         file=str(path),
         progress_callback=progress.callback,
     )
+    check_stop()
     elapsed = progress.finish(size or (Path(downloaded).stat().st_size if downloaded else 0))
     return downloaded, "normal", elapsed
 
@@ -2155,8 +2166,10 @@ async def prepare_job(client, job, index: int, total: int):
             raise AppError("E401", "تعذر تنزيل الملف من Telegram.")
         src = Path(downloaded)
 
+        check_stop()
         probe_started = time.time()
-        info = ffprobe(src)
+        info = await asyncio.to_thread(ffprobe, src)
+        check_stop()
         probe_seconds = time.time() - probe_started
 
         return {
@@ -2171,6 +2184,9 @@ async def prepare_job(client, job, index: int, total: int):
             "download_mode": mode,
             "error": None,
         }
+    except (StopRequested, asyncio.CancelledError):
+        src.unlink(missing_ok=True)
+        raise
     except AppError as exc:
         try:
             if src.exists():
@@ -2230,6 +2246,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
     version = int(parent_lineage.get("version", 0)) + 1
 
     try:
+        check_stop()
         # "1" must replay the original output settings, not today's dashboard.
         studio_for_job = ACTIVE_STUDIO_SETTINGS
         replay_profile = None
@@ -2278,7 +2295,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
 
             encode_started = time.time()
             try:
-                encode_audio(src, dst, info, settings=selected_audio)
+                await asyncio.to_thread(encode_audio, src, dst, info, settings=selected_audio)
             finally:
                 timings["encode"] += time.time() - encode_started
 
@@ -2342,7 +2359,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
             if profile in ("VIDEO_BALANCED", "VIDEO_FAST") and nvenc:
                 print("⚡ كارت الشاشة متاح للترميز.")
 
-            encode_video(src, dst, info, profile, target_mb, nvenc, timings=timings, settings=studio_for_job)
+            await asyncio.to_thread(encode_video, src, dst, info, profile, target_mb, nvenc, timings=timings, settings=studio_for_job)
             if (studio_for_job is None or studio_for_job["skip_if_no_saving"]) and dst.stat().st_size >= src.stat().st_size * 0.98:
                 raise AppError("E430", "الملف مضغوط بالفعل تقريبًا؛ إعادة الضغط مش هتوفر مساحة مفيدة.")
 
