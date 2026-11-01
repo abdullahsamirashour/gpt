@@ -1301,41 +1301,41 @@ def _encode_audio_once(
     stream_index: int,
     audio_filter: str,
     label: str,
+    settings=None,
 ):
+    codec_options = [
+        "-c:a", "libopus", "-b:a", "8k", "-ac", "1", "-ar", "12000",
+        "-application", "voip", "-frame_duration", "60",
+        "-compression_level", "0", "-vbr", "on",
+    ]
+    if settings is not None:
+        codec_map = {"opus": "libopus", "mp3": "libmp3lame", "aac": "aac"}
+        chosen = settings["audio_codec"]
+        codec_options = [
+            "-c:a", codec_map[chosen],
+            "-b:a", f"{settings['audio_kbps']}k",
+            "-ac", "1" if settings["audio_channels"] == "mono" else "2",
+        ]
+        if settings["audio_sample_rate"] != "auto":
+            codec_options.extend(["-ar", settings["audio_sample_rate"]])
+        if chosen == "opus":
+            codec_options.extend([
+                "-application", "audio" if settings["audio_preset"] == "music" else "voip",
+                "-frame_duration", "60" if settings["audio_preset"] == "tiny" else "20",
+                "-compression_level", "6", "-vbr", "on",
+            ])
+        if settings["audio_noise"] == "light":
+            audio_filter += ",afftdn=nr=10"
+
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(src),
-        "-map",
-        f"0:{stream_index}",
-        "-vn",
-        "-sn",
-        "-dn",
-        "-af",
-        audio_filter,
-        "-c:a",
-        "libopus",
-        "-b:a",
-        "8k",
-        "-ac",
-        "1",
-        "-ar",
-        "12000",
-        "-application",
-        "voip",
-        "-frame_duration",
-        "60",
-        "-compression_level",
-        "0",
-        "-vbr",
-        "on",
-        str(dst),
+        "ffmpeg", "-y", "-i", str(src), "-map", f"0:{stream_index}",
+        "-vn", "-sn", "-dn", "-af", audio_filter,
+        *codec_options, str(dst),
     ]
     run_ffmpeg(cmd, info.duration, label)
 
 
-def encode_audio(src: Path, dst: Path, info: MediaInfo):
+def encode_audio(src: Path, dst: Path, info: MediaInfo, settings=None):
     if not info.has_audio:
         raise AppError("E412", "هذا الفيديو لا يحتوي على مسار صوتي يمكن ضغطه.")
 
@@ -1347,6 +1347,7 @@ def encode_audio(src: Path, dst: Path, info: MediaInfo):
         stream["index"],
         "aresample=async=1:first_pts=0",
         "ضغط الصوت",
+        settings=settings,
     )
     output_peak = _audio_output_peak(dst)
     if output_peak > -70.0:
@@ -1374,6 +1375,7 @@ def encode_audio(src: Path, dst: Path, info: MediaInfo):
                 stream["index"],
                 f"pan=mono|c0=c{channel},aresample=async=1:first_pts=0",
                 "إصلاح قناة الصوت",
+                settings=settings,
             )
             retry_peak = _audio_output_peak(dst)
             if retry_peak > -70.0:
