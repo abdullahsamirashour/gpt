@@ -295,6 +295,89 @@ class StudioPreferencesTests(unittest.TestCase):
 
 
 
+    def test_stop_button_is_clickable_during_an_active_async_run(self):
+        import ipywidgets as widgets
+        path = Path(__file__).with_name("media_studio_ui.py")
+        spec = importlib.util.spec_from_file_location("tsc_ui_stop_test", path)
+        ui = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ui)
+
+        async def fake_long_run():
+            while not engine.stop_requested():
+                await asyncio.sleep(0.01)
+            return {"stopped": True, "error": None}
+
+        original_base = engine.BASE_DIR
+        with tempfile.TemporaryDirectory() as td:
+            engine.BASE_DIR = Path(td)
+            try:
+                with patch.object(engine, "mount_drive", return_value=None), \
+                     patch.object(engine, "run_async", side_effect=fake_long_run), \
+                     patch("IPython.display.display"):
+                    dashboard = ui.show_studio(engine)
+                    buttons = [x for x in dashboard.children if isinstance(x, widgets.Button)]
+                    run = next(x for x in buttons if "تشغيل الضغط" in x.description)
+                    stop = next(x for x in buttons if "إيقاف التشغيل" in x.description)
+                    pin = next(x for x in buttons if "Save as Default" in x.description)
+                    self.assertTrue(stop.disabled)
+
+                    async def action():
+                        run.click()
+                        self.assertTrue(run.disabled)
+                        self.assertFalse(stop.disabled)
+                        self.assertTrue(pin.disabled)
+                        await asyncio.sleep(0.03)
+                        stop.click()
+                        self.assertTrue(engine.stop_requested())
+                        self.assertTrue(stop.disabled)
+                        await asyncio.sleep(0.05)
+
+                    asyncio.run(action())
+                    self.assertFalse(run.disabled)
+                    self.assertTrue(stop.disabled)
+                    self.assertFalse(pin.disabled)
+                    self.assertIn("تم إيقاف التشغيل", dashboard.children[1].value)
+            finally:
+                engine.BASE_DIR = original_base
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg unavailable")
+    def test_stop_terminates_running_encoder_without_damaging_source(self):
+        engine.reset_stop()
+        errors = []
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "source.txt"
+            src.write_text("keep-original-untouched")
+            target = Path(td) / "encoding.ogg"
+            cmd = [
+                "ffmpeg", "-re", "-f", "lavfi",
+                "-i", "sine=frequency=600:sample_rate=48000",
+                "-t", "12", "-c:a", "libopus", str(target),
+            ]
+
+            def worker():
+                try:
+                    engine.run_ffmpeg(cmd, 12, "test-stop")
+                except BaseException as exc:
+                    errors.append(exc)
+
+            worker_thread = threading.Thread(target=worker)
+            worker_thread.start()
+            started = time.monotonic()
+            while time.monotonic() - started < 4:
+                with engine._SUBPROCESS_LOCK:
+                    active = bool(engine._ACTIVE_SUBPROCESSES)
+                if active:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(active, "FFmpeg did not start in time")
+            engine.request_stop()
+            worker_thread.join(5)
+            self.assertFalse(worker_thread.is_alive(), "FFmpeg ignored Stop")
+            self.assertTrue(errors)
+            self.assertIsInstance(errors[0], engine.StopRequested)
+            self.assertEqual(src.read_text(), "keep-original-untouched")
+        engine.reset_stop()
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg unavailable")
     def test_real_ffmpeg_media_studio_encode_smoke(self):
         """Encode short synthetic media without cloud or Telegram credentials."""
