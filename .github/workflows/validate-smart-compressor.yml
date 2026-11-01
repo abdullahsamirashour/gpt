@@ -88,10 +88,14 @@ jobs:
                   drive_code = "".join(code_cells[1].get("source", []))
                   telegram_code = "".join(code_cells[2].get("source", []))
                   assert 'ENGINE_REL = "telegram-smart-compressor/engine.py"' in code
-                  assert 'UI_REL = "telegram-smart-compressor/media_studio_ui.py"' in code
-                  assert 'ui.show_studio(engine)' in code
+                  assert 'FORM_REL = "telegram-smart-compressor/studio_form_controls.py"' in code
+                  assert 'form.perform_form_action(engine, actions[العملية]' in code
+                  assert 'ui.show_studio(engine)' not in code
+                  assert 'UI_REL = ' not in code
                   assert 'TSC_UI_ONLY' in code
-                  assert code.count('#@param') == 1
+                  assert code.count('#@param') >= 20
+                  assert '💾 Save as Default' in code
+                  assert 'مصدر_الإعدادات' in code
                   assert 'direction="drive_to_telegram"' in drive_code
                   assert 'source=رابط_Drive.strip()' in drive_code
                   assert 'destination=""' in drive_code
@@ -127,6 +131,13 @@ jobs:
         run: |
           python -m py_compile telegram-smart-compressor/media_studio_ui.py
           python -m unittest discover -s telegram-smart-compressor -p 'test_media_studio.py' -v
+
+      - name: Verify native Colab Forms, advanced media presets and saved Drive settings
+        env:
+          TSC_TEST_MODE: '1'
+        run: |
+          python -m py_compile telegram-smart-compressor/studio_form_controls.py
+          python -m unittest discover -s telegram-smart-compressor -p 'test_studio_form_controls.py' -v
 
       - name: Bidirectional transfer regression tests
         run: |
