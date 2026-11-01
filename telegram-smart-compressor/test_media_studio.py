@@ -156,5 +156,60 @@ class StudioPreferencesTests(unittest.TestCase):
         self.assertEqual(engine.STUDIO_VIDEO_PRESETS["presentation"]["video_resolution"], "1080")
 
 
+
+    def test_interactive_ui_can_pin_run_and_restore_settings(self):
+        """Widget buttons actually persist last-used and pinned-default separately."""
+        import ipywidgets as widgets
+        ui_path = Path(__file__).with_name("media_studio_ui.py")
+        ui_spec = importlib.util.spec_from_file_location("tsc_ui_tests", ui_path)
+        studio = importlib.util.module_from_spec(ui_spec)
+        ui_spec.loader.exec_module(studio)
+
+        original_base = engine.BASE_DIR
+        with tempfile.TemporaryDirectory() as td:
+            engine.BASE_DIR = Path(td)
+            try:
+                with patch.object(engine, "mount_drive", return_value=None), \
+                     patch.object(engine, "run", return_value=None) as execute, \
+                     patch("IPython.display.display"):
+                    dashboard = studio.show_studio(engine)
+                    buttons = [
+                        item for item in dashboard.children
+                        if isinstance(item, widgets.Button)
+                    ]
+                    run_button = next(item for item in buttons if "تشغيل الضغط" in item.description)
+                    pin_button = next(item for item in buttons if "Save as Default" in item.description)
+                    restore_button = next(item for item in buttons if "استرجاع" in item.description)
+                    accordion = next(
+                        item for item in dashboard.children
+                        if isinstance(item, widgets.Accordion)
+                    )
+                    self.assertEqual(accordion.selected_index, None)
+                    self.assertEqual(len(accordion.children), 2)
+                    audio_controls = accordion.children[0].children
+                    codec = next(item for item in audio_controls
+                                 if getattr(item, "description", "") == "الصيغة")
+                    bitrate = next(item for item in audio_controls
+                                   if getattr(item, "description", "") == "جودة الصوت")
+
+                    codec.value = "mp3"
+                    bitrate.value = 64
+                    pin_button.click()
+                    self.assertEqual(engine.load_studio_preferences()["default"]["audio_kbps"], 64)
+
+                    codec.value = "opus"
+                    bitrate.value = 24
+                    run_button.click()
+                    execute.assert_called_once()
+                    stored = engine.load_studio_preferences()
+                    self.assertEqual(stored["last_used"]["audio_codec"], "opus")
+                    self.assertEqual(stored["default"]["audio_codec"], "mp3")
+                    restore_button.click()
+                    self.assertEqual(codec.value, "mp3")
+                    self.assertEqual(bitrate.value, 64)
+            finally:
+                engine.BASE_DIR = original_base
+
+
 if __name__ == "__main__":
     unittest.main()
