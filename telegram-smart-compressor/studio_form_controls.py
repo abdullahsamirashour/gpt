@@ -119,7 +119,9 @@ def show_settings(settings, origin):
         "video": "🎬 فيديو: الحفاظ على الصورة في الملفات المرئية",
     }
     print(f"🎯 الناتج: {output_labels[settings['source']]} | Telegram: 6 اتصالات تنزيل")
-    print(f"🎧 صوت: {settings['audio_codec'].upper()} | {settings['audio_kbps']} kbps | {settings['audio_channels']}")
+    audio_kbps = settings["audio_kbps"]
+    print(f"🎧 صوت: {settings['audio_codec'].upper()} | {audio_kbps} kbps | {settings['audio_channels']}")
+    print(f"📦 حجم ساعة تسجيل متوقع: حوالي {audio_kbps * 0.45:.1f} MB للصوت (تقريبي؛ يختلف مع VBR).")
     video_mode = settings["video_rate_mode"]
     video_quality = (
         f"CRF {settings['video_crf']}" if video_mode == "quality" else
