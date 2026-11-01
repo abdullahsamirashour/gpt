@@ -60,9 +60,9 @@ def collect_form_settings(engine, values):
         base.update({
             "audio_codec": _option(AUDIO_CODECS, values["audio_codec"], "صيغة الصوت"),
             "audio_kbps": int(values["audio_kbps"]),
-            "audio_channels": values["audio_channels"],
+            "audio_channels": str(values["audio_channels"]).lower(),
             "audio_sample_rate": values["audio_sample_rate"],
-            "audio_noise": values["audio_noise"],
+            "audio_noise": str(values["audio_noise"]).lower(),
         })
     if values["advanced_video"]:
         base.update({
@@ -113,9 +113,11 @@ def show_settings(settings, origin):
         f"{settings['video_bitrate_kbps']} kbps" if video_mode == "bitrate" else
         f"{settings['video_target_mb']} MiB مستهدف"
     )
+    resolution = ("الأصلية" if settings["video_resolution"] == "source"
+                  else settings["video_resolution"] + "p")
     print(
         f"🎬 فيديو: {settings['video_codec'].upper()} | "
-        f"{settings['video_resolution']}p | {settings['video_fps']} FPS | {video_quality}"
+        f"{resolution} | {settings['video_fps']} FPS | {video_quality}"
     )
     print("💾 الإعدادات المحفوظة تخص الضغط فقط؛ لا تحتوي جلسات Telegram أو كلمات المرور.")
 
