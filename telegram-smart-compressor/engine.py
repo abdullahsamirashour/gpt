@@ -1284,6 +1284,8 @@ async def download_media_fast(client, msg, path: Path):
             try:
                 if downloader is not None and getattr(downloader, "senders", None):
                     await downloader._cleanup()
+            except Exception as cleanup_exc:
+                _log_debug(f"telegram-stop-cleanup: {type(cleanup_exc).__name__}: {cleanup_exc}")
             finally:
                 path.unlink(missing_ok=True)
             raise
