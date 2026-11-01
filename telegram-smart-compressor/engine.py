@@ -2573,27 +2573,41 @@ async def app():
         started = time.time()
         results = []
 
-        # Pipeline: while file N is being compressed/uploaded, file N+1 downloads.
+        # Pipeline: the next file is downloaded while the current one is
+        # encoded/uploaded. Always cancel and clean any unconsumed prefetched
+        # file when Stop is requested, including if the next task finished.
         current_download = asyncio.create_task(prepare_job(client, jobs[0], 1, len(jobs)))
+        try:
+            for idx, job in enumerate(jobs, 1):
+                check_stop()
+                prepared = await current_download
 
-        for idx, job in enumerate(jobs, 1):
-            prepared = await current_download
+                if idx < len(jobs):
+                    current_download = asyncio.create_task(
+                        prepare_job(client, jobs[idx], idx + 1, len(jobs))
+                    )
 
-            if idx < len(jobs):
-                current_download = asyncio.create_task(
-                    prepare_job(client, jobs[idx], idx + 1, len(jobs))
+                result = await process_job(
+                    client, channel, state, prepared,
+                    nvenc=nvenc, index=idx, total=len(jobs),
                 )
-
-            result = await process_job(
-                client,
-                channel,
-                state,
-                prepared,
-                nvenc=nvenc,
-                index=idx,
-                total=len(jobs),
-            )
-            results.append(result)
+                results.append(result)
+                check_stop()
+        finally:
+            if current_download is not None:
+                if not current_download.done():
+                    current_download.cancel()
+                try:
+                    unconsumed = await current_download
+                except (StopRequested, asyncio.CancelledError):
+                    pass
+                except Exception as exc:
+                    _log_debug(f"prefetch-cleanup: {type(exc).__name__}: {exc}")
+                else:
+                    # Harmless if process_job has already deleted the source.
+                    local = unconsumed.get("src") if isinstance(unconsumed, dict) else None
+                    if local:
+                        Path(local).unlink(missing_ok=True)
 
         ok = sum(1 for r in results if r["ok"])
         skipped = sum(1 for r in results if r.get("skipped"))
@@ -2621,7 +2635,60 @@ async def app():
 
 
 
+
+async def run_async():
+    """Studio-only non-blocking launcher; preserves the legacy run() path.
+
+    Launched as an asyncio task from the Run button so Stop clicks remain
+    actionable even while encoding (CPU-bound encoding runs in to_thread).
+    """
+    use_run_log = os.environ.get("TSC_TEST_MODE") != "1"
+    log_path = None
+    if use_run_log:
+        try:
+            log_path = _start_run_log()
+        except Exception:
+            log_path = None
+    print(f"✅ المحرك {ENGINE_BUNDLE_VERSION}")
+    try:
+        await asyncio.to_thread(ensure_dependencies)
+        check_stop()
+        await app()
+        return {"stopped": False, "error": None}
+    except (StopRequested, asyncio.CancelledError):
+        print("⏹️ تم إيقاف التشغيل بطلبك. الملفات الأصلية لم تتأثر.")
+        return {"stopped": True, "error": None}
+    except AppError as exc:
+        _log_debug(f"app-error {exc.code}: {exc.details or exc.message}")
+        print(f"❌ {exc.code} — {exc.message}")
+        if exc.details:
+            try:
+                BASE_DIR.mkdir(parents=True, exist_ok=True)
+                ERROR_LOG.write_text(exc.details, encoding="utf-8")
+                print("📝 تفاصيل الخطأ محفوظة على Drive.")
+            except Exception:
+                print("📝 تعذر حفظ تفاصيل الخطأ على Drive.")
+        return {"stopped": False, "error": exc.code}
+    except Exception as exc:
+        details = traceback.format_exc()
+        _log_debug(details)
+        try:
+            BASE_DIR.mkdir(parents=True, exist_ok=True)
+            ERROR_LOG.write_text(details, encoding="utf-8")
+        except Exception:
+            pass
+        print(f"❌ E999 — {type(exc).__name__}")
+        return {"stopped": False, "error": "E999"}
+    finally:
+        if use_run_log:
+            _log_debug("run-end")
+            _stop_run_log()
+            if log_path is not None and log_path.exists():
+                show_log_controls(log_path)
+
+
 def run():
+    reset_stop()
     use_run_log = os.environ.get("TSC_TEST_MODE") != "1"
     log_path = None
     if use_run_log:
