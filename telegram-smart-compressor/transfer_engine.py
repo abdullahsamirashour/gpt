@@ -762,21 +762,204 @@ async def cached_part_messages(client, channel) -> dict:
     return result
 
 
+TG_UPLOAD_CONNECTIONS = 6
+TG_UPLOAD_PART_BYTES = 512 * 1024
+TG_UPLOAD_MIN_BYTES = 5 * 1024 * 1024
+
+
+class TelegramParallelUploader:
+    """Six reusable MTProto upload connections; native Telethon remains fallback."""
+
+    def __init__(self, client):
+        self.client = client
+        self.senders = []
+        self.dc_id = None
+        self.disabled = False
+
+    @staticmethod
+    def supported(client):
+        required = ("_get_dc", "_connection", "_call", "_log", "_proxy", "session")
+        return hasattr(os, "pread") and all(hasattr(client, key) for key in required)
+
+    async def close(self):
+        senders, self.senders = self.senders, []
+        self.dc_id = None
+        if senders:
+            await asyncio.gather(*(s.disconnect() for s in senders), return_exceptions=True)
+
+    async def _connect(self):
+        from telethon.network import MTProtoSender
+
+        if self.disabled or not self.supported(self.client):
+            raise RuntimeError("Parallel Telegram uploader unavailable")
+        current_dc = self.client.session.dc_id
+        if self.senders and current_dc == self.dc_id:
+            return
+        await self.close()
+        dc = await self.client._get_dc(current_dc)
+
+        async def make_sender():
+            sender = MTProtoSender(self.client.session.auth_key, loggers=self.client._log)
+            try:
+                await sender.connect(self.client._connection(
+                    dc.ip_address, dc.port, dc.id,
+                    loggers=self.client._log, proxy=self.client._proxy,
+                    local_addr=getattr(self.client, "_local_addr", None)))
+                return sender
+            except BaseException:
+                await sender.disconnect()
+                raise
+
+        results = await asyncio.gather(
+            *(make_sender() for _ in range(TG_UPLOAD_CONNECTIONS)),
+            return_exceptions=True,
+        )
+        errors = [r for r in results if isinstance(r, BaseException)]
+        self.senders = [r for r in results if not isinstance(r, BaseException)]
+        if errors:
+            await self.close()
+            raise errors[0]
+        self.dc_id = current_dc
+
+    async def upload_file(self, payload, size, name, progress):
+        """Return a real Telethon InputFile handle only after every part is ACKed.
+
+        Supports an ordinary path and the existing SegmentReader used for split
+        files >1.9 GB. All reads use positioned os.pread, not shared seek state.
+        """
+        from telethon import helpers
+        from telethon.tl import functions, types
+
+        if size <= 0:
+            raise ValueError("Cannot upload empty Telegram file")
+        if isinstance(payload, (str, Path)):
+            fd = os.open(str(payload), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            close_fd = True
+            base = 0
+        elif isinstance(payload, SegmentReader):
+            fd = payload._source.fileno()
+            close_fd = False
+            base = payload._offset
+            if payload._size != size:
+                raise ValueError("Segment size mismatch")
+        else:
+            raise TypeError("Unsupported parallel upload source")
+
+        try:
+            if os.fstat(fd).st_size < base + size:
+                raise IOError("Telegram upload source is smaller than declared size")
+            await self._connect()
+            part_count = math.ceil(size / TG_UPLOAD_PART_BYTES)
+            is_big = size > 10 * 1024 * 1024
+            file_id = helpers.generate_random_long()
+            md5 = None
+            if not is_big:
+                md5 = hashlib.md5()
+                for offset in range(0, size, TG_UPLOAD_PART_BYTES):
+                    amount = min(TG_UPLOAD_PART_BYTES, size - offset)
+                    data = os.pread(fd, amount, base + offset)
+                    if len(data) != amount:
+                        raise IOError("Cannot read full small-file chunk for MD5")
+                    md5.update(data)
+
+            queue = asyncio.Queue()
+            for part_no in range(part_count):
+                queue.put_nowait(part_no)
+            acknowledged = 0
+
+            async def worker(sender):
+                nonlocal acknowledged
+                while True:
+                    try:
+                        part_no = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    offset = part_no * TG_UPLOAD_PART_BYTES
+                    amount = min(TG_UPLOAD_PART_BYTES, size - offset)
+                    data = os.pread(fd, amount, base + offset)
+                    if len(data) != amount:
+                        raise IOError(f"Incomplete local upload part {part_no}")
+                    if is_big:
+                        request = functions.upload.SaveBigFilePartRequest(
+                            file_id, part_no, part_count, data)
+                    else:
+                        request = functions.upload.SaveFilePartRequest(file_id, part_no, data)
+                    if not await self.client._call(sender, request):
+                        raise RuntimeError(f"Telegram rejected upload part {part_no}")
+                    acknowledged += amount
+                    progress(acknowledged, size)
+
+            tasks = [asyncio.create_task(worker(sender)) for sender in self.senders]
+            try:
+                await asyncio.gather(*tasks)
+            except BaseException:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            if acknowledged != size:
+                raise RuntimeError(f"Telegram upload part total {acknowledged} != {size}")
+            if is_big:
+                return types.InputFileBig(file_id, part_count, name)
+            return types.InputFile(file_id, part_count, name, md5.hexdigest())
+        finally:
+            if close_fd:
+                os.close(fd)
+
+
+async def prepare_drive_upload(service, meta):
+    """Fetch the next Drive file into its own bounded Colab staging directory."""
+    temporary = tempfile.TemporaryDirectory(dir=TEMP_ROOT)
+    local = Path(temporary.name) / clean_filename(meta["name"])
+    try:
+        size, digest = await asyncio.to_thread(download_drive_file, service, meta, local)
+        name = telegram_transfer_filename(meta, local)
+        return temporary, local, size, digest, name
+    except BaseException:
+        temporary.cleanup()
+        raise
+
+
+def can_prefetch_drive_file(meta):
+    """Bound pipeline disk use to the current upload plus one known-size file."""
+    try:
+        expected = int(meta.get("size") or 0)
+    except (ValueError, TypeError):
+        return False
+    return expected > 0 and shutil.disk_usage(TEMP_ROOT).free >= expected + 2 * DISK_RESERVE
+
+
+
 async def send_transfer_document(
     client, channel, payload, size: int, name: str, caption: str,
-    progress, raw_part: bool = False,
+    progress, raw_part: bool = False, parallel_uploader=None,
 ):
-    """Use Telethon's *own* uploader with fewer 512 KiB MTProto round-trips.
+    """Upload with six independent MTProto senders, with native Telethon fallback.
 
-    Unlike the removed experimental parallel uploader, we do not construct
-    Telegram part handles manually or change data ordering.
+    Send only the fully acknowledged input file handle, preserving receipt logic.
     """
     from telethon.tl.types import DocumentAttributeFilename
 
-    handle = await client.upload_file(
-        payload, file_size=size, file_name=name,
-        part_size_kb=UPLOAD_PART_KB, progress_callback=progress,
-    )
+    handle = None
+    if parallel_uploader is not None and not parallel_uploader.disabled and size >= TG_UPLOAD_MIN_BYTES:
+        started_parallel = time.monotonic()
+        try:
+            handle = await parallel_uploader.upload_file(payload, size, name, progress)
+            elapsed = max(0.001, time.monotonic() - started_parallel)
+            print(f"⚡ Telegram رفع متوازي ({TG_UPLOAD_CONNECTIONS} اتصالات): "
+                  f"{size / elapsed / (1024 * 1024):.2f} MiB/s")
+        except Exception as exc:
+            parallel_uploader.disabled = True
+            await parallel_uploader.close()
+            if type(exc).__name__ in ("FloodWaitError", "FloodPremiumWaitError"):
+                raise
+            print(f"↩️ رفع متوازي غير متاح ({type(exc).__name__})؛ "
+                  "الرجوع لرفع Telethon العادي لبقية التشغيل.")
+    if handle is None:
+        handle = await client.upload_file(
+            payload, file_size=size, file_name=name,
+            part_size_kb=UPLOAD_PART_KB, progress_callback=progress,
+        )
     return await client.send_file(
         channel, handle, caption=caption, force_document=True,
         mime_type="application/octet-stream" if raw_part else None,
@@ -1022,7 +1205,7 @@ async def transfer_drive_to_telegram(
 # Telegram -> Drive: use independent MTProto download connections for files
 # >= 5 MiB, and keep Telethon's native path as the safe fallback.
 TG_PARALLEL_MIN_BYTES = 5 * 1024 * 1024
-TG_PARALLEL_CONNECTIONS = 4
+TG_PARALLEL_CONNECTIONS = 6
 TG_PARALLEL_PART_BYTES = 512 * 1024
 
 
@@ -1176,7 +1359,7 @@ async def fetch_telegram_message(client, channel, msg, local: Path, size: int, d
     mode = "عادي"
     completed = False
     if downloader is not None and size >= TG_PARALLEL_MIN_BYTES:
-        print(f"⚡ Parallel Telegram: 4 اتصالات × 512 KiB — {local.name}")
+        print(f"⚡ Parallel Telegram: {TG_PARALLEL_CONNECTIONS} اتصالات × 512 KiB — {local.name}")
         try:
             await downloader.download(msg, local, size, Progress(title))
             completed = True
@@ -1237,7 +1420,7 @@ async def transfer_telegram_to_drive(
     source_name = clean_filename(getattr(channel, "title", "") or "Telegram")
     dst_folder = ensure_child_folder(service, folder_id, source_name, folder_cache)
     downloader = TelegramParallelDownloader(client) if TelegramParallelDownloader.supported(client) else None
-    print("⚡ Telegram parallel download: من 5 MiB، أربع اتصالات؛ fallback تلقائي.")
+    print("⚡ Telegram parallel download: من 5 MiB، {TG_PARALLEL_CONNECTIONS} اتصالات؛ fallback تلقائي.")
     for index, msg in enumerate(jobs, 1):
         key = origin_key(peer_id, int(msg.id))
         size = int(getattr(msg.file, "size", 0) or 0)
