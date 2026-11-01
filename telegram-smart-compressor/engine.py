@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.5.7"
+ENGINE_BUNDLE_VERSION = "5.5.8"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -80,7 +80,7 @@ TARGET_SIZE_TEXT = os.environ.get("TSC_TARGET_SIZE_MB", "").strip()
 STUDIO_SETTINGS_VERSION = 1
 STUDIO_FACTORY_SETTINGS = {
     "source": "auto",
-    "download_connections": "auto",
+    "download_connections": "6",
     "audio_preset": "speech",
     "audio_codec": "opus",
     "audio_kbps": 24,
@@ -163,6 +163,10 @@ def normalize_studio_settings(value):
 def apply_studio_settings(settings):
     global ACTIVE_STUDIO_SETTINGS
     ACTIVE_STUDIO_SETTINGS = normalize_studio_settings(settings)
+    # Deliberately keep compressor downloads at six MTProto connections until
+    # we have an on-device 6/8/18 benchmark. Older Drive JSON values cannot
+    # unexpectedly restore the high-connection mode.
+    ACTIVE_STUDIO_SETTINGS["download_connections"] = "6"
     return dict(ACTIVE_STUDIO_SETTINGS)
 
 
@@ -901,14 +905,11 @@ def transfer_connection_count(size: int) -> int:
         return 4
     scaled = math.ceil((size / TURBO_FULL_SPEED_BYTES) * TURBO_MAX_CONNECTIONS)
     auto = min(TURBO_MAX_CONNECTIONS, max(4, scaled))
-    # Never silently change existing transfers: 'auto' keeps the legacy
-    # size-scaled behaviour. Advanced Studio can request a repeatable 4-18
-    # connection experiment on its own account, one transfer at a time.
+    # Studio mode is deliberately fixed at 6 for now. The legacy launchers
+    # retain their size-based behavior; the transfer-engine cells are separate.
     if ACTIVE_STUDIO_SETTINGS is not None:
-        value = ACTIVE_STUDIO_SETTINGS.get("download_connections", "auto")
-        if value != "auto":
-            parts = math.ceil(size / (TURBO_PART_KB * 1024))
-            return min(int(value), max(1, parts))
+        parts = math.ceil(size / (TURBO_PART_KB * 1024))
+        return min(6, max(1, parts))
     return auto
 
 
