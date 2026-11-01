@@ -99,6 +99,18 @@ def show_studio(engine):
         value=selected["source"], description="", layout=wide_layout(),
         style={"button_width": "120px"},
     )
+    download_connections = w.Dropdown(
+        options=[
+            ("تلقائي حسب حجم الملف (السلوك الحالي)", "auto"),
+            ("6 اتصالات — اختبار مبدئي", "6"),
+            ("8 اتصالات — اختبار متوسط", "8"),
+            ("12 اتصال", "12"),
+            ("18 اتصال — مقارنة مع الصورة", "18"),
+            ("4 اتصالات — أقل ضغط", "4"),
+        ],
+        value=selected["download_connections"], description="عدد الاتصالات",
+        layout=wide_layout(), style={"description_width": "115px"},
+    )
     audio_presets = w.Dropdown(
         options=[
             ("🎙️ محاضرات — كلام واضح (موصى به)", "speech"),
@@ -221,10 +233,21 @@ def show_studio(engine):
         video_speed, video_audio_kbps,
     ], layout=w.Layout(width="100%", padding="7px"))
 
-    advanced = w.Accordion(children=(audio_advanced, video_advanced),
+    network_advanced = w.VBox([
+        title_html(
+            "⬇️ تنزيل Telegram — سرعة الاتصال",
+            "الاتصالات ليست عدد أجزاء الملف. التنزيل المتوازي متاح للملفات من 8 MiB. "
+            "ابدأ بمقارنة 6 و8 والعدد التلقائي على ملفات متقاربة؛ "
+            "الزيادة ليست ضمانًا لسرعة أعلى. ملفات Drive ↔ Telegram لها محرك منفصل."
+        ),
+        download_connections,
+    ], layout=w.Layout(width="100%", padding="7px"))
+
+    advanced = w.Accordion(children=(audio_advanced, video_advanced, network_advanced),
                            selected_index=None, layout=wide_layout())
     advanced.set_title(0, "🎧 إعدادات الصوت المتقدمة")
     advanced.set_title(1, "🎬 إعدادات الفيديو المتقدمة")
+    advanced.set_title(2, "⚡ تنزيل تيليجرام — اتصالات MTProto")
 
     summary = w.HTML(layout=wide_layout())
     saving_hint = w.HTML(
@@ -253,6 +276,7 @@ def show_studio(engine):
     def collect():
         return {
             "source": source.value,
+            "download_connections": download_connections.value,
             "audio_preset": audio_presets.value,
             "audio_codec": audio_codec.value,
             "audio_kbps": audio_kbps.value,
@@ -273,7 +297,8 @@ def show_studio(engine):
         }
 
     controls = {
-        "source": source, "audio_preset": audio_presets, "audio_codec": audio_codec,
+        "source": source, "download_connections": download_connections,
+        "audio_preset": audio_presets, "audio_codec": audio_codec,
         "audio_kbps": audio_kbps, "audio_channels": audio_channels,
         "audio_sample_rate": audio_sample_rate, "audio_noise": audio_noise,
         "video_preset": video_presets, "video_codec": video_codec,
@@ -306,16 +331,20 @@ def show_studio(engine):
         audio_quick.layout.display = "none" if value == "video" else ""
         video_quick.layout.display = "none" if value == "audio" else ""
         visible_advanced = (
-            (audio_advanced,) if value == "audio" else
-            (video_advanced,) if value == "video" else
-            (audio_advanced, video_advanced)
+            (audio_advanced, network_advanced) if value == "audio" else
+            (video_advanced, network_advanced) if value == "video" else
+            (audio_advanced, video_advanced, network_advanced)
         )
         if advanced.children != visible_advanced:
             advanced.children = visible_advanced
             advanced.selected_index = None
+            names = {
+                audio_advanced: "🎧 إعدادات الصوت المتقدمة",
+                video_advanced: "🎬 إعدادات الفيديو المتقدمة",
+                network_advanced: "⚡ تنزيل تيليجرام — اتصالات MTProto",
+            }
             for i, child in enumerate(visible_advanced):
-                advanced.set_title(i, "🎧 إعدادات الصوت المتقدمة" if child is audio_advanced
-                                   else "🎬 إعدادات الفيديو المتقدمة")
+                advanced.set_title(i, names[child])
         rate_mode = video_rate_mode.value
         target = rate_mode == "target"
         video_target_mb.layout.display = "" if target else "none"
@@ -339,6 +368,10 @@ def show_studio(engine):
         )
         if active["video_resolution"] == "source":
             video_line = video_line.replace("sourcep", "الدقة الأصلية")
+        download_label = (
+            "تلقائي حسب حجم الملف" if active["download_connections"] == "auto"
+            else f'{active["download_connections"]} اتصالات'
+        )
         summary.value = (
             '<div dir="rtl" style="font-family:system-ui,Tahoma,sans-serif;'
             'border:1px solid #cbd5e1;background:#f8fafc;border-radius:12px;'
@@ -347,6 +380,7 @@ def show_studio(engine):
             f'نوع الملف: <b>{escape(media)}</b>'
             + (f'<div>🎧 {escape(audio_line)}</div>' if value != "video" else "")
             + (f'<div>🎬 {escape(video_line)}</div>' if value != "audio" else "")
+            + f'<div>⬇️ Telegram: {escape(download_label)}</div>'
             + '<div style="color:#64748b">حجم الناتج الفعلي يعتمد على مدة وجودة الملف الأصلي.</div>'
             '</div>'
         )
