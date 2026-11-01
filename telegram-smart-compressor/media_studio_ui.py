@@ -159,6 +159,11 @@ def show_studio(engine):
         description="جودة CRF", continuous_update=False,
         readout=True, layout=WIDE, style={"description_width": "115px"},
     )
+    video_bitrate_kbps = w.BoundedIntText(
+        value=selected["video_bitrate_kbps"], min=100, max=20000, step=100,
+        description="Video kbps", layout=WIDE,
+        style={"description_width": "115px"},
+    )
     video_speed = w.Dropdown(
         options=[("سريع", "fast"), ("متوازن", "balanced"), ("أبطأ / ضغط أفضل", "slow")],
         value=selected["video_speed"], description="سرعة الترميز", layout=WIDE,
@@ -170,7 +175,7 @@ def show_studio(engine):
         layout=WIDE, style={"description_width": "115px"},
     )
     video_rate_mode = w.ToggleButtons(
-        options=[("🎚️ جودة ثابتة", "quality"), ("🎯 حجم محدد", "target")],
+        options=[("🎚️ جودة CRF", "quality"), ("📊 Bitrate", "bitrate"), ("🎯 حجم محدد", "target")],
         value=selected["video_rate_mode"], description="", layout=WIDE,
         style={"button_width": "150px"},
     )
@@ -203,7 +208,7 @@ def show_studio(engine):
         title_html("ضبط الفيديو", "CRF الأقل يعطي جودة أعلى وحجمًا أكبر عادةً. "
                    "الحجم المستهدف يستخدم H.264 بمرحلتي ترميز."),
         video_codec, video_resolution, video_fps,
-        video_rate_mode, video_crf, video_target_mb,
+        video_rate_mode, video_crf, video_bitrate_kbps, video_target_mb,
         video_speed, video_audio_kbps,
     ], layout=w.Layout(width="100%", padding="7px"))
 
@@ -250,6 +255,7 @@ def show_studio(engine):
             "video_resolution": video_resolution.value,
             "video_fps": video_fps.value,
             "video_crf": video_crf.value,
+            "video_bitrate_kbps": video_bitrate_kbps.value,
             "video_speed": video_speed.value,
             "video_audio_kbps": video_audio_kbps.value,
             "video_rate_mode": video_rate_mode.value,
@@ -263,7 +269,8 @@ def show_studio(engine):
         "audio_sample_rate": audio_sample_rate, "audio_noise": audio_noise,
         "video_preset": video_presets, "video_codec": video_codec,
         "video_resolution": video_resolution, "video_fps": video_fps,
-        "video_crf": video_crf, "video_speed": video_speed,
+        "video_crf": video_crf, "video_bitrate_kbps": video_bitrate_kbps,
+        "video_speed": video_speed,
         "video_audio_kbps": video_audio_kbps, "video_rate_mode": video_rate_mode,
         "video_target_mb": video_target_mb, "skip_if_no_saving": skip_if_no_saving,
     }
@@ -300,9 +307,11 @@ def show_studio(engine):
             for i, child in enumerate(visible_advanced):
                 advanced.set_title(i, "🎧 إعدادات الصوت المتقدمة" if child is audio_advanced
                                    else "🎬 إعدادات الفيديو المتقدمة")
-        target = video_rate_mode.value == "target"
+        rate_mode = video_rate_mode.value
+        target = rate_mode == "target"
         video_target_mb.layout.display = "" if target else "none"
-        video_crf.layout.display = "none" if target else ""
+        video_bitrate_kbps.layout.display = "" if rate_mode == "bitrate" else "none"
+        video_crf.layout.display = "" if rate_mode == "quality" else "none"
         video_codec.disabled = target
         if target and video_codec.value != "h264":
             video_codec.value = "h264"
@@ -316,6 +325,7 @@ def show_studio(engine):
         video_line = (
             f"{active['video_codec'].upper()} · {active['video_resolution']}p · "
             + (f"حجم {active['video_target_mb']} MiB" if target else
+               f"Bitrate {active['video_bitrate_kbps']} kbps" if rate_mode == "bitrate" else
                f"CRF {active['video_crf']}")
         )
         if active["video_resolution"] == "source":
