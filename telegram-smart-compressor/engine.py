@@ -2285,6 +2285,13 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
             profile = "AUDIO_CUSTOM" if studio_for_job is not None else "AUDIO_TINY"
 
         if profile in ("AUDIO_TINY", "AUDIO_CUSTOM"):
+            if info.has_video:
+                if not info.has_audio:
+                    raise AppError(
+                        "E412",
+                        "الفيديو مفيهوش مسار صوتي؛ مش هنطلع ملف صامت أو نتيجة وهمية."
+                    )
+                print("🎞️ → 🎧 تحويل الفيديو إلى ملف صوت فقط؛ الصورة مش هتكون في الناتج.")
             selected_audio = studio_for_job if profile == "AUDIO_CUSTOM" else None
             suffix = {"opus": ".ogg", "aac": ".m4a", "mp3": ".mp3"}[
                 selected_audio["audio_codec"] if selected_audio else "opus"
