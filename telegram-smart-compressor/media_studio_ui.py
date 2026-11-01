@@ -41,18 +41,27 @@ def show_studio(engine):
         }
 
     selected = engine.normalize_studio_settings(record["last_used"])
-    WIDE = w.Layout(width="100%", margin="0 0 8px 0")
-    BUTTON = w.Layout(width="100%", height="45px", margin="4px 0")
-    container = w.Layout(width="100%", max_width="840px", padding="10px 6px", margin="0 auto")
-    separate = w.Layout(width="100%", padding="10px 12px", border="1px solid #e2e8f0",
-                        margin="6px 0 12px 0")
+    # Each widget owns an independent Layout. Sharing a Layout here makes
+    # hiding one control accidentally hide unrelated controls (notably mobile).
+    def wide_layout():
+        return w.Layout(width="100%", margin="0 0 8px 0")
+
+    def button_layout():
+        return w.Layout(width="100%", height="45px", margin="4px 0")
+
+    def section_layout():
+        return w.Layout(width="100%", padding="10px 12px",
+                        border="1px solid #e2e8f0", margin="6px 0 12px 0")
+
+    container = w.Layout(width="100%", max_width="840px",
+                         padding="10px 6px", margin="0 auto")
 
     def title_html(title, subtitle):
         return w.HTML(
             f'<div dir="rtl" style="font-family:system-ui,Tahoma,sans-serif;padding:6px 2px 10px">'
             f'<div style="font-size:16px;font-weight:750;color:#0f172a">{title}</div>'
             f'<div style="font-size:12px;line-height:1.65;color:#64748b">{subtitle}</div></div>',
-            layout=WIDE,
+            layout=wide_layout(),
         )
 
     header = w.HTML(
@@ -64,10 +73,10 @@ def show_studio(engine):
         '<div style="font-size:25px;font-weight:800;margin:5px 0">🗜️ اضغطها</div>'
         '<div style="font-size:13px;opacity:.9;line-height:1.7">'
         'اضغط محاضراتك وفيديوهاتك بسهولة — أو افتح الإعدادات المتقدمة للتحكم الكامل.</div>'
-        '</div>', layout=WIDE,
+        '</div>', layout=wide_layout(),
     )
 
-    status = w.HTML(layout=WIDE)
+    status = w.HTML(layout=wide_layout())
     if drive_ready:
         status.value = (
             '<div dir="rtl" style="font-size:12px;color:#166534;padding:4px 1px">'
@@ -87,7 +96,7 @@ def show_studio(engine):
 
     source = w.ToggleButtons(
         options=[("✨ تلقائي", "auto"), ("🎧 صوت فقط", "audio"), ("🎬 فيديو", "video")],
-        value=selected["source"], description="", layout=WIDE,
+        value=selected["source"], description="", layout=wide_layout(),
         style={"button_width": "120px"},
     )
     audio_presets = w.Dropdown(
@@ -97,7 +106,7 @@ def show_studio(engine):
             ("🪶 أصغر حجم ممكن", "tiny"),
             ("🎵 موسيقى / صوت غني", "music"),
         ],
-        value=selected["audio_preset"], description="", layout=WIDE,
+        value=selected["audio_preset"], description="", layout=wide_layout(),
     )
     video_presets = w.Dropdown(
         options=[
@@ -106,98 +115,98 @@ def show_studio(engine):
             ("🪶 حجم صغير جدًا", "small"),
             ("⚡ أسرع معالجة", "fast"),
         ],
-        value=selected["video_preset"], description="", layout=WIDE,
+        value=selected["video_preset"], description="", layout=wide_layout(),
     )
     audio_codec = w.Dropdown(
         options=[("OGG · Opus — أصغر حجم وكلام واضح", "opus"),
                  ("M4A · AAC — توافق واسع", "aac"),
                  ("MP3 — تشغيل على أغلب الأجهزة", "mp3")],
-        value=selected["audio_codec"], description="الصيغة", layout=WIDE,
+        value=selected["audio_codec"], description="الصيغة", layout=wide_layout(),
         style={"description_width": "115px"},
     )
     audio_kbps = w.Dropdown(
         options=[(f"{x} kbps", x) for x in (8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 192)],
-        value=selected["audio_kbps"], description="جودة الصوت", layout=WIDE,
+        value=selected["audio_kbps"], description="جودة الصوت", layout=wide_layout(),
         style={"description_width": "115px"},
     )
     audio_channels = w.Dropdown(
         options=[("Mono — كلام", "mono"), ("Stereo — موسيقى", "stereo")],
-        value=selected["audio_channels"], description="القنوات", layout=WIDE,
+        value=selected["audio_channels"], description="القنوات", layout=wide_layout(),
         style={"description_width": "115px"},
     )
     audio_sample_rate = w.Dropdown(
         options=[("تلقائي", "auto"), ("12 kHz", "12000"), ("16 kHz", "16000"),
                  ("24 kHz", "24000"), ("48 kHz", "48000")],
-        value=selected["audio_sample_rate"], description="Sample Rate", layout=WIDE,
+        value=selected["audio_sample_rate"], description="Sample Rate", layout=wide_layout(),
         style={"description_width": "115px"},
     )
     audio_noise = w.Dropdown(
         options=[("بدون تعديل — آمن", "off"), ("إزالة ضوضاء خفيفة", "light")],
-        value=selected["audio_noise"], description="الضوضاء", layout=WIDE,
+        value=selected["audio_noise"], description="الضوضاء", layout=wide_layout(),
         style={"description_width": "115px"},
     )
     video_codec = w.Dropdown(
         options=[("H.264 — التوافق الأفضل", "h264"), ("H.265 — حجم أقل أحيانًا", "h265")],
-        value=selected["video_codec"], description="Codec", layout=WIDE,
+        value=selected["video_codec"], description="Codec", layout=wide_layout(),
         style={"description_width": "115px"},
     )
     video_resolution = w.Dropdown(
         options=[("الحفاظ على المصدر", "source"), ("480p", "480"), ("540p", "540"),
                  ("720p", "720"), ("1080p", "1080")],
-        value=selected["video_resolution"], description="الدقة", layout=WIDE,
+        value=selected["video_resolution"], description="الدقة", layout=wide_layout(),
         style={"description_width": "115px"},
     )
     video_fps = w.Dropdown(
         options=[("ذكي حسب الحركة", "auto"), ("الأصلية", "source"),
                  ("12 FPS", "12"), ("15 FPS", "15"), ("24 FPS", "24"),
                  ("30 FPS", "30")],
-        value=selected["video_fps"], description="الفريمات", layout=WIDE,
+        value=selected["video_fps"], description="الفريمات", layout=wide_layout(),
         style={"description_width": "115px"},
     )
     video_crf = w.IntSlider(
         value=selected["video_crf"], min=18, max=35, step=1,
         description="جودة CRF", continuous_update=False,
-        readout=True, layout=WIDE, style={"description_width": "115px"},
+        readout=True, layout=wide_layout(), style={"description_width": "115px"},
     )
     video_bitrate_kbps = w.BoundedIntText(
         value=selected["video_bitrate_kbps"], min=100, max=20000, step=100,
-        description="Video kbps", layout=WIDE,
+        description="Video kbps", layout=wide_layout(),
         style={"description_width": "115px"},
     )
     video_speed = w.Dropdown(
         options=[("سريع", "fast"), ("متوازن", "balanced"), ("أبطأ / ضغط أفضل", "slow")],
-        value=selected["video_speed"], description="سرعة الترميز", layout=WIDE,
+        value=selected["video_speed"], description="سرعة الترميز", layout=wide_layout(),
         style={"description_width": "115px"},
     )
     video_audio_kbps = w.Dropdown(
         options=[(f"{x} kbps", x) for x in (32, 40, 48, 64, 96, 128, 160, 192)],
         value=selected["video_audio_kbps"], description="صوت الفيديو",
-        layout=WIDE, style={"description_width": "115px"},
+        layout=wide_layout(), style={"description_width": "115px"},
     )
     video_rate_mode = w.ToggleButtons(
         options=[("🎚️ جودة CRF", "quality"), ("📊 Bitrate", "bitrate"), ("🎯 حجم محدد", "target")],
-        value=selected["video_rate_mode"], description="", layout=WIDE,
+        value=selected["video_rate_mode"], description="", layout=wide_layout(),
         style={"button_width": "150px"},
     )
     video_target_mb = w.BoundedIntText(
         value=selected["video_target_mb"], min=4, max=4096, step=1,
-        description="الحجم (MiB)", layout=WIDE,
+        description="الحجم (MiB)", layout=wide_layout(),
         style={"description_width": "115px"},
     )
     skip_if_no_saving = w.Checkbox(
         value=selected["skip_if_no_saving"],
         description="تخطي الملف لو الناتج مش هيقل عن الأصل بشكل مفيد",
-        indent=False, layout=WIDE,
+        indent=False, layout=wide_layout(),
     )
 
     audio_quick = w.VBox([
         title_html("إعداد صوت المحاضرات", "لو الملف صوتي، هتتطبق إعدادات الصوت المختارة."),
         audio_presets,
-    ], layout=separate)
+    ], layout=section_layout())
     video_quick = w.VBox([
         title_html("إعداد الفيديو", "للفيديو: متوازن، شروحات شاشة، أصغر حجم، أو أسرع معالجة."),
         video_presets,
-    ], layout=separate)
+    ], layout=section_layout())
 
     audio_advanced = w.VBox([
         title_html("ضبط الصوت", "Opus هو الأفضل للمحاضرات الصغيرة. MP3 وAAC للتوافق. "
@@ -213,28 +222,28 @@ def show_studio(engine):
     ], layout=w.Layout(width="100%", padding="7px"))
 
     advanced = w.Accordion(children=(audio_advanced, video_advanced),
-                           selected_index=None, layout=WIDE)
+                           selected_index=None, layout=wide_layout())
     advanced.set_title(0, "🎧 إعدادات الصوت المتقدمة")
     advanced.set_title(1, "🎬 إعدادات الفيديو المتقدمة")
 
-    summary = w.HTML(layout=WIDE)
+    summary = w.HTML(layout=wide_layout())
     saving_hint = w.HTML(
         '<div dir="rtl" style="font-size:12px;color:#64748b;line-height:1.75">'
         '💾 <b>تشغيل:</b> يحفظ آخر إعدادات مستخدمة تلقائيًا في Google Drive. '
         '<b>Save as Default:</b> يثبت هذه الإعدادات كمرجع ترجع له وقت ما تحب.'
-        '</div>', layout=WIDE,
+        '</div>', layout=wide_layout(),
     )
     run_button = w.Button(
         description="▶ تشغيل الضغط وحفظ آخر إعدادات", button_style="primary",
-        icon="play", layout=BUTTON, tooltip="ابدأ ضغط الملفات الموجودة في قناة تيليجرام",
+        icon="play", layout=button_layout(), tooltip="ابدأ ضغط الملفات الموجودة في قناة تيليجرام",
     )
     pin_button = w.Button(
         description="💾 Save as Default | ثبّت كافتراضي", button_style="success",
-        icon="save", layout=BUTTON, tooltip="احفظ إعداداتك المفضلة على Google Drive",
+        icon="save", layout=button_layout(), tooltip="احفظ إعداداتك المفضلة على Google Drive",
     )
     restore_button = w.Button(
         description="↩ استرجاع الإعدادات الافتراضية المحفوظة", button_style="",
-        icon="undo", layout=BUTTON, tooltip="يرجع الإعدادات فقط؛ لا يحذف الملفات ولا يبدأ الضغط",
+        icon="undo", layout=button_layout(), tooltip="يرجع الإعدادات فقط؛ لا يحذف الملفات ولا يبدأ الضغط",
     )
     run_output = w.Output(layout=w.Layout(width="100%", border="1px solid #e2e8f0",
                                           padding="8px", margin="8px 0 0"))
