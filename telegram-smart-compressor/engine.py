@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.request
@@ -112,6 +113,66 @@ STUDIO_VIDEO_PRESETS = {
     "fast": {"video_codec": "h264", "video_resolution": "720", "video_fps": "24", "video_crf": 30, "video_speed": "fast", "video_audio_kbps": 64, "video_rate_mode": "quality"},
 }
 ACTIVE_STUDIO_SETTINGS = None
+
+# Cooperative UI stop: no file or Telegram message is marked successful until
+# its existing transaction completes. Registered encoder/prober processes can
+# be terminated immediately by the button, without interrupting the kernel.
+class StopRequested(BaseException):
+    """User intentionally stopped Media Lite Studio, not an ordinary failure."""
+
+
+_STOP_SIGNAL = threading.Event()
+_SUBPROCESS_LOCK = threading.Lock()
+_ACTIVE_SUBPROCESSES = set()
+
+
+def reset_stop():
+    _STOP_SIGNAL.clear()
+
+
+def stop_requested():
+    return _STOP_SIGNAL.is_set()
+
+
+def check_stop():
+    if stop_requested():
+        raise StopRequested()
+
+
+def _register_subprocess(proc):
+    with _SUBPROCESS_LOCK:
+        _ACTIVE_SUBPROCESSES.add(proc)
+    if stop_requested() and proc.poll() is None:
+        proc.terminate()
+
+
+def _unregister_subprocess(proc):
+    with _SUBPROCESS_LOCK:
+        _ACTIVE_SUBPROCESSES.discard(proc)
+
+
+def request_stop():
+    """Signal both network callbacks and live FFmpeg/ffprobe subprocesses."""
+    _STOP_SIGNAL.set()
+    with _SUBPROCESS_LOCK:
+        processes = list(_ACTIVE_SUBPROCESSES)
+    for proc in processes:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except OSError:
+            pass
+    return len(processes)
+
+
+def _wait_for_subprocess(proc, timeout=2.0):
+    """Reap a stopped encoder; escalate only if it ignores termination."""
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
 
 
 def studio_settings_path():
@@ -399,13 +460,28 @@ def show_log_controls(log_path: Path):
 
 
 def run_quiet(args, check=True):
-    result = subprocess.run(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
+    """Run FFprobe/peak analysis with responsive Studio stop support."""
+    check_stop()
+    proc = subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
+    _register_subprocess(proc)
+    try:
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                check_stop()
+        check_stop()
+        result = subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+    except BaseException:
+        if proc.poll() is None:
+            proc.terminate()
+        _wait_for_subprocess(proc)
+        raise
+    finally:
+        _unregister_subprocess(proc)
     if result.returncode != 0:
         _log_debug(
             f"command-failed rc={result.returncode} args={json.dumps([str(x) for x in args], ensure_ascii=False)} "
@@ -413,10 +489,7 @@ def run_quiet(args, check=True):
         )
         if check:
             raise subprocess.CalledProcessError(
-                result.returncode,
-                args,
-                output=result.stdout,
-                stderr=result.stderr,
+                result.returncode, args, output=result.stdout, stderr=result.stderr,
             )
     return result
 
