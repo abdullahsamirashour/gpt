@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.5.6"
+ENGINE_BUNDLE_VERSION = "5.5.7"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -80,6 +80,7 @@ TARGET_SIZE_TEXT = os.environ.get("TSC_TARGET_SIZE_MB", "").strip()
 STUDIO_SETTINGS_VERSION = 1
 STUDIO_FACTORY_SETTINGS = {
     "source": "auto",
+    "download_connections": "auto",
     "audio_preset": "speech",
     "audio_codec": "opus",
     "audio_kbps": 24,
@@ -127,6 +128,7 @@ def normalize_studio_settings(value):
             result[key] = item
     allowed = {
         "source": {"auto", "audio", "video"},
+        "download_connections": {"auto", "4", "6", "8", "12", "18"},
         "audio_preset": set(STUDIO_AUDIO_PRESETS),
         "audio_codec": {"opus", "aac", "mp3"},
         "audio_channels": {"mono", "stereo"},
@@ -898,7 +900,16 @@ def transfer_connection_count(size: int) -> int:
     if size <= 0:
         return 4
     scaled = math.ceil((size / TURBO_FULL_SPEED_BYTES) * TURBO_MAX_CONNECTIONS)
-    return min(TURBO_MAX_CONNECTIONS, max(4, scaled))
+    auto = min(TURBO_MAX_CONNECTIONS, max(4, scaled))
+    # Never silently change existing transfers: 'auto' keeps the legacy
+    # size-scaled behaviour. Advanced Studio can request a repeatable 4-18
+    # connection experiment on its own account, one transfer at a time.
+    if ACTIVE_STUDIO_SETTINGS is not None:
+        value = ACTIVE_STUDIO_SETTINGS.get("download_connections", "auto")
+        if value != "auto":
+            parts = math.ceil(size / (TURBO_PART_KB * 1024))
+            return min(int(value), max(1, parts))
+    return auto
 
 
 def show_file_header(index: int, total: int, name: str):
@@ -971,8 +982,9 @@ class LiveProgress:
         self.last_current = 0.0
         self.speed = 0.0
         self.last_render = 0.0
-        self.handle = None
+        self.widget = None
         self.terminal_started = False
+        self._fallback_bucket = -1
 
     def _metrics(self, current, total, speed_override=None):
         total = float(total or 0)
@@ -987,7 +999,7 @@ class LiveProgress:
         else:
             eta = (total - current) / self.speed if total > current and self.speed > 0 else 0
             detail = f"{human_size(int(current))} / {human_size(int(total))}"
-            speed_text = f"{self.speed / 1024 / 1024:.1f} MB/s" if self.speed > 0 else "..."
+            speed_text = f"{self.speed / 1024 / 1024:.1f} MiB/s" if self.speed > 0 else "..."
 
         eta_text = _format_duration(eta) if eta > 0 else "..."
         return pct, detail, speed_text, eta_text
@@ -1027,16 +1039,24 @@ class LiveProgress:
         pct, detail, speed_text, eta_text = self._metrics(current, total, speed_override)
 
         try:
-            from IPython.display import HTML, display
-            card = HTML(self._card(pct, detail, speed_text, eta_text))
-            if self.handle is None:
-                self.handle = display(card, display_id=True)
+            import ipywidgets as widgets
+            from IPython.display import display
+            markup = self._card(pct, detail, speed_text, eta_text)
+            if self.widget is None:
+                widget = widgets.HTML(value=markup, layout=widgets.Layout(width="100%"))
+                display(widget)
+                self.widget = widget
             else:
-                self.handle.update(card)
+                self.widget.value = markup
         except Exception:
-            line = f"{self.icon} {self.label} — {pct:.1f}% • {detail} • {speed_text} • باقي {eta_text}"
-            print("\r" + line + " " * 8, end="", flush=True)
-            self.terminal_started = True
+            # Colab mobile may not coalesce carriage-return output. Bound the
+            # text-only fallback to 10% milestones instead of hundreds of cards.
+            bucket = max(0, min(10, int(pct // 10)))
+            if bucket > self._fallback_bucket or pct >= 100:
+                line = f"{self.icon} {self.label} — {pct:.1f}% • {detail} • {speed_text} • باقي {eta_text}"
+                print(line, flush=True)
+                self.terminal_started = True
+                self._fallback_bucket = bucket
 
     def callback(self, *args, **kwargs):
         current = kwargs.get("done")
@@ -1053,7 +1073,7 @@ class LiveProgress:
 
         if self.mode == "bytes":
             avg_speed = total / elapsed if total > 0 else 0.0
-            speed_text = f"{avg_speed / 1024 / 1024:.1f} MB/s" if avg_speed > 0 else "..."
+            speed_text = f"{avg_speed / 1024 / 1024:.1f} MiB/s" if avg_speed > 0 else "..."
         else:
             avg_x = speed_override if speed_override and speed_override > 0 else (
                 total / elapsed if total > 0 else 0.0
@@ -1070,14 +1090,15 @@ class LiveProgress:
         )
 
         try:
-            from IPython.display import HTML, display
-            if self.handle is None:
-                self.handle = display(HTML(compact), display_id=True)
+            import ipywidgets as widgets
+            from IPython.display import display
+            if self.widget is None:
+                widget = widgets.HTML(value=compact, layout=widgets.Layout(width="100%"))
+                display(widget)
+                self.widget = widget
             else:
-                self.handle.update(HTML(compact))
+                self.widget.value = compact
         except Exception:
-            if self.terminal_started:
-                print()
             print(f"✅ {self.label} — {_format_duration(elapsed)} • {speed_text}")
 
         return elapsed
@@ -1151,7 +1172,8 @@ async def download_media_fast(client, msg, path: Path):
                 connection_count=connections,
             )
 
-            print(f"⚡ تنزيل سريع — {connections} اتصال")
+            part_count = math.ceil(size / (TURBO_PART_KB * 1024))
+            print(f"⚡ تنزيل سريع — {connections} اتصال MTProto • {part_count} جزء × {TURBO_PART_KB} KiB")
             async with aiofiles.open(str(path), "wb") as out:
                 done = 0
                 async for chunk in chunks:
@@ -1159,10 +1181,16 @@ async def download_media_fast(client, msg, path: Path):
                     done += len(chunk)
                     progress.update(done, size)
 
+            actual = path.stat().st_size
+            if done != size or actual != size:
+                raise IOError(f"Telegram parallel download incomplete: {actual} / {size} bytes")
             elapsed = progress.finish(size)
+            print(f"📊 Telegram download: {connections} connections • "
+                  f"{size / max(elapsed, 0.001) / 1024**2:.2f} MiB/s average • "
+                  f"{elapsed:.1f}s")
             return str(path), "turbo", elapsed
 
-        except Exception:
+        except Exception as exc:
             try:
                 if downloader is not None and getattr(downloader, "senders", None):
                     await downloader._cleanup()
@@ -1172,6 +1200,9 @@ async def download_media_fast(client, msg, path: Path):
                 path.unlink()
             except FileNotFoundError:
                 pass
+            if type(exc).__name__ in ("FloodWaitError", "FloodPremiumWaitError"):
+                print("⏸️ Telegram طلب الانتظار. لن نعيد التحميل فورًا حتى لا نزيد الحظر.")
+                raise
             print("↪️ تعذر التنزيل السريع؛ هنكمل تلقائيًا بالطريقة العادية.")
             progress = LiveProgress("تنزيل", "⬇️")
 
