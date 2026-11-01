@@ -91,6 +91,7 @@ STUDIO_FACTORY_SETTINGS = {
     "video_resolution": "720",
     "video_fps": "auto",
     "video_crf": 28,
+    "video_bitrate_kbps": 1400,
     "video_speed": "balanced",
     "video_audio_kbps": 64,
     "video_rate_mode": "quality",
@@ -136,13 +137,14 @@ def normalize_studio_settings(value):
         "video_resolution": {"source", "480", "540", "720", "1080"},
         "video_fps": {"auto", "source", "12", "15", "24", "30"},
         "video_speed": {"fast", "balanced", "slow"},
-        "video_rate_mode": {"quality", "target"},
+        "video_rate_mode": {"quality", "bitrate", "target"},
     }
     for key, choices in allowed.items():
         if not isinstance(result[key], str) or result[key] not in choices:
             raise ValueError(f"إعداد غير معروف أو غير مدعوم: {key}")
     limits = {"audio_kbps": (8, 192), "video_crf": (18, 35),
-              "video_audio_kbps": (32, 192), "video_target_mb": (4, 4096)}
+              "video_audio_kbps": (32, 192), "video_bitrate_kbps": (100, 20000),
+              "video_target_mb": (4, 4096)}
     for key, (minimum, maximum) in limits.items():
         val = result[key]
         if isinstance(val, bool) or not isinstance(val, int) or not minimum <= val <= maximum:
@@ -1529,12 +1531,23 @@ def encode_video(src: Path, dst: Path, info: MediaInfo, profile: str, target_mb:
         preset = {"fast": "veryfast", "balanced": "medium", "slow": "slow"}[studio["video_speed"]]
         crf = str(studio["video_crf"])
         extra = ["-tag:v", "hvc1"] if studio["video_codec"] == "h265" else []
-        cpu = [*base, "-c:v", codec, "-preset", preset, "-crf", crf, *extra, *tail]
+        if studio["video_rate_mode"] == "bitrate":
+            kbps = studio["video_bitrate_kbps"]
+            rate_flags = ["-b:v", f"{kbps}k", "-maxrate", f"{int(kbps * 1.3)}k",
+                          "-bufsize", f"{kbps * 2}k"]
+        else:
+            rate_flags = ["-crf", crf]
+        cpu = [*base, "-c:v", codec, "-preset", preset, *rate_flags, *extra, *tail]
         if nvenc:
             gpu_codec = "h264_nvenc" if studio["video_codec"] == "h264" else "hevc_nvenc"
             gpu_preset = {"fast": "p3", "balanced": "p4", "slow": "p6"}[studio["video_speed"]]
+            gpu_rate = (
+                ["-rc", "vbr", "-b:v", f"{studio['video_bitrate_kbps']}k"]
+                if studio["video_rate_mode"] == "bitrate" else
+                ["-rc", "vbr", "-cq", crf, "-b:v", "0"]
+            )
             gpu = [*base, "-c:v", gpu_codec, "-preset", gpu_preset,
-                   "-rc", "vbr", "-cq", crf, "-b:v", "0", *extra, *tail]
+                   *gpu_rate, *extra, *tail]
             try:
                 timed_run(gpu, "ضغط الفيديو GPU")
                 return "STUDIO_GPU"
