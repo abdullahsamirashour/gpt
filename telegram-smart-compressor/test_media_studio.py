@@ -138,6 +138,17 @@ class StudioPreferencesTests(unittest.TestCase):
                 self.assertIn("25", recorded[0])
                 self.assertIn("hvc1", recorded[0])
                 recorded.clear()
+                direct_bitrate = engine.normalize_studio_settings({
+                    "video_rate_mode": "bitrate",
+                    "video_bitrate_kbps": 1800,
+                    "video_fps": "24",
+                })
+                engine.encode_video(Path("/tmp/input.mp4"), Path(td) / "bitrate.mp4",
+                                    info, "VIDEO_CUSTOM", None, False,
+                                    settings=direct_bitrate)
+                self.assertIn("1800k", recorded[0])
+                self.assertIn("-maxrate", recorded[0])
+                recorded.clear()
                 target = engine.normalize_studio_settings({
                     "video_codec": "h264", "video_rate_mode": "target",
                     "video_target_mb": 25, "video_fps": "15",
