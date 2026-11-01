@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
 """Media Lite Studio offline settings, codec command, and UX smoke tests."""
 import importlib.util
+import asyncio
 import json
 import os
 import sys
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 os.environ["TSC_TEST_MODE"] = "1"
 ENGINE = Path(__file__).with_name("engine.py")
@@ -24,6 +27,7 @@ spec.loader.exec_module(engine)
 class StudioPreferencesTests(unittest.TestCase):
     def tearDown(self):
         engine.ACTIVE_STUDIO_SETTINGS = None
+        engine.reset_stop()
 
     def test_factory_values_are_validated_and_legacy_mode_is_unchanged(self):
         d = engine.normalize_studio_settings({})
@@ -171,18 +175,14 @@ class StudioPreferencesTests(unittest.TestCase):
 
 
 
-    def test_download_connection_count_is_configurable_and_legacy_auto_is_unchanged(self):
+    def test_download_is_fixed_six_in_studio_but_legacy_launchers_keep_auto(self):
         size = int(87.9 * 1024**2)
         self.assertEqual(engine.transfer_connection_count(size), 18)
-        self.assertEqual(engine.normalize_studio_settings({})["download_connections"], "auto")
-        engine.apply_studio_settings({"download_connections": "6"})
-        self.assertEqual(engine.transfer_connection_count(size), 6)
-        engine.apply_studio_settings({"download_connections": "8"})
-        self.assertEqual(engine.transfer_connection_count(size), 8)
-        engine.apply_studio_settings({"download_connections": "18"})
-        self.assertEqual(engine.transfer_connection_count(size), 18)
-        engine.apply_studio_settings({"download_connections": "auto"})
-        self.assertEqual(engine.transfer_connection_count(size), 18)
+        self.assertEqual(engine.normalize_studio_settings({})["download_connections"], "6")
+        for old_value in ("auto", "8", "18", "4", "6"):
+            engine.apply_studio_settings({"download_connections": old_value})
+            self.assertEqual(engine.ACTIVE_STUDIO_SETTINGS["download_connections"], "6")
+            self.assertEqual(engine.transfer_connection_count(size), 6)
         with self.assertRaises(ValueError):
             engine.normalize_studio_settings({"download_connections": "999"})
 
@@ -218,7 +218,7 @@ class StudioPreferencesTests(unittest.TestCase):
             engine.BASE_DIR = Path(td)
             try:
                 with patch.object(engine, "mount_drive", return_value=None), \
-                     patch.object(engine, "run", return_value=None) as execute, \
+                     patch.object(engine, "run_async", new_callable=AsyncMock, return_value={"stopped": False, "error": None}) as execute, \
                      patch("IPython.display.display"):
                     dashboard = studio.show_studio(engine)
                     buttons = [
@@ -267,19 +267,22 @@ class StudioPreferencesTests(unittest.TestCase):
                     rate_mode.value = "quality"
 
                     connections = next(item for item in accordion.children[2].children
-                                       if getattr(item, "description", "") == "عدد الاتصالات")
-                    connections.value = "6"
+                                       if getattr(item, "description", "") == "تنزيل Telegram")
+                    self.assertTrue(connections.disabled)
+                    self.assertEqual(connections.value, "6")
                     codec.value = "mp3"
                     bitrate.value = 64
                     pin_button.click()
                     self.assertEqual(engine.load_studio_preferences()["default"]["download_connections"], "6")
                     self.assertEqual(engine.load_studio_preferences()["default"]["audio_kbps"], 64)
 
-                    connections.value = "auto"
                     codec.value = "opus"
                     bitrate.value = 24
-                    run_button.click()
-                    execute.assert_called_once()
+                    async def press_run():
+                        run_button.click()
+                        await asyncio.sleep(0.05)
+                    asyncio.run(press_run())
+                    execute.assert_awaited_once()
                     stored = engine.load_studio_preferences()
                     self.assertEqual(stored["last_used"]["audio_codec"], "opus")
                     self.assertEqual(stored["default"]["audio_codec"], "mp3")
