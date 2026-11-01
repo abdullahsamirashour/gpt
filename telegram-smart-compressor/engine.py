@@ -1707,6 +1707,11 @@ def looks_like_generated_output(msg):
 def resolve_profile(msg, explicit=None):
     if explicit:
         return explicit
+    if ACTIVE_STUDIO_SETTINGS is not None:
+        selected = ACTIVE_STUDIO_SETTINGS["source"]
+        if selected == "audio" or (selected == "auto" and message_media_kind(msg) != "video"):
+            return "AUDIO_CUSTOM"
+        return "VIDEO_CUSTOM"
     if PROFILE == "SMART_AUTO":
         return "VIDEO_BALANCED" if message_media_kind(msg) == "video" else "AUDIO_TINY"
     return PROFILE
@@ -2093,29 +2098,61 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
     version = int(parent_lineage.get("version", 0)) + 1
 
     try:
-        profile = resolve_profile(msg, job["profile"])
+        # "1" must replay the original output settings, not today's dashboard.
+        studio_for_job = ACTIVE_STUDIO_SETTINGS
+        replay_profile = None
+        if job["rerun"]:
+            if job["profile"] is None:
+                saved_studio = parent_lineage.get("media_settings")
+                if isinstance(saved_studio, dict):
+                    try:
+                        studio_for_job = normalize_studio_settings(saved_studio)
+                    except ValueError:
+                        studio_for_job = None
+                else:
+                    studio_for_job = None
+                    replay_profile = parent_lineage.get("profile")
+            else:
+                # Commands 2, 3 and numeric size explicitly override the saved profile.
+                studio_for_job = None
+
+        profile = replay_profile or resolve_profile(msg, job["profile"])
+        if studio_for_job is not None and job["profile"] is None:
+            wanted = studio_for_job["source"]
+            profile = ("AUDIO_CUSTOM" if wanted == "audio"
+                       or (wanted == "auto" and message_media_kind(msg) != "video")
+                       else "VIDEO_CUSTOM")
         target_mb = job["target_mb"]
         if profile == "VIDEO_TARGET_SIZE" and target_mb is None:
-            target_mb = target_size_from_ui()
+            target_mb = (
+                parent_lineage.get("target_mb")
+                if job["rerun"] and job["profile"] is None else None
+            ) or target_size_from_ui()
 
         if profile.startswith("VIDEO_") and not info.has_video:
-            print("ℹ️ الملف صوتي؛ هنستخدم ضغط الصوت.")
-            profile = "AUDIO_TINY"
+            print("ℹ️ الملف صوتي؛ هنستخدم إعدادات الصوت.")
+            profile = "AUDIO_CUSTOM" if studio_for_job is not None else "AUDIO_TINY"
 
-        if profile == "AUDIO_TINY":
-            dst = TMP_DIR / f"{src.stem}_compressed.ogg"
-            label = "صوت صغير جدًا"
+        if profile in ("AUDIO_TINY", "AUDIO_CUSTOM"):
+            selected_audio = studio_for_job if profile == "AUDIO_CUSTOM" else None
+            suffix = {"opus": ".ogg", "aac": ".m4a", "mp3": ".mp3"}[
+                selected_audio["audio_codec"] if selected_audio else "opus"
+            ]
+            dst = TMP_DIR / f"{src.stem}_compressed{suffix}"
+            label = ("صوت صغير جدًا" if selected_audio is None else
+                     f"صوت • {selected_audio['audio_codec'].upper()} "
+                     f"{selected_audio['audio_kbps']} kbps")
             print(f"🎧 {label}")
 
             encode_started = time.time()
             try:
-                encode_audio(src, dst, info)
+                encode_audio(src, dst, info, settings=selected_audio)
             finally:
                 timings["encode"] += time.time() - encode_started
 
             out_info = ffprobe(dst)
 
-            if dst.stat().st_size >= src.stat().st_size * 0.98:
+            if (selected_audio is None or selected_audio["skip_if_no_saving"]) and dst.stat().st_size >= src.stat().st_size * 0.98:
                 raise AppError("E430", "الملف مضغوط بالفعل تقريبًا؛ إعادة الضغط مش هتوفر مساحة مفيدة.")
 
             title = Path(name).stem[:60]
@@ -2143,7 +2180,9 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
                     f"{human_size(original_size)} → {human_size(final_size)} • وفر {saved_pct:.0f}%"
                 ),
                 attributes=attrs,
-                mime_type="audio/ogg",
+                mime_type={"opus": "audio/ogg", "aac": "audio/mp4", "mp3": "audio/mpeg"}[
+                    selected_audio["audio_codec"] if selected_audio else "opus"
+                ],
                 voice_note=False,
                 force_document=False,
                 reply_to=msg.id,
@@ -2159,14 +2198,20 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
                 "VIDEO_FAST": "فيديو سريع",
                 "VIDEO_SMALLEST": "أصغر حجم",
                 "VIDEO_TARGET_SIZE": f"حجم مستهدف {target_mb} MB",
+                "VIDEO_CUSTOM": (
+                    f"حجم مستهدف {studio_for_job['video_target_mb']} MiB"
+                    if studio_for_job["video_rate_mode"] == "target" else
+                    f"فيديو • {studio_for_job['video_codec'].upper()} "
+                    f"CRF {studio_for_job['video_crf']}"
+                ) if studio_for_job is not None else "فيديو متقدم",
             }
             label = labels.get(profile, profile)
             print(f"🎬 {label}")
             if profile in ("VIDEO_BALANCED", "VIDEO_FAST") and nvenc:
                 print("⚡ كارت الشاشة متاح للترميز.")
 
-            encode_video(src, dst, info, profile, target_mb, nvenc, timings=timings)
-            if dst.stat().st_size >= src.stat().st_size * 0.98:
+            encode_video(src, dst, info, profile, target_mb, nvenc, timings=timings, settings=studio_for_job)
+            if (studio_for_job is None or studio_for_job["skip_if_no_saving"]) and dst.stat().st_size >= src.stat().st_size * 0.98:
                 raise AppError("E430", "الملف مضغوط بالفعل تقريبًا؛ إعادة الضغط مش هتوفر مساحة مفيدة.")
 
             out_info = ffprobe(dst)
@@ -2211,6 +2256,8 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
             "parent_id": int(msg.id),
             "version": version,
             "profile": profile,
+            "target_mb": target_mb if profile == "VIDEO_TARGET_SIZE" else None,
+            "media_settings": dict(studio_for_job) if studio_for_job is not None and profile in ("AUDIO_CUSTOM", "VIDEO_CUSTOM") else None,
             "created_at": int(time.time()),
         }
 
