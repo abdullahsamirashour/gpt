@@ -2727,8 +2727,11 @@ def run():
             print("📝 سجل التشغيل محفوظ في Colab محليًا؛ زر Import logs to Drive اختياري.")
 
     except KeyboardInterrupt:
+        # Native Colab Forms use the cell's built-in Stop/Interrupt control.
+        # Terminate active FFmpeg/ffprobe instead of leaving a worker behind.
+        request_stop()
         print()
-        print("⏹️ تم إيقاف التشغيل. الملفات الأصلية لم تتأثر.")
+        print("⏹️ تم إيقاف التشغيل من Colab. الملفات الأصلية لم تتأثر.")
 
     except Exception as exc:
         details = traceback.format_exc()
