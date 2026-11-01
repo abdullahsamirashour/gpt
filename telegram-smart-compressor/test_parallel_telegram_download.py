@@ -140,7 +140,7 @@ class ParallelTransferTests(unittest.TestCase):
 
     def test_threshold_is_five_mebibytes_not_twenty(self):
         self.assertEqual(transfer.TG_PARALLEL_MIN_BYTES, 5 * 1024 * 1024)
-        self.assertEqual(transfer.TG_PARALLEL_CONNECTIONS, 4)
+        self.assertEqual(transfer.TG_PARALLEL_CONNECTIONS, 6)
         self.assertEqual(transfer.TG_PARALLEL_PART_BYTES, 512 * 1024)
 
     def test_parallel_home_dc_reassembles_full_file(self):
@@ -151,7 +151,7 @@ class ParallelTransferTests(unittest.TestCase):
             asyncio.run(transfer.TelegramParallelDownloader(client).download(
                 SimpleNamespace(dc=1), path, len(payload), lambda *_: None))
             self.assertEqual(path.read_bytes(), payload)
-        self.assertEqual(len(FakeSender.registry), 4)
+        self.assertEqual(len(FakeSender.registry), 6)
         self.assertTrue(all(sender.closed for sender in FakeSender.registry))
         self.assertEqual(sorted(client.offsets), list(range(0, len(payload), 512 * 1024)))
 
