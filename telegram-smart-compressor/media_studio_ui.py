@@ -6,6 +6,7 @@ user explicitly clicks Run. It only stores validated encoding preferences.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from html import escape
 
@@ -41,6 +42,7 @@ def show_studio(engine):
         }
 
     selected = engine.normalize_studio_settings(record["last_used"])
+    selected["download_connections"] = "6"  # temporarily fixed until benchmarking
     # Each widget owns an independent Layout. Sharing a Layout here makes
     # hiding one control accidentally hide unrelated controls (notably mobile).
     def wide_layout():
@@ -100,15 +102,8 @@ def show_studio(engine):
         style={"button_width": "120px"},
     )
     download_connections = w.Dropdown(
-        options=[
-            ("تلقائي حسب حجم الملف (السلوك الحالي)", "auto"),
-            ("6 اتصالات — اختبار مبدئي", "6"),
-            ("8 اتصالات — اختبار متوسط", "8"),
-            ("12 اتصال", "12"),
-            ("18 اتصال — مقارنة مع الصورة", "18"),
-            ("4 اتصالات — أقل ضغط", "4"),
-        ],
-        value=selected["download_connections"], description="عدد الاتصالات",
+        options=[("6 اتصالات — مثبت حاليًا", "6")],
+        value="6", disabled=True, description="تنزيل Telegram",
         layout=wide_layout(), style={"description_width": "115px"},
     )
     audio_presets = w.Dropdown(
@@ -236,9 +231,9 @@ def show_studio(engine):
     network_advanced = w.VBox([
         title_html(
             "⬇️ تنزيل Telegram — سرعة الاتصال",
-            "الاتصالات ليست عدد أجزاء الملف. التنزيل المتوازي متاح للملفات من 8 MiB. "
-            "ابدأ بمقارنة 6 و8 والعدد التلقائي على ملفات متقاربة؛ "
-            "الزيادة ليست ضمانًا لسرعة أعلى. ملفات Drive ↔ Telegram لها محرك منفصل."
+            "ثبّتنا تنزيل Telegram على 6 اتصالات للملفات من 8 MiB مؤقتًا. "
+            "ده غير حجم الأجزاء (512 KiB). المقارنة بين 6/8/18 هتبقى في اختبار لاحق؛ "
+            "خلايا نقل Drive ↔ Telegram ليها محرك مستقل."
         ),
         download_connections,
     ], layout=w.Layout(width="100%", padding="7px"))
@@ -253,12 +248,19 @@ def show_studio(engine):
     saving_hint = w.HTML(
         '<div dir="rtl" style="font-size:12px;color:#64748b;line-height:1.75">'
         '💾 <b>تشغيل:</b> يحفظ آخر إعدادات مستخدمة تلقائيًا في Google Drive. '
-        '<b>Save as Default:</b> يثبت هذه الإعدادات كمرجع ترجع له وقت ما تحب.'
+        '<b>Save as Default:</b> يثبت هذه الإعدادات كمرجع ترجع له وقت ما تحب. '
+        '⏹ <b>إيقاف:</b> يطلب إيقاف المهمة الحالية بأمان من غير مسح الملفات الأصلية.'
         '</div>', layout=wide_layout(),
     )
     run_button = w.Button(
         description="▶ تشغيل الضغط وحفظ آخر إعدادات", button_style="primary",
         icon="play", layout=button_layout(), tooltip="ابدأ ضغط الملفات الموجودة في قناة تيليجرام",
+    )
+    stop_button = w.Button(
+        description="⏹ إيقاف التشغيل بأمان", button_style="danger",
+        icon="stop", layout=button_layout(),
+        tooltip="أوقف التنزيل أو FFmpeg أو الرفع، مع الاحتفاظ بالأصول والنتائج المكتملة",
+        disabled=True,
     )
     pin_button = w.Button(
         description="💾 Save as Default | ثبّت كافتراضي", button_style="success",
@@ -320,7 +322,7 @@ def show_studio(engine):
         changing["presets"] = True
         try:
             for key, control in controls.items():
-                control.value = values[key]
+                control.value = "6" if key == "download_connections" else values[key]
         finally:
             changing["presets"] = False
         refresh()
@@ -427,36 +429,88 @@ def show_studio(engine):
         except Exception as exc:
             display_status("تعذر استرجاع الإعدادات: " + str(exc), False)
 
+    running = {"task": None}
+
+    def stop_clicked(_):
+        task = running["task"]
+        if stop_button.disabled or task is None or task.done():
+            return
+        engine.request_stop()
+        stop_button.disabled = True
+        stop_button.description = "⏳ جاري الإيقاف والتنظيف..."
+        display_status(
+            "⏹ طلب الإيقاف اتسجل. جاري إيقاف التنزيل/الضغط بأمان "
+            "وإغلاق أي عملية نشطة. النتائج المكتملة محفوظة.", False,
+        )
+
     def run_clicked(_):
-        if run_button.disabled:
+        if run_button.disabled or (
+            running["task"] is not None and not running["task"].done()
+        ):
             return
         try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            display_status(
+                "Colab لا يوفّر Event Loop نشطًا لأزرار التشغيل. "
+                "افتح النوتبوك على Colab وأعد تشغيل الخلية.", False
+            )
+            return
+
+        try:
             options = engine.normalize_studio_settings(collect())
+            options["download_connections"] = "6"
             ensure_drive()
             engine.save_studio_preferences(options)
         except Exception as exc:
             display_status("تعذر بدء التشغيل أو حفظ الإعدادات: " + str(exc), False)
             return
 
+        engine.reset_stop()
         engine.apply_studio_settings(options)
-        display_status("✓ اتسجلت آخر إعدادات تشغيل تلقائيًا في Google Drive. جاري المعالجة...")
+        display_status("✓ اتحفظت آخر إعداداتك على Drive. التشغيل بدأ؛ زر الإيقاف متاح.")
         run_button.disabled = True
+        stop_button.disabled = False
+        stop_button.description = "⏹ إيقاف التشغيل بأمان"
         pin_button.disabled = True
         restore_button.disabled = True
-        try:
-            with run_output:
-                clear_output(wait=True)
-                print("🗜️ Media Lite Studio — الإعدادات الحالية محفوظة على Drive.")
-                engine.run()
-            display_status("✓ انتهى تشغيل المحرك. راجع نتائج الملفات والأخطاء — إن وُجدت — في سجل التشغيل أدناه.")
-        except Exception as exc:
-            display_status("حدث خطأ أثناء التشغيل: " + str(exc), False)
-        finally:
-            run_button.disabled = False
-            pin_button.disabled = False
-            restore_button.disabled = False
+
+        async def execute():
+            try:
+                with run_output:
+                    clear_output(wait=True)
+                    print("🗜️ Media Lite Studio — تنزيل Telegram بست اتصالات؛ إيقاف آمن متاح.")
+                    result = await engine.run_async()
+                if result.get("stopped"):
+                    display_status(
+                        "⏹ تم إيقاف التشغيل. الملفات الأصلية محفوظة، "
+                        "والملفات التي لم تكتمل ستُعاد محاولتها في التشغيل القادم.",
+                    )
+                elif result.get("error"):
+                    display_status(
+                        f"⚠️ انتهى التشغيل بخطأ {result['error']}. راجع سجل التشغيل.",
+                        False,
+                    )
+                else:
+                    display_status("✓ انتهى التشغيل. راجع نتائج الملفات في سجل التشغيل.")
+            except Exception as exc:
+                display_status(
+                    "تعذر إكمال التشغيل: " + str(exc), False,
+                )
+            finally:
+                running["task"] = None
+                run_button.disabled = False
+                stop_button.disabled = True
+                stop_button.description = "⏹ إيقاف التشغيل بأمان"
+                pin_button.disabled = False
+                restore_button.disabled = False
+
+        # Schedule instead of calling engine.run() synchronously. This keeps
+        # the widget event loop responsive to the Stop button during uploads.
+        running["task"] = loop.create_task(execute())
 
     run_button.on_click(run_clicked)
+    stop_button.on_click(stop_clicked)
     pin_button.on_click(save_as_default)
     restore_button.on_click(restore_default)
 
@@ -469,7 +523,7 @@ def show_studio(engine):
                    "اضغط على القسم الذي تريد تعديله. لو مش محتاج تفاصيل تقنية، سيب الإعدادات كما هي."),
         advanced,
         skip_if_no_saving,
-        summary, saving_hint, run_button, pin_button, restore_button,
+        summary, saving_hint, run_button, stop_button, pin_button, restore_button,
         title_html("③ سجل التشغيل", "هتظهر هنا أوقات التحميل والضغط والرفع وأي ملاحظات أثناء المعالجة."),
         run_output,
         w.HTML('<div dir="rtl" style="font-size:11px;color:#64748b;margin:8px 0">'

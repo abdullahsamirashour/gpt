@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.request
@@ -24,7 +25,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.5.7"
+ENGINE_BUNDLE_VERSION = "5.5.8"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -80,7 +81,7 @@ TARGET_SIZE_TEXT = os.environ.get("TSC_TARGET_SIZE_MB", "").strip()
 STUDIO_SETTINGS_VERSION = 1
 STUDIO_FACTORY_SETTINGS = {
     "source": "auto",
-    "download_connections": "auto",
+    "download_connections": "6",
     "audio_preset": "speech",
     "audio_codec": "opus",
     "audio_kbps": 24,
@@ -112,6 +113,66 @@ STUDIO_VIDEO_PRESETS = {
     "fast": {"video_codec": "h264", "video_resolution": "720", "video_fps": "24", "video_crf": 30, "video_speed": "fast", "video_audio_kbps": 64, "video_rate_mode": "quality"},
 }
 ACTIVE_STUDIO_SETTINGS = None
+
+# Cooperative UI stop: no file or Telegram message is marked successful until
+# its existing transaction completes. Registered encoder/prober processes can
+# be terminated immediately by the button, without interrupting the kernel.
+class StopRequested(BaseException):
+    """User intentionally stopped Media Lite Studio, not an ordinary failure."""
+
+
+_STOP_SIGNAL = threading.Event()
+_SUBPROCESS_LOCK = threading.Lock()
+_ACTIVE_SUBPROCESSES = set()
+
+
+def reset_stop():
+    _STOP_SIGNAL.clear()
+
+
+def stop_requested():
+    return _STOP_SIGNAL.is_set()
+
+
+def check_stop():
+    if stop_requested():
+        raise StopRequested()
+
+
+def _register_subprocess(proc):
+    with _SUBPROCESS_LOCK:
+        _ACTIVE_SUBPROCESSES.add(proc)
+    if stop_requested() and proc.poll() is None:
+        proc.terminate()
+
+
+def _unregister_subprocess(proc):
+    with _SUBPROCESS_LOCK:
+        _ACTIVE_SUBPROCESSES.discard(proc)
+
+
+def request_stop():
+    """Signal both network callbacks and live FFmpeg/ffprobe subprocesses."""
+    _STOP_SIGNAL.set()
+    with _SUBPROCESS_LOCK:
+        processes = list(_ACTIVE_SUBPROCESSES)
+    for proc in processes:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except OSError:
+            pass
+    return len(processes)
+
+
+def _wait_for_subprocess(proc, timeout=2.0):
+    """Reap a stopped encoder; escalate only if it ignores termination."""
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
 
 
 def studio_settings_path():
@@ -163,6 +224,10 @@ def normalize_studio_settings(value):
 def apply_studio_settings(settings):
     global ACTIVE_STUDIO_SETTINGS
     ACTIVE_STUDIO_SETTINGS = normalize_studio_settings(settings)
+    # Deliberately keep compressor downloads at six MTProto connections until
+    # we have an on-device 6/8/18 benchmark. Older Drive JSON values cannot
+    # unexpectedly restore the high-connection mode.
+    ACTIVE_STUDIO_SETTINGS["download_connections"] = "6"
     return dict(ACTIVE_STUDIO_SETTINGS)
 
 
@@ -395,13 +460,28 @@ def show_log_controls(log_path: Path):
 
 
 def run_quiet(args, check=True):
-    result = subprocess.run(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
+    """Run FFprobe/peak analysis with responsive Studio stop support."""
+    check_stop()
+    proc = subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
+    _register_subprocess(proc)
+    try:
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                check_stop()
+        check_stop()
+        result = subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+    except BaseException:
+        if proc.poll() is None:
+            proc.terminate()
+        _wait_for_subprocess(proc)
+        raise
+    finally:
+        _unregister_subprocess(proc)
     if result.returncode != 0:
         _log_debug(
             f"command-failed rc={result.returncode} args={json.dumps([str(x) for x in args], ensure_ascii=False)} "
@@ -409,10 +489,7 @@ def run_quiet(args, check=True):
         )
         if check:
             raise subprocess.CalledProcessError(
-                result.returncode,
-                args,
-                output=result.stdout,
-                stderr=result.stderr,
+                result.returncode, args, output=result.stdout, stderr=result.stderr,
             )
     return result
 
@@ -901,14 +978,11 @@ def transfer_connection_count(size: int) -> int:
         return 4
     scaled = math.ceil((size / TURBO_FULL_SPEED_BYTES) * TURBO_MAX_CONNECTIONS)
     auto = min(TURBO_MAX_CONNECTIONS, max(4, scaled))
-    # Never silently change existing transfers: 'auto' keeps the legacy
-    # size-scaled behaviour. Advanced Studio can request a repeatable 4-18
-    # connection experiment on its own account, one transfer at a time.
+    # Studio mode is deliberately fixed at 6 for now. The legacy launchers
+    # retain their size-based behavior; the transfer-engine cells are separate.
     if ACTIVE_STUDIO_SETTINGS is not None:
-        value = ACTIVE_STUDIO_SETTINGS.get("download_connections", "auto")
-        if value != "auto":
-            parts = math.ceil(size / (TURBO_PART_KB * 1024))
-            return min(int(value), max(1, parts))
+        parts = math.ceil(size / (TURBO_PART_KB * 1024))
+        return min(6, max(1, parts))
     return auto
 
 
@@ -1019,6 +1093,7 @@ class LiveProgress:
         )
 
     def update(self, current, total, speed_override=None, force=False):
+        check_stop()
         now = time.time()
         current = float(current or 0)
         total = float(total or 0)
@@ -1106,6 +1181,7 @@ class LiveProgress:
 
 
 def run_ffmpeg(cmd, duration: float, label: str):
+    check_stop()
     full = [cmd[0], "-y", "-nostdin", "-hide_banner", "-loglevel", "error", *cmd[1:-1], "-progress", "pipe:1", "-nostats", cmd[-1]]
     _log_debug(
         f"ffmpeg-start label={label} cmd={json.dumps([str(x) for x in full], ensure_ascii=False)}"
@@ -1122,36 +1198,49 @@ def run_ffmpeg(cmd, duration: float, label: str):
     current_seconds = 0.0
     speed_x = None
 
-    if proc.stdout:
-        for raw in proc.stdout:
-            line = raw.strip()
-            lines.append(line)
+    _register_subprocess(proc)
+    try:
+        if proc.stdout:
+            for raw in proc.stdout:
+                line = raw.strip()
+                lines.append(line)
 
-            if line.startswith("speed="):
-                raw_speed = line.split("=", 1)[1].rstrip("x").strip()
-                try:
-                    speed_x = float(raw_speed)
-                except Exception:
-                    speed_x = None
+                if line.startswith("speed="):
+                    raw_speed = line.split("=", 1)[1].rstrip("x").strip()
+                    try:
+                        speed_x = float(raw_speed)
+                    except Exception:
+                        speed_x = None
 
-            if line.startswith("out_time_ms=") and duration > 0:
-                try:
-                    current_seconds = int(line.split("=", 1)[1]) / 1_000_000
-                    progress.update(current_seconds, duration, speed_override=speed_x)
-                except Exception:
-                    pass
+                if line.startswith("out_time_ms=") and duration > 0:
+                    try:
+                        current_seconds = int(line.split("=", 1)[1]) / 1_000_000
+                        progress.update(current_seconds, duration, speed_override=speed_x)
+                    except Exception:
+                        pass
 
-    code = proc.wait()
-    if code != 0:
-        tail = "\n".join(lines[-30:])
-        _log_debug(f"ffmpeg-failed label={label} rc={code} tail={tail}")
-        raise AppError("E420", "فشل ضغط الملف.", tail)
+        code = proc.wait()
+        check_stop()
+        if code != 0:
+            tail = "\n".join(lines[-30:])
+            _log_debug(f"ffmpeg-failed label={label} rc={code} tail={tail}")
+            raise AppError("E420", "فشل ضغط الملف.", tail)
 
-    _log_debug(f"ffmpeg-ok label={label} duration={duration:.3f} speed={speed_x}")
-    progress.finish(duration, speed_override=speed_x)
+        _log_debug(f"ffmpeg-ok label={label} duration={duration:.3f} speed={speed_x}")
+        progress.finish(duration, speed_override=speed_x)
 
+    except BaseException:
+        if proc.poll() is None:
+            proc.terminate()
+        _wait_for_subprocess(proc)
+        raise
+    finally:
+        _unregister_subprocess(proc)
+        if proc.stdout is not None:
+            proc.stdout.close()
 
 async def download_media_fast(client, msg, path: Path):
+    check_stop()
     size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
     progress = LiveProgress("تنزيل", "⬇️")
 
@@ -1177,6 +1266,7 @@ async def download_media_fast(client, msg, path: Path):
             async with aiofiles.open(str(path), "wb") as out:
                 done = 0
                 async for chunk in chunks:
+                    check_stop()
                     await out.write(chunk)
                     done += len(chunk)
                     progress.update(done, size)
@@ -1190,6 +1280,15 @@ async def download_media_fast(client, msg, path: Path):
                   f"{elapsed:.1f}s")
             return str(path), "turbo", elapsed
 
+        except (StopRequested, asyncio.CancelledError):
+            try:
+                if downloader is not None and getattr(downloader, "senders", None):
+                    await downloader._cleanup()
+            except Exception as cleanup_exc:
+                _log_debug(f"telegram-stop-cleanup: {type(cleanup_exc).__name__}: {cleanup_exc}")
+            finally:
+                path.unlink(missing_ok=True)
+            raise
         except Exception as exc:
             try:
                 if downloader is not None and getattr(downloader, "senders", None):
@@ -1206,11 +1305,13 @@ async def download_media_fast(client, msg, path: Path):
             print("↪️ تعذر التنزيل السريع؛ هنكمل تلقائيًا بالطريقة العادية.")
             progress = LiveProgress("تنزيل", "⬇️")
 
+    check_stop()
     downloaded = await client.download_media(
         msg,
         file=str(path),
         progress_callback=progress.callback,
     )
+    check_stop()
     elapsed = progress.finish(size or (Path(downloaded).stat().st_size if downloaded else 0))
     return downloaded, "normal", elapsed
 
@@ -2067,8 +2168,10 @@ async def prepare_job(client, job, index: int, total: int):
             raise AppError("E401", "تعذر تنزيل الملف من Telegram.")
         src = Path(downloaded)
 
+        check_stop()
         probe_started = time.time()
-        info = ffprobe(src)
+        info = await asyncio.to_thread(ffprobe, src)
+        check_stop()
         probe_seconds = time.time() - probe_started
 
         return {
@@ -2083,6 +2186,9 @@ async def prepare_job(client, job, index: int, total: int):
             "download_mode": mode,
             "error": None,
         }
+    except (StopRequested, asyncio.CancelledError):
+        src.unlink(missing_ok=True)
+        raise
     except AppError as exc:
         try:
             if src.exists():
@@ -2142,6 +2248,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
     version = int(parent_lineage.get("version", 0)) + 1
 
     try:
+        check_stop()
         # "1" must replay the original output settings, not today's dashboard.
         studio_for_job = ACTIVE_STUDIO_SETTINGS
         replay_profile = None
@@ -2190,7 +2297,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
 
             encode_started = time.time()
             try:
-                encode_audio(src, dst, info, settings=selected_audio)
+                await asyncio.to_thread(encode_audio, src, dst, info, settings=selected_audio)
             finally:
                 timings["encode"] += time.time() - encode_started
 
@@ -2254,7 +2361,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
             if profile in ("VIDEO_BALANCED", "VIDEO_FAST") and nvenc:
                 print("⚡ كارت الشاشة متاح للترميز.")
 
-            encode_video(src, dst, info, profile, target_mb, nvenc, timings=timings, settings=studio_for_job)
+            await asyncio.to_thread(encode_video, src, dst, info, profile, target_mb, nvenc, timings=timings, settings=studio_for_job)
             if (studio_for_job is None or studio_for_job["skip_if_no_saving"]) and dst.stat().st_size >= src.stat().st_size * 0.98:
                 raise AppError("E430", "الملف مضغوط بالفعل تقريبًا؛ إعادة الضغط مش هتوفر مساحة مفيدة.")
 
@@ -2468,27 +2575,41 @@ async def app():
         started = time.time()
         results = []
 
-        # Pipeline: while file N is being compressed/uploaded, file N+1 downloads.
+        # Pipeline: the next file is downloaded while the current one is
+        # encoded/uploaded. Always cancel and clean any unconsumed prefetched
+        # file when Stop is requested, including if the next task finished.
         current_download = asyncio.create_task(prepare_job(client, jobs[0], 1, len(jobs)))
+        try:
+            for idx, job in enumerate(jobs, 1):
+                check_stop()
+                prepared = await current_download
 
-        for idx, job in enumerate(jobs, 1):
-            prepared = await current_download
+                if idx < len(jobs):
+                    current_download = asyncio.create_task(
+                        prepare_job(client, jobs[idx], idx + 1, len(jobs))
+                    )
 
-            if idx < len(jobs):
-                current_download = asyncio.create_task(
-                    prepare_job(client, jobs[idx], idx + 1, len(jobs))
+                result = await process_job(
+                    client, channel, state, prepared,
+                    nvenc=nvenc, index=idx, total=len(jobs),
                 )
-
-            result = await process_job(
-                client,
-                channel,
-                state,
-                prepared,
-                nvenc=nvenc,
-                index=idx,
-                total=len(jobs),
-            )
-            results.append(result)
+                results.append(result)
+                check_stop()
+        finally:
+            if current_download is not None:
+                if not current_download.done():
+                    current_download.cancel()
+                try:
+                    unconsumed = await current_download
+                except (StopRequested, asyncio.CancelledError):
+                    pass
+                except Exception as exc:
+                    _log_debug(f"prefetch-cleanup: {type(exc).__name__}: {exc}")
+                else:
+                    # Harmless if process_job has already deleted the source.
+                    local = unconsumed.get("src") if isinstance(unconsumed, dict) else None
+                    if local:
+                        Path(local).unlink(missing_ok=True)
 
         ok = sum(1 for r in results if r["ok"])
         skipped = sum(1 for r in results if r.get("skipped"))
@@ -2516,7 +2637,60 @@ async def app():
 
 
 
+
+async def run_async():
+    """Studio-only non-blocking launcher; preserves the legacy run() path.
+
+    Launched as an asyncio task from the Run button so Stop clicks remain
+    actionable even while encoding (CPU-bound encoding runs in to_thread).
+    """
+    use_run_log = os.environ.get("TSC_TEST_MODE") != "1"
+    log_path = None
+    if use_run_log:
+        try:
+            log_path = _start_run_log()
+        except Exception:
+            log_path = None
+    print(f"✅ المحرك {ENGINE_BUNDLE_VERSION}")
+    try:
+        await asyncio.to_thread(ensure_dependencies)
+        check_stop()
+        await app()
+        return {"stopped": False, "error": None}
+    except (StopRequested, asyncio.CancelledError):
+        print("⏹️ تم إيقاف التشغيل بطلبك. الملفات الأصلية لم تتأثر.")
+        return {"stopped": True, "error": None}
+    except AppError as exc:
+        _log_debug(f"app-error {exc.code}: {exc.details or exc.message}")
+        print(f"❌ {exc.code} — {exc.message}")
+        if exc.details:
+            try:
+                BASE_DIR.mkdir(parents=True, exist_ok=True)
+                ERROR_LOG.write_text(exc.details, encoding="utf-8")
+                print("📝 تفاصيل الخطأ محفوظة على Drive.")
+            except Exception:
+                print("📝 تعذر حفظ تفاصيل الخطأ على Drive.")
+        return {"stopped": False, "error": exc.code}
+    except Exception as exc:
+        details = traceback.format_exc()
+        _log_debug(details)
+        try:
+            BASE_DIR.mkdir(parents=True, exist_ok=True)
+            ERROR_LOG.write_text(details, encoding="utf-8")
+        except Exception:
+            pass
+        print(f"❌ E999 — {type(exc).__name__}")
+        return {"stopped": False, "error": "E999"}
+    finally:
+        if use_run_log:
+            _log_debug("run-end")
+            _stop_run_log()
+            if log_path is not None and log_path.exists():
+                show_log_controls(log_path)
+
+
 def run():
+    reset_stop()
     use_run_log = os.environ.get("TSC_TEST_MODE") != "1"
     log_path = None
     if use_run_log:

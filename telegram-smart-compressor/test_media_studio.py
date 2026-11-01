@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
 """Media Lite Studio offline settings, codec command, and UX smoke tests."""
 import importlib.util
+import asyncio
 import json
 import os
 import sys
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 os.environ["TSC_TEST_MODE"] = "1"
 ENGINE = Path(__file__).with_name("engine.py")
@@ -24,6 +27,7 @@ spec.loader.exec_module(engine)
 class StudioPreferencesTests(unittest.TestCase):
     def tearDown(self):
         engine.ACTIVE_STUDIO_SETTINGS = None
+        engine.reset_stop()
 
     def test_factory_values_are_validated_and_legacy_mode_is_unchanged(self):
         d = engine.normalize_studio_settings({})
@@ -171,18 +175,14 @@ class StudioPreferencesTests(unittest.TestCase):
 
 
 
-    def test_download_connection_count_is_configurable_and_legacy_auto_is_unchanged(self):
+    def test_download_is_fixed_six_in_studio_but_legacy_launchers_keep_auto(self):
         size = int(87.9 * 1024**2)
         self.assertEqual(engine.transfer_connection_count(size), 18)
-        self.assertEqual(engine.normalize_studio_settings({})["download_connections"], "auto")
-        engine.apply_studio_settings({"download_connections": "6"})
-        self.assertEqual(engine.transfer_connection_count(size), 6)
-        engine.apply_studio_settings({"download_connections": "8"})
-        self.assertEqual(engine.transfer_connection_count(size), 8)
-        engine.apply_studio_settings({"download_connections": "18"})
-        self.assertEqual(engine.transfer_connection_count(size), 18)
-        engine.apply_studio_settings({"download_connections": "auto"})
-        self.assertEqual(engine.transfer_connection_count(size), 18)
+        self.assertEqual(engine.normalize_studio_settings({})["download_connections"], "6")
+        for old_value in ("auto", "8", "18", "4", "6"):
+            engine.apply_studio_settings({"download_connections": old_value})
+            self.assertEqual(engine.ACTIVE_STUDIO_SETTINGS["download_connections"], "6")
+            self.assertEqual(engine.transfer_connection_count(size), 6)
         with self.assertRaises(ValueError):
             engine.normalize_studio_settings({"download_connections": "999"})
 
@@ -218,7 +218,7 @@ class StudioPreferencesTests(unittest.TestCase):
             engine.BASE_DIR = Path(td)
             try:
                 with patch.object(engine, "mount_drive", return_value=None), \
-                     patch.object(engine, "run", return_value=None) as execute, \
+                     patch.object(engine, "run_async", new_callable=AsyncMock, return_value={"stopped": False, "error": None}) as execute, \
                      patch("IPython.display.display"):
                     dashboard = studio.show_studio(engine)
                     buttons = [
@@ -267,19 +267,22 @@ class StudioPreferencesTests(unittest.TestCase):
                     rate_mode.value = "quality"
 
                     connections = next(item for item in accordion.children[2].children
-                                       if getattr(item, "description", "") == "عدد الاتصالات")
-                    connections.value = "6"
+                                       if getattr(item, "description", "") == "تنزيل Telegram")
+                    self.assertTrue(connections.disabled)
+                    self.assertEqual(connections.value, "6")
                     codec.value = "mp3"
                     bitrate.value = 64
                     pin_button.click()
                     self.assertEqual(engine.load_studio_preferences()["default"]["download_connections"], "6")
                     self.assertEqual(engine.load_studio_preferences()["default"]["audio_kbps"], 64)
 
-                    connections.value = "auto"
                     codec.value = "opus"
                     bitrate.value = 24
-                    run_button.click()
-                    execute.assert_called_once()
+                    async def press_run():
+                        run_button.click()
+                        await asyncio.sleep(0.05)
+                    asyncio.run(press_run())
+                    execute.assert_awaited_once()
                     stored = engine.load_studio_preferences()
                     self.assertEqual(stored["last_used"]["audio_codec"], "opus")
                     self.assertEqual(stored["default"]["audio_codec"], "mp3")
@@ -291,6 +294,89 @@ class StudioPreferencesTests(unittest.TestCase):
                 engine.BASE_DIR = original_base
 
 
+
+    def test_stop_button_is_clickable_during_an_active_async_run(self):
+        import ipywidgets as widgets
+        path = Path(__file__).with_name("media_studio_ui.py")
+        spec = importlib.util.spec_from_file_location("tsc_ui_stop_test", path)
+        ui = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ui)
+
+        async def fake_long_run():
+            while not engine.stop_requested():
+                await asyncio.sleep(0.01)
+            return {"stopped": True, "error": None}
+
+        original_base = engine.BASE_DIR
+        with tempfile.TemporaryDirectory() as td:
+            engine.BASE_DIR = Path(td)
+            try:
+                with patch.object(engine, "mount_drive", return_value=None), \
+                     patch.object(engine, "run_async", side_effect=fake_long_run), \
+                     patch("IPython.display.display"):
+                    dashboard = ui.show_studio(engine)
+                    buttons = [x for x in dashboard.children if isinstance(x, widgets.Button)]
+                    run = next(x for x in buttons if "تشغيل الضغط" in x.description)
+                    stop = next(x for x in buttons if "إيقاف التشغيل" in x.description)
+                    pin = next(x for x in buttons if "Save as Default" in x.description)
+                    self.assertTrue(stop.disabled)
+
+                    async def action():
+                        run.click()
+                        self.assertTrue(run.disabled)
+                        self.assertFalse(stop.disabled)
+                        self.assertTrue(pin.disabled)
+                        await asyncio.sleep(0.03)
+                        stop.click()
+                        self.assertTrue(engine.stop_requested())
+                        self.assertTrue(stop.disabled)
+                        await asyncio.sleep(0.05)
+
+                    asyncio.run(action())
+                    self.assertFalse(run.disabled)
+                    self.assertTrue(stop.disabled)
+                    self.assertFalse(pin.disabled)
+                    self.assertIn("تم إيقاف التشغيل", dashboard.children[1].value)
+            finally:
+                engine.BASE_DIR = original_base
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg unavailable")
+    def test_stop_terminates_running_encoder_without_damaging_source(self):
+        engine.reset_stop()
+        errors = []
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / "source.txt"
+            src.write_text("keep-original-untouched")
+            target = Path(td) / "encoding.ogg"
+            cmd = [
+                "ffmpeg", "-re", "-f", "lavfi",
+                "-i", "sine=frequency=600:sample_rate=48000",
+                "-t", "12", "-c:a", "libopus", str(target),
+            ]
+
+            def worker():
+                try:
+                    engine.run_ffmpeg(cmd, 12, "test-stop")
+                except BaseException as exc:
+                    errors.append(exc)
+
+            worker_thread = threading.Thread(target=worker)
+            worker_thread.start()
+            started = time.monotonic()
+            while time.monotonic() - started < 4:
+                with engine._SUBPROCESS_LOCK:
+                    active = bool(engine._ACTIVE_SUBPROCESSES)
+                if active:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(active, "FFmpeg did not start in time")
+            engine.request_stop()
+            worker_thread.join(5)
+            self.assertFalse(worker_thread.is_alive(), "FFmpeg ignored Stop")
+            self.assertTrue(errors)
+            self.assertIsInstance(errors[0], engine.StopRequested)
+            self.assertEqual(src.read_text(), "keep-original-untouched")
+        engine.reset_stop()
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg unavailable")
     def test_real_ffmpeg_media_studio_encode_smoke(self):
