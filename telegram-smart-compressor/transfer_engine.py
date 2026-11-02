@@ -2009,6 +2009,7 @@ async def _run_transfer(
     reupload_selected: bool = False, selected_numbers: str = "",
     drive_subfolder: str = "", telegram_hashtag: str = "",
     delete_after_transfer: bool = False,
+    recopy_previously_transferred: bool = False,
 ) -> dict:
     drive_subfolder = normalize_transfer_subfolder(drive_subfolder)
     telegram_hashtag = normalize_transfer_hashtag(telegram_hashtag)
@@ -2074,6 +2075,7 @@ async def _run_transfer(
                 client, source_entity, service, state, dest_id, max_files, preview,
                 subfolder_name=drive_subfolder,
                 delete_after_transfer=delete_after_transfer,
+                recopy_previously_transferred=recopy_previously_transferred,
             )
         raise ValueError("اتجاه النقل غير معروف.")
     finally:
@@ -2090,8 +2092,15 @@ def run_transfer(
     login_method: str = "code", reupload_selected: bool = False,
     selected_numbers: str = "", drive_subfolder: str = "",
     telegram_hashtag: str = "", delete_after_transfer: bool = False,
+    recopy_previously_transferred: bool = False,
 ) -> None:
     """Entry point called by the small GitHub-backed Colab launcher cell."""
+    if not isinstance(recopy_previously_transferred, bool):
+        raise ValueError("إعادة نقل القديم لازم تكون True أو False.")
+    if recopy_previously_transferred and delete_after_transfer:
+        raise ValueError("مينفعش تشغّل إعادة نسخ القديم والحذف في نفس الوقت.")
+    if direction != "telegram_to_drive" and recopy_previously_transferred:
+        raise ValueError("إعادة نقل القديم متاحة فقط لاتجاه Telegram → Drive.")
     if not isinstance(delete_after_transfer, bool):
         raise ValueError("خيار حذف Telegram لازم يكون True أو False.")
     if direction != "telegram_to_drive" and delete_after_transfer:
@@ -2135,6 +2144,7 @@ def run_transfer(
                         service, direction, source, destination, max_files, recursive,
                         preview, login_method, reupload_selected, selected_numbers,
                         drive_subfolder, telegram_hashtag, delete_after_transfer,
+                        recopy_previously_transferred,
                     )
                 )
             print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']}"
@@ -2149,6 +2159,7 @@ def run_transfer(
                     "drive_subfolder": drive_subfolder if direction == "telegram_to_drive" else "",
                     "telegram_hashtag": telegram_hashtag if direction == "drive_to_telegram" else "",
                     "delete_after_transfer": delete_after_transfer,
+                    "recopy_previously_transferred": recopy_previously_transferred,
                     **result,
                 })
         except KeyboardInterrupt:
