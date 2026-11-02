@@ -1487,18 +1487,25 @@ async def fetch_telegram_message(client, channel, msg, local: Path, size: int, d
 
 async def transfer_telegram_to_drive(
     client, channel, service, state: dict, folder_id: str, max_files: int, preview: bool,
+    subfolder_name: str = "",
 ) -> dict:
     from telethon import utils
 
+    subfolder_name = normalize_transfer_subfolder(subfolder_name)
     peer_id = utils.get_peer_id(channel)
+    records = state_section(state, "telegram_to_drive")
+    source_name = clean_filename(getattr(channel, "title", "") or "Telegram")
+    target_name = subfolder_name or source_name
+    print(f"📁 الحفظ: {DEFAULT_DRIVE_FOLDER if folder_id else 'Drive'} / {target_name}"
+          + (" (فولدر مخصص؛ يُنشأ لو مش موجود)" if subfolder_name else ""))
     downloaded = []
     async for msg in client.iter_messages(channel, limit=SCAN_LIMIT):
         if not getattr(msg, "file", None):
             continue
         if "MLTX:" in (msg.message or ""):
             continue  # Drive → Telegram uploads must never bounce back to Drive.
-        key = origin_key(peer_id, int(msg.id))
-        if state_section(state, "telegram_to_drive").get(key):
+        key = telegram_drive_state_key(peer_id, int(msg.id), folder_id, subfolder_name)
+        if records.get(key):
             continue
         downloaded.append(msg)
     jobs = list(reversed(downloaded))
@@ -1508,18 +1515,20 @@ async def transfer_telegram_to_drive(
     for msg in jobs[:10]:
         print(" •", clean_filename(getattr(msg.file, "name", "") or f"telegram_{msg.id}"))
     if preview:
-        print("👁️ معاينة فقط — لم يتم نقل ملفات.")
+        print("👁️ معاينة فقط — لم يتم نقل ملفات أو إنشاء فولدر.")
         return {"ok": 0, "skipped": 0, "failed": 0}
 
-    records = state_section(state, "telegram_to_drive")
     counters = {"ok": 0, "skipped": 0, "failed": 0}
+    if not jobs:
+        print("✅ مفيش ملفات جديدة للوجهة المختارة.")
+        return counters
     folder_cache = {}
-    source_name = clean_filename(getattr(channel, "title", "") or "Telegram")
-    dst_folder = ensure_child_folder(service, folder_id, source_name, folder_cache)
+    dst_folder = ensure_child_folder(service, folder_id, target_name, folder_cache)
+    print(f"✅ فولدر الحفظ جاهز: {target_name}")
     downloader = TelegramParallelDownloader(client) if TelegramParallelDownloader.supported(client) else None
     print(f"⚡ Telegram parallel download: من 5 MiB، {TG_PARALLEL_CONNECTIONS} اتصالات؛ fallback تلقائي.")
     for index, msg in enumerate(jobs, 1):
-        key = origin_key(peer_id, int(msg.id))
+        key = telegram_drive_state_key(peer_id, int(msg.id), folder_id, subfolder_name)
         size = int(getattr(msg.file, "size", 0) or 0)
         name = clean_filename(
             getattr(msg.file, "name", None) or f"telegram_{msg.id}{getattr(msg.file, 'ext', '') or ''}"
