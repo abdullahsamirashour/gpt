@@ -1377,6 +1377,15 @@ class TelegramSafeDeleteTests(unittest.TestCase):
                 asyncio.run(transfer.delete_telegram_after_confirmed_drive_upload(
                     Telegram(), channel, message, object(), "destination-folder", record,
                 ))
+        with patch.object(transfer, "get_drive_metadata", return_value={
+            "id": "file", "size": str(len(payload)),
+            "md5Checksum": md5, "parents": ["destination-folder"], "trashed": True,
+        }):
+            with self.assertRaisesRegex(RuntimeError, "Google Drive"):
+                asyncio.run(transfer.delete_telegram_after_confirmed_drive_upload(
+                    Telegram(), channel, message, object(), "destination-folder", record,
+                ))
+
         changed = SimpleNamespace(
             id=42, document=SimpleNamespace(id=9999), file=message.file)
         with self.assertRaisesRegex(ValueError, "هوية"):
