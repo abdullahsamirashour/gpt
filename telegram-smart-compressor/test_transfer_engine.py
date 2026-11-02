@@ -527,6 +527,7 @@ class TransferEngineTests(unittest.TestCase):
             "md5Checksum": hashlib.md5(payload).hexdigest(),
         }
         telegram = FakeTelegram()
+        channel = SimpleNamespace(id=909, title="Media Lite Transfer")
         state = transfer.new_state()
         old_root, old_state, old_limit = transfer.TEMP_ROOT, transfer.STATE_PATH, transfer.MAX_TG_PART
         try:
@@ -540,7 +541,7 @@ class TransferEngineTests(unittest.TestCase):
                 service = FakeDrive(FakeFiles(metas={source_id: meta}))
                 with patch.object(transfer, "download_drive_file", fake_download):
                     result = asyncio.run(transfer.transfer_drive_to_telegram(
-                        telegram, object(), service, state, source_id, True, 20, False
+                        telegram, channel, service, state, source_id, True, 20, False
                     ))
                     self.assertEqual(result["ok"], 1)
                     self.assertEqual([m[2] for m in telegram.messages[:3]], [3, 3, 2])
@@ -550,10 +551,14 @@ class TransferEngineTests(unittest.TestCase):
                         "archive.bin.part001", "archive.bin.part002", "archive.bin.part003"
                     ])
                     self.assertEqual(len(telegram.messages), 4)  # 3 parts and manifest
+                    self.assertEqual(
+                        set(state["drive_to_telegram_message_ids"]["909"]),
+                        {"100", "101", "102", "103"},
+                    )
                     token = transfer.transfer_token(meta)
                     self.assertTrue(state["drive_to_telegram"][token]["done"])
                     repeat = asyncio.run(transfer.transfer_drive_to_telegram(
-                        telegram, object(), service, state, source_id, True, 20, False
+                        telegram, channel, service, state, source_id, True, 20, False
                     ))
                     self.assertEqual(repeat["skipped"], 1)
                     self.assertEqual(len(telegram.messages), 4)
@@ -947,15 +952,13 @@ class CustomTransferOptionsTests(unittest.TestCase):
             transfer.add_transfer_hashtag("original caption", ""), "original caption"
         )
 
-    def test_named_drive_folder_is_created_once_and_destination_receipts_are_separate(self):
+    def test_named_folder_skips_historic_copy_by_default_and_recopy_requires_opt_in(self):
         class FolderFiles:
             def __init__(self):
                 self.children = {}
                 self.created = []
-                self.list_queries = []
 
             def list(self, q, **_kwargs):
-                self.list_queries.append(q)
                 items = [
                     {"id": fid} for (parent, name), fid in self.children.items()
                     if f"'{parent}' in parents" in q and f"name = '{name}'" in q
@@ -984,19 +987,24 @@ class CustomTransferOptionsTests(unittest.TestCase):
                 progress_callback(4, 4)
                 return file
 
+            async def delete_messages(self, *_args, **_kwargs):
+                raise AssertionError("Historical messages must never auto-delete")
+
         files = FolderFiles()
         drive = FakeDrive(files)
         client = FakeTelegram()
         channel = SimpleNamespace(id=12, title="Channel Name")
         state = transfer.new_state()
         old_key = transfer.origin_key(-10012, 42)
-        state["telegram_to_drive"][old_key] = {"drive_id": "old-default-copy"}
+        state["telegram_to_drive"][old_key] = {
+            "drive_id": "old-default-copy", "size": 4,
+        }
         uploads = []
 
         def fake_upload(_service, local, folder_id, name, key):
             self.assertEqual(Path(local).read_bytes(), b"OggS")
             uploads.append((folder_id, name, key))
-            return {"id": f"saved_{len(uploads)}"}
+            return {"id": f"saved_{len(uploads)}", "size": 4}
 
         with tempfile.TemporaryDirectory() as td:
             with patch.object(transfer, "TEMP_ROOT", Path(td)), \
@@ -1004,38 +1012,47 @@ class CustomTransferOptionsTests(unittest.TestCase):
                  patch("telethon.utils.get_peer_id", return_value=-10012), \
                  patch.object(transfer, "existing_drive_copy", return_value=None), \
                  patch.object(transfer, "upload_drive_file", side_effect=fake_upload):
-                def run(name, preview=False):
+                def run(name, preview=False, force=False):
                     return asyncio.run(transfer.transfer_telegram_to_drive(
                         client, channel, drive, state, "base-folder", 0, preview,
-                        subfolder_name=name))
+                        subfolder_name=name, recopy_previously_transferred=force))
 
-                self.assertEqual(run("محاضرات نوفمبر", preview=True)["ok"], 0)
+                preview = run("محاضرات نوفمبر", preview=True)
+                self.assertEqual(preview["new"], 0)
+                self.assertEqual(preview["already_transferred"], 1)
+                self.assertFalse(files.created)
+                self.assertFalse(client.downloads)
+
+                # The empty destination does NOT make an old message new.
+                self.assertEqual(run("محاضرات نوفمبر")["ok"], 0)
                 self.assertEqual(len(files.created), 0)
-                self.assertEqual(client.downloads, 0)
-                self.assertEqual(run("محاضرات نوفمبر")["ok"], 1)
+                self.assertIn(old_key, state["telegram_to_drive_seen"])
+
+                # Explicit manual re-copy may populate a different folder.
+                self.assertEqual(run("محاضرات نوفمبر", force=True)["ok"], 1)
                 self.assertEqual(files.created[0][1]["parents"], ["base-folder"])
                 self.assertEqual(files.created[0][1]["name"], "محاضرات نوفمبر")
                 self.assertEqual(uploads[0][0], "subfolder_1")
-                # Drive appProperties keeps the original provenance token,
-                # while the local state key is specific to this destination.
                 self.assertEqual(uploads[0][2], old_key)
                 scoped = transfer.telegram_drive_state_key(
                     -10012, 42, "subfolder_1", "محاضرات نوفمبر")
-                self.assertNotEqual(scoped, old_key)
                 self.assertIn(scoped, state["telegram_to_drive"])
                 self.assertEqual(run("محاضرات نوفمبر")["ok"], 0)
                 self.assertEqual(client.downloads, 1)
+
+                # Other new folders don't cause more copying without opt-in.
+                self.assertEqual(run("مراجعة")["ok"], 0)
                 self.assertEqual(len(files.created), 1)
-                self.assertEqual(run("مراجعة")["ok"], 1)
-                self.assertEqual(len(files.created), 2)
+                self.assertEqual(run("مراجعة", force=True)["ok"], 1)
                 self.assertEqual(uploads[-1][0], "subfolder_2")
-                # If the named folder was deleted, it is recreated and the
-                # same Telegram message is copied into this new folder.
+
+                # Removing and recreating a folder never silently triggers a re-copy.
                 del files.children[("base-folder", "محاضرات نوفمبر")]
-                self.assertEqual(run("محاضرات نوفمبر")["ok"], 1)
-                self.assertEqual(files.created[-1][0], "subfolder_3")
+                self.assertEqual(run("محاضرات نوفمبر")["ok"], 0)
+                self.assertEqual(len(files.created), 2)
+                self.assertEqual(run("محاضرات نوفمبر", force=True)["ok"], 1)
                 self.assertEqual(uploads[-1][0], "subfolder_3")
-                self.assertEqual(run("")["ok"], 0)  # Legacy default remains done.
+                self.assertEqual(run("")["ok"], 0)  # Legacy original is done.
                 self.assertEqual(len(files.created), 3)
 
     def test_drive_preview_folder_lookup_never_calls_create(self):
@@ -1420,6 +1437,179 @@ class TelegramSafeDeleteTests(unittest.TestCase):
         self.assertIn('حذف_رسائل_Telegram_بعد_التحقق = False #@param {type:"boolean"}', to_drive)
         self.assertIn("delete_after_transfer=حذف_رسائل_Telegram_بعد_التحقق", to_drive)
         compile(to_drive, "telegram-to-drive-colab-form", "exec")
+
+
+
+
+class GlobalTelegramHistoryRegressionTests(unittest.TestCase):
+    """No credential/network calls; treat message identity as globally stable."""
+
+    def test_migration_of_legacy_and_folder_scoped_receipts_is_read_only(self):
+        legacy = transfer.origin_key(-100100, 21)
+        named = transfer.telegram_drive_state_key(-100100, 22, "drive-sub1", "نوفمبر")
+        state = {
+            "telegram_to_drive": {
+                legacy: {"drive_id": "previous", "size": 17},
+                named: {"drive_id": "named", "size": 18},
+                "folder-bad-format:-100100_25": {"drive_id": "untrusted"},
+                "-100100_23": {"size": 19},  # Never finished uploading.
+            },
+            "drive_to_telegram": {},
+        }
+        before = json.dumps(state, sort_keys=True)
+        seen = transfer.transferred_telegram_origins(state)
+        self.assertEqual(set(seen), {"-100100_21", "-100100_22"})
+        self.assertEqual(seen["-100100_22"]["size"], 18)
+        self.assertEqual(json.dumps(state, sort_keys=True), before)
+        self.assertEqual(transfer.canonical_telegram_origin_from_receipt(named),
+                         "-100100_22")
+        self.assertEqual(transfer.canonical_telegram_origin_from_receipt("bad"), "")
+
+    def test_drive_origin_index_recovers_legacy_manifest_reupload_and_caption_edits(self):
+        channel = SimpleNamespace(id=12345)
+        state = transfer.new_state()
+        state["drive_to_telegram_channel_id"] = 12345
+        state["drive_to_telegram"] = {
+            "oldtoken": {
+                "done": True, "parts": {"1": 42, "2": 43},
+                "manifest_id": 44,
+                "history": [{"parts": {"1": 45}, "manifest_id": 46}],
+                "reupload": {"parts": {"1": 47}, "manifest_id": 48},
+            }
+        }
+        existing = transfer.known_drive_to_telegram_message_ids(state, channel)
+        self.assertEqual(existing, {42, 43, 44, 45, 46, 47, 48})
+        transfer.remember_outbound_telegram_id(state, channel, 49)
+        self.assertIn(49, transfer.known_drive_to_telegram_message_ids(state, channel))
+        self.assertEqual(transfer.known_drive_to_telegram_message_ids(
+            state, SimpleNamespace(id=12346)), set())
+        with patch.object(transfer, "save_json"):
+            transfer.bind_transfer_channel(state, 12346)  # Old history is retained.
+        self.assertEqual(state["drive_to_telegram"], {})
+        self.assertEqual(
+            transfer.known_drive_to_telegram_message_ids(state, channel),
+            {42, 43, 44, 45, 46, 47, 48, 49},
+        )
+        self.assertEqual(transfer.known_drive_to_telegram_message_ids(
+            state, SimpleNamespace(id=12346)), set())
+
+    def test_new_only_scans_skip_old_receipts_and_drive_origin_posts_even_in_empty_folder(self):
+        channel = SimpleNamespace(id=12, title="Lecture channel")
+        def file_message(mid, caption, name="lecture.bin"):
+            return SimpleNamespace(
+                id=mid, message=caption,
+                file=SimpleNamespace(name=name, size=4, ext=".bin"),
+            )
+        old_msg = file_message(21, "Old Telegram lecture")
+        edited_drive_upload = file_message(25, "Caption edited without the MLTX marker")
+        tagged_drive_upload = file_message(26, "MLTX:0123456789abcdefab:1/1")
+        brand_new = file_message(27, "A newly uploaded lecture")
+        messages = [brand_new, tagged_drive_upload, edited_drive_upload, old_msg]
+
+        class FakeTelegram:
+            def __init__(self):
+                self.downloaded = []
+                self.deleted = []
+
+            async def iter_messages(self, _channel, limit):
+                for msg in messages[:limit]:
+                    yield msg
+
+            async def download_media(self, msg, *, file, progress_callback):
+                self.downloaded.append(msg.id)
+                Path(file).write_bytes(b"file")
+                progress_callback(4, 4)
+                return file
+
+            async def delete_messages(self, channel_ref, ids, **_kwargs):
+                self.deleted.extend(ids)
+                raise AssertionError("Already transferred old posts must not be deleted")
+
+        telegram = FakeTelegram()
+        state = transfer.new_state()
+        legacy = transfer.origin_key(-10012, 21)
+        state["telegram_to_drive"][legacy] = {
+            "drive_id": "archive-copy", "size": 4,
+        }
+        state["drive_to_telegram_channel_id"] = 12
+        state["drive_to_telegram"] = {
+            "drive-token": {"done": True, "parts": {"1": 25}}
+        }
+        destinations_created = []
+        uploads = []
+
+        def make_folder(_service, parent, name, _cache):
+            destinations_created.append(name)
+            return f"folder-{len(destinations_created)}"
+
+        def upload(_service, source, dst_folder, filename, origin):
+            self.assertEqual(Path(source).read_bytes(), b"file")
+            uploads.append((dst_folder, filename, origin))
+            return {"id": f"drive-upload-{len(uploads)}", "size": 4}
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "state.json"
+            with patch("telethon.utils.get_peer_id", return_value=-10012), \
+                 patch.object(transfer, "TEMP_ROOT", Path(td)), \
+                 patch.object(transfer, "STATE_PATH", path), \
+                 patch.object(transfer, "find_child_folder", return_value=""), \
+                 patch.object(transfer, "ensure_child_folder", side_effect=make_folder), \
+                 patch.object(transfer, "existing_drive_copy", return_value=None), \
+                 patch.object(transfer, "upload_drive_file", side_effect=upload):
+                def run(name, preview=False, delete=False):
+                    return asyncio.run(transfer.transfer_telegram_to_drive(
+                        telegram, channel, object(), state, "parent", 0, preview,
+                        subfolder_name=name, delete_after_transfer=delete,
+                    ))
+                preview = run("empty-destination", preview=True)
+                self.assertEqual(preview["new"], 1)
+                self.assertEqual(preview["already_transferred"], 1)
+                self.assertEqual(preview["from_drive"], 2)
+                self.assertFalse(destinations_created)
+                self.assertFalse(path.exists())  # No hidden state writes in Preview.
+
+                actual = run("empty-destination")
+                self.assertEqual(actual["ok"], 1)
+                self.assertEqual(actual["already_transferred"], 1)
+                self.assertEqual(actual["from_drive"], 2)
+                self.assertEqual(telegram.downloaded, [27])
+                self.assertEqual(uploads, [("folder-1", "lecture.bin", "-10012_27")])
+                self.assertEqual(destinations_created, ["empty-destination"])
+                self.assertTrue(path.exists())
+                self.assertEqual(set(state["telegram_to_drive_seen"]),
+                                 {"-10012_21", "-10012_27"})
+
+                another = run("another-empty-destination", delete=True)
+                self.assertEqual(another["ok"], 0)
+                self.assertEqual(another["deleted"], 0)
+                self.assertEqual(another["already_transferred"], 2)
+                self.assertEqual(telegram.downloaded, [27])
+                self.assertEqual(telegram.deleted, [])
+                self.assertEqual(destinations_created, ["empty-destination"])
+
+    def test_manual_recopy_and_delete_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "الحذف"):
+            asyncio.run(transfer.transfer_telegram_to_drive(
+                object(), object(), object(), {}, "folder", 0, False,
+                recopy_previously_transferred=True, delete_after_transfer=True))
+        with self.assertRaises(ValueError):
+            transfer.run_transfer(
+                direction="telegram_to_drive",
+                delete_after_transfer=True, recopy_previously_transferred=True)
+
+    def test_colab_form_new_only_is_default_and_existing_cells_are_untouched(self):
+        nb = json.loads(Path(__file__).with_name("Smart_Compressor.ipynb").read_text("utf-8"))
+        self.assertEqual(len(nb["cells"]), 6)
+        source = "".join(nb["cells"][1]["source"])
+        reverse = "".join(nb["cells"][3]["source"])
+        forward = "".join(nb["cells"][5]["source"])
+        self.assertIn('FORM_REL = "telegram-smart-compressor/studio_form_controls.py"', source)
+        self.assertIn('telegram_hashtag=هاشتاج_الملفات.strip()', reverse)
+        self.assertIn('اعادة_نسخ_المنقول_سابقا = False #@param {type:"boolean"}', forward)
+        self.assertIn('recopy_previously_transferred=اعادة_نسخ_المنقول_سابقا', forward)
+        self.assertIn('حذف_رسائل_Telegram_بعد_التحقق = False #@param {type:"boolean"}', forward)
+        self.assertIn('delete_after_transfer=حذف_رسائل_Telegram_بعد_التحقق', forward)
+        compile(forward, "telegram-to-drive-smart-form", "exec")
 
 
 

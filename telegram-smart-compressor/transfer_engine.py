@@ -141,6 +141,18 @@ def bind_transfer_channel(state: dict, channel_id: int, previous_channel_id=None
     channel_id = int(channel_id)
     old_id = state.get("drive_to_telegram_channel_id") or previous_channel_id
     if old_id is not None and int(old_id) != channel_id:
+        # Preserve legacy receipts before resetting the old upload channel:
+        # even an edited or removed MLTX caption must not bounce back to Drive.
+        old_receipts = state.get("drive_to_telegram") or {}
+        if isinstance(old_receipts, dict):
+            old_ids = set()
+            for record in old_receipts.values():
+                old_ids.update(_outgoing_ids_in_record(record))
+            if old_ids:
+                registry = state_section(state, "drive_to_telegram_message_ids")
+                saved_ids = registry.setdefault(str(int(old_id)), {})
+                for msg_id in old_ids:
+                    saved_ids[str(msg_id)] = True
         state["drive_to_telegram"] = {}
         state.pop("reupload_batches", None)
         print("📣 قناة النقل اتغيرت؛ هراجع الملفات كأنها أول مرة للقناة الجديدة.")
@@ -657,6 +669,107 @@ def ensure_child_folder(service, parent_id: str, name: str, cache: dict) -> str:
 
 def origin_key(peer_id: int, message_id: int) -> str:
     return f"{peer_id}_{message_id}"
+
+
+def canonical_telegram_origin_from_receipt(receipt_key: str) -> str:
+    """Decode both old plain and named-folder-scoped receipt IDs."""
+    raw = str(receipt_key or "")
+    if re.fullmatch(r"-?\d+_\d+", raw):
+        return raw
+    scoped = re.fullmatch(r"folder-[0-9a-f]{18}:(-?\d+_\d+)", raw)
+    return scoped.group(1) if scoped else ""
+
+
+def transferred_telegram_origins(state: dict) -> dict:
+    """Stable global ever-transferred ledger, independent of destination.
+
+    Read existing v1 destination-scoped receipts without needing a migration
+    command. Do not perform Drive network checks in this function: if a
+    previously saved folder was emptied or deleted, the source is still
+    considered already transferred. The explicit recopy flag opts out.
+    """
+    stored = state.get("telegram_to_drive_seen")
+    known = dict(stored) if isinstance(stored, dict) else {}
+    for receipt_key, record in state.get("telegram_to_drive", {}).items():
+        if not isinstance(record, dict) or not record.get("drive_id"):
+            continue
+        origin = canonical_telegram_origin_from_receipt(receipt_key)
+        if origin:
+            known.setdefault(origin, {
+                "drive_id": str(record["drive_id"]),
+                "size": int(record.get("size") or 0),
+                "from_legacy_receipt": True,
+            })
+    return known
+
+
+def remember_telegram_transfer(state: dict, origin: str, record: dict) -> None:
+    """Persist global identity only after the Drive receipt is persisted."""
+    if not canonical_telegram_origin_from_receipt(origin):
+        raise ValueError("Telegram origin identity must be channel ID + message ID.")
+    ledger = state_section(state, "telegram_to_drive_seen")
+    ledger.setdefault(origin, {
+        "drive_id": str(record["drive_id"]),
+        "size": int(record.get("size") or 0),
+        "recorded_at": int(time.time()),
+    })
+
+
+def _outgoing_ids_in_record(record: dict) -> set[int]:
+    ids = set()
+    if not isinstance(record, dict):
+        return ids
+    for group in [record, *(record.get("history") or [])]:
+        if not isinstance(group, dict):
+            continue
+        for part_id in (group.get("parts") or {}).values():
+            try:
+                if int(part_id) > 0:
+                    ids.add(int(part_id))
+            except (TypeError, ValueError):
+                pass
+        try:
+            if int(group.get("manifest_id") or 0) > 0:
+                ids.add(int(group["manifest_id"]))
+        except (TypeError, ValueError):
+            pass
+    # Reuploads may be interrupted before the final record is completed.
+    reupload = record.get("reupload")
+    if isinstance(reupload, dict) and reupload:
+        ids.update(_outgoing_ids_in_record(reupload))
+    return ids
+
+
+def known_drive_to_telegram_message_ids(state: dict, channel) -> set[int]:
+    """Recognize own uploads even when their Telegram captions were edited."""
+    channel_id = getattr(channel, "id", getattr(channel, "channel_id", None))
+    if channel_id is None:
+        return set()
+    channel_id = str(channel_id)
+    found = set()
+    remembered = state.get("drive_to_telegram_message_ids")
+    if isinstance(remembered, dict):
+        channel_map = remembered.get(channel_id)
+        if isinstance(channel_map, dict):
+            found.update(int(msg_id) for msg_id in channel_map
+                         if str(msg_id).isdigit() and int(msg_id) > 0)
+    # Backfill old transfer state that predates the explicit outbound index.
+    if str(state.get("drive_to_telegram_channel_id")) == channel_id:
+        for record in state.get("drive_to_telegram", {}).values():
+            found.update(_outgoing_ids_in_record(record))
+    return found
+
+
+def remember_outbound_telegram_id(state: dict, channel, message_id: int) -> None:
+    """Durable provenance for every newly uploaded part/manifest, per channel."""
+    channel_id = getattr(channel, "id", getattr(channel, "channel_id", None))
+    if channel_id is None:
+        return  # Lightweight fake clients/legacy interfaces without a channel.
+    group = state_section(state, "drive_to_telegram_message_ids")
+    per_channel = group.setdefault(str(channel_id), {})
+    if not isinstance(per_channel, dict):
+        per_channel = group[str(channel_id)] = {}
+    per_channel[str(int(message_id))] = True
 
 
 def existing_drive_copy(service, folder_id: str, key: str, expected_size: int) -> dict | None:
@@ -1190,6 +1303,7 @@ async def transfer_drive_to_telegram(
 
             def record_part(part_no: int, message_id: int) -> None:
                 existing[str(part_no)] = int(message_id)
+                remember_outbound_telegram_id(state, channel, message_id)
                 if repairing:
                     repair["parts"] = existing
                     records[token] = previous
@@ -1286,9 +1400,10 @@ async def transfer_drive_to_telegram(
                             manifest_id = int(receipt.id)
                         if repairing:
                             repair["manifest_id"] = manifest_id
-                            save_json(STATE_PATH, state)
                         else:
                             records[token]["manifest_id"] = manifest_id
+                        remember_outbound_telegram_id(state, channel, int(manifest_id))
+                        save_json(STATE_PATH, state)
 
                     if repairing:
                         history = previous.get("history", [])
@@ -1608,9 +1723,12 @@ async def delete_telegram_after_confirmed_drive_upload(
 async def transfer_telegram_to_drive(
     client, channel, service, state: dict, folder_id: str, max_files: int, preview: bool,
     subfolder_name: str = "", delete_after_transfer: bool = False,
+    recopy_previously_transferred: bool = False,
 ) -> dict:
     from telethon import utils
 
+    if recopy_previously_transferred and delete_after_transfer:
+        raise ValueError("مينفعش الجمع بين إعادة نسخ القديم وحذف رسائل Telegram. اقفل الحذف أولًا.")
     subfolder_name = normalize_transfer_subfolder(subfolder_name)
     peer_id = utils.get_peer_id(channel)
     records = state_section(state, "telegram_to_drive")
@@ -1621,61 +1739,140 @@ async def transfer_telegram_to_drive(
     folder_cache = {}
     target_id = ""
     if subfolder_name:
-        # Resolve the actual destination before filtering saved receipts.
-        # When an old custom folder is deleted/recreated its ID changes, so
-        # previously transferred files must be copied to the new folder.
-        finder = find_child_folder if preview else ensure_child_folder
-        if preview:
-            target_id = await asyncio.to_thread(finder, service, folder_id, target_name)
-        else:
-            target_id = await asyncio.to_thread(
-                finder, service, folder_id, target_name, folder_cache
-            )
-            print(f"✅ فولدر الحفظ جاهز: {target_name}")
+        # Never create a new folder during scanning or preview. Existing
+        # folders may be looked up for deletion retry; missing folders are
+        # created only when there is an actual new upload.
+        target_id = await asyncio.to_thread(
+            find_child_folder, service, folder_id, target_name
+        )
+    known_origins = transferred_telegram_origins(state)
+    if not known_origins:
+        print("⚠️ مفيش سجل سابق لنقل Telegram على Google Drive. "
+              "لو نقلت ملفات قبل كده، اتأكد إن Colab متصل بالدرايف الصحيح "
+              "وإن ملف سجل النقل محفوظ قبل ما تختار تنفيذ النقل أو الحذف.")
+    sent_from_drive = known_drive_to_telegram_message_ids(state, channel)
     downloaded = []
     pending_for_deletion = []
+    count_source_drive = 0
+    count_already_here = 0
+    count_already_elsewhere = 0
+    count_recopy = 0
+    count_changed_media = 0
+    scanned_messages = 0
+
     if delete_after_transfer:
         print("⚠️ حذف رسائل Telegram مفعّل: الحذف نهائي للقناة، وبعد إثبات نسخة Drive فقط.")
+    if recopy_previously_transferred:
+        print("⚠️ إعادة نسخ المنقول سابقًا مفعّلة يدويًا؛ الحذف مش مسموح في الوضع ده.")
+
     async for msg in client.iter_messages(channel, limit=SCAN_LIMIT):
+        scanned_messages += 1
         if not getattr(msg, "file", None):
             continue
-        if "MLTX:" in (msg.message or ""):
-            continue  # Drive → Telegram uploads must never bounce back to Drive.
-        key = telegram_drive_state_key(peer_id, int(msg.id), target_id, subfolder_name)
-        existing_record = records.get(key)
-        if existing_record:
-            # Never retroactively delete messages copied in older runs.
-            # Only explicitly queued, checksum-verified cleanup is resumable.
-            if (delete_after_transfer and existing_record.get("delete_pending")
-                    and not existing_record.get("telegram_deleted")):
-                pending_for_deletion.append((msg, key))
+
+        # Outbound provenance has two independent signals:
+        # 1. MLTX receipts embedded in captions (works after a state reset).
+        # 2. Channel-scoped message IDs saved during Drive -> Telegram uploads
+        #    (works if captions were edited/removed).
+        if "MLTX:" in (msg.message or "") or int(msg.id) in sent_from_drive:
+            count_source_drive += 1
             continue
+
+        origin = origin_key(peer_id, int(msg.id))
+        receipt_key = telegram_drive_state_key(
+            peer_id, int(msg.id), target_id, subfolder_name
+        )
+        local_receipt = records.get(receipt_key)
+        if isinstance(local_receipt, dict) and local_receipt.get("drive_id"):
+            count_already_here += 1
+            # No retroactive deletion of previously copied messages.
+            # Retry only explicitly persisted verified delete-pending receipts.
+            if (delete_after_transfer and local_receipt.get("delete_pending")
+                    and not local_receipt.get("telegram_deleted")):
+                pending_for_deletion.append((msg, receipt_key))
+            continue
+
+        previous = known_origins.get(origin)
+        if previous:
+            prior_size = int(previous.get("size") or 0)
+            current_size = int(getattr(msg.file, "size", 0) or 0)
+            if prior_size > 0 and current_size != prior_size:
+                # An edited media file is not safely identified by a message
+                # ID alone; do not silently copy/delete it.
+                count_changed_media += 1
+                continue
+            if not recopy_previously_transferred:
+                count_already_elsewhere += 1
+                continue
+            count_recopy += 1
         downloaded.append(msg)
+
     jobs = list(reversed(downloaded))
     pending_for_deletion.reverse()
     if max_files:
         jobs = jobs[:max_files]
         pending_for_deletion = pending_for_deletion[:max_files]
-    print(f"📦 Telegram → Drive | {len(jobs)} ملف جديد من آخر {SCAN_LIMIT} رسالة")
+
+    print(
+        f"📦 Telegram → Drive | جديد للنقل: {len(jobs)}"
+        f" • منقول سابقًا لفولدر تاني: {count_already_elsewhere}"
+        f" • موجود في الوجهة: {count_already_here}"
+        f" • أصله Drive فمستبعد: {count_source_drive}"
+    )
+    if count_recopy:
+        print(f"📤 ملفات قديمة اخترت إعادة نسخها يدويًا: {count_recopy}")
+    if count_changed_media:
+        print(f"⚠️ رسائل اتغير حجم ميدياها بعد النقل: {count_changed_media} — اتخطيناها للمراجعة.")
+    if scanned_messages >= SCAN_LIMIT:
+        print(f"ℹ️ الفحص شمل آخر {SCAN_LIMIT} رسالة فقط من القناة، مش الأرشيف كله.")
     if delete_after_transfer:
-        print(f"🧹 عمليات حذف معلّقة من تشغيل سابق: {len(pending_for_deletion)}")
+        print(f"🧹 عمليات حذف معلّقة بعد رفع سابق: {len(pending_for_deletion)}")
+
     for msg in jobs[:10]:
         print(" •", clean_filename(getattr(msg.file, "name", "") or f"telegram_{msg.id}"))
     if preview:
-        print("👁️ معاينة فقط — لن ننقل أو نحذف رسائل أو ننشئ فولدر.")
-        return {"ok": 0, "skipped": 0, "failed": 0}
+        print("👁️ معاينة فقط — من غير نقل أو حذف أو إنشاء فولدر أو تعديل سجل Drive.")
+        return {
+            "ok": 0, "skipped": 0, "failed": 0,
+            "already_transferred": count_already_here + count_already_elsewhere,
+            "from_drive": count_source_drive,
+            "new": len(jobs),
+        }
 
-    counters = {"ok": 0, "skipped": 0, "failed": 0,
-                "deleted": 0, "delete_failed": 0}
+    # One-time non-destructive migration: old per-folder receipts become a
+    # central, persistent ledger, preventing future copies into new folders.
+    ledger = state_section(state, "telegram_to_drive_seen")
+    migrated = 0
+    for origin, receipt in known_origins.items():
+        if origin not in ledger:
+            ledger[origin] = receipt
+            migrated += 1
+    if migrated:
+        # Retain a one-time recoverable pre-migration copy on Drive.
+        backup = STATE_PATH.with_name("state_v1_before_global_dedup.json")
+        if STATE_PATH.exists() and not backup.exists():
+            shutil.copy2(STATE_PATH, backup)
+        save_json(STATE_PATH, state)
+        print(f"✅ تم استرجاع سجل {migrated} رسالة من النقل القديم، بدون تحميلها مرة تانية.")
+
+    counters = {
+        "ok": 0, "skipped": 0, "failed": 0,
+        "deleted": 0, "delete_failed": 0,
+        "already_transferred": count_already_here + count_already_elsewhere,
+        "from_drive": count_source_drive,
+    }
     if not jobs and not pending_for_deletion:
-        print("✅ مفيش ملفات جديدة للوجهة المختارة.")
+        print("✅ مفيش رسائل جديدة محتاجة نقل. سجل النقل شغال عبر كل فولدرات Drive.")
         return counters
+
     dst_folder = target_id
-    if not subfolder_name:
+    if not subfolder_name or (jobs and not dst_folder):
         dst_folder = await asyncio.to_thread(
             ensure_child_folder, service, folder_id, target_name, folder_cache
         )
         print(f"✅ فولدر الحفظ جاهز: {target_name}")
+        if subfolder_name:
+            target_id = dst_folder  # Scope new receipts to the real Drive folder ID.
     # Retry *only* deletions explicitly queued after a previously verified
     # upload. Reverify Drive metadata before every attempt.
     for msg, key in pending_for_deletion:
@@ -1709,6 +1906,7 @@ async def transfer_telegram_to_drive(
             existing = await asyncio.to_thread(existing_drive_copy, service, dst_folder, remote_key, size)
             if existing:
                 records[key] = {"drive_id": existing["id"], "size": size}
+                remember_telegram_transfer(state, remote_key, records[key])
                 save_json(STATE_PATH, state)
                 counters["skipped"] += 1
                 continue
@@ -1737,6 +1935,7 @@ async def transfer_telegram_to_drive(
                               "مطابقًا، لذلك لن نحذف الأصل.")
                 # Persist the verified destination before ANY destructive step.
                 records[key] = record
+                remember_telegram_transfer(state, remote_key, record)
                 save_json(STATE_PATH, state)
                 counters["ok"] += 1
                 print(f"✅ [{index}/{len(jobs)}] {name}")
@@ -1832,6 +2031,7 @@ async def _run_transfer(
     reupload_selected: bool = False, selected_numbers: str = "",
     drive_subfolder: str = "", telegram_hashtag: str = "",
     delete_after_transfer: bool = False,
+    recopy_previously_transferred: bool = False,
 ) -> dict:
     drive_subfolder = normalize_transfer_subfolder(drive_subfolder)
     telegram_hashtag = normalize_transfer_hashtag(telegram_hashtag)
@@ -1897,6 +2097,7 @@ async def _run_transfer(
                 client, source_entity, service, state, dest_id, max_files, preview,
                 subfolder_name=drive_subfolder,
                 delete_after_transfer=delete_after_transfer,
+                recopy_previously_transferred=recopy_previously_transferred,
             )
         raise ValueError("اتجاه النقل غير معروف.")
     finally:
@@ -1913,8 +2114,15 @@ def run_transfer(
     login_method: str = "code", reupload_selected: bool = False,
     selected_numbers: str = "", drive_subfolder: str = "",
     telegram_hashtag: str = "", delete_after_transfer: bool = False,
+    recopy_previously_transferred: bool = False,
 ) -> None:
     """Entry point called by the small GitHub-backed Colab launcher cell."""
+    if not isinstance(recopy_previously_transferred, bool):
+        raise ValueError("إعادة نقل القديم لازم تكون True أو False.")
+    if recopy_previously_transferred and delete_after_transfer:
+        raise ValueError("مينفعش تشغّل إعادة نسخ القديم والحذف في نفس الوقت.")
+    if direction != "telegram_to_drive" and recopy_previously_transferred:
+        raise ValueError("إعادة نقل القديم متاحة فقط لاتجاه Telegram → Drive.")
     if not isinstance(delete_after_transfer, bool):
         raise ValueError("خيار حذف Telegram لازم يكون True أو False.")
     if direction != "telegram_to_drive" and delete_after_transfer:
@@ -1958,6 +2166,7 @@ def run_transfer(
                         service, direction, source, destination, max_files, recursive,
                         preview, login_method, reupload_selected, selected_numbers,
                         drive_subfolder, telegram_hashtag, delete_after_transfer,
+                        recopy_previously_transferred,
                     )
                 )
             print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']}"
@@ -1972,6 +2181,7 @@ def run_transfer(
                     "drive_subfolder": drive_subfolder if direction == "telegram_to_drive" else "",
                     "telegram_hashtag": telegram_hashtag if direction == "drive_to_telegram" else "",
                     "delete_after_transfer": delete_after_transfer,
+                    "recopy_previously_transferred": recopy_previously_transferred,
                     **result,
                 })
         except KeyboardInterrupt:
