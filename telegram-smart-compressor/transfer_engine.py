@@ -1532,7 +1532,7 @@ async def transfer_telegram_to_drive(
     records = state_section(state, "telegram_to_drive")
     source_name = clean_filename(getattr(channel, "title", "") or "Telegram")
     target_name = subfolder_name or source_name
-    print(f"📁 الحفظ: {DEFAULT_DRIVE_FOLDER if folder_id else 'Drive'} / {target_name}"
+    print(f"📁 الحفظ: داخل فولدر Drive المختار / {target_name}"
           + (" (فولدر مخصص؛ يُنشأ لو مش موجود)" if subfolder_name else ""))
     downloaded = []
     async for msg in client.iter_messages(channel, limit=SCAN_LIMIT):
@@ -1565,6 +1565,7 @@ async def transfer_telegram_to_drive(
     print(f"⚡ Telegram parallel download: من 5 MiB، {TG_PARALLEL_CONNECTIONS} اتصالات؛ fallback تلقائي.")
     for index, msg in enumerate(jobs, 1):
         key = telegram_drive_state_key(peer_id, int(msg.id), folder_id, subfolder_name)
+        remote_key = origin_key(peer_id, int(msg.id))  # Stable Drive appProperties across destinations.
         size = int(getattr(msg.file, "size", 0) or 0)
         name = clean_filename(
             getattr(msg.file, "name", None) or f"telegram_{msg.id}{getattr(msg.file, 'ext', '') or ''}"
@@ -1572,7 +1573,7 @@ async def transfer_telegram_to_drive(
         try:
             if size <= 0:
                 raise ValueError("Telegram لم يوفّر حجم الملف.")
-            existing = await asyncio.to_thread(existing_drive_copy, service, dst_folder, key, size)
+            existing = await asyncio.to_thread(existing_drive_copy, service, dst_folder, remote_key, size)
             if existing:
                 records[key] = {"drive_id": existing["id"], "size": size}
                 save_json(STATE_PATH, state)
@@ -1583,7 +1584,7 @@ async def transfer_telegram_to_drive(
             with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as td:
                 local = Path(td) / name
                 await fetch_telegram_message(client, channel, msg, local, size, downloader)
-                uploaded = await asyncio.to_thread(upload_drive_file, service, local, dst_folder, name, key)
+                uploaded = await asyncio.to_thread(upload_drive_file, service, local, dst_folder, name, remote_key)
                 records[key] = {"drive_id": uploaded["id"], "size": size, "name": name}
                 save_json(STATE_PATH, state)
                 counters["ok"] += 1
