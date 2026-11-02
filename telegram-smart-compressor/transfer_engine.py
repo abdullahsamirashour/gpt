@@ -1822,6 +1822,7 @@ async def _run_transfer(
     max_files: int, recursive: bool, preview: bool, login_method: str = "code",
     reupload_selected: bool = False, selected_numbers: str = "",
     drive_subfolder: str = "", telegram_hashtag: str = "",
+    delete_after_transfer: bool = False,
 ) -> dict:
     drive_subfolder = normalize_transfer_subfolder(drive_subfolder)
     telegram_hashtag = normalize_transfer_hashtag(telegram_hashtag)
@@ -1868,12 +1869,25 @@ async def _run_transfer(
                 source_entity = await client.get_entity(ref)
             else:
                 source_entity = await ensure_channel(client, transfer_config)
+            if delete_after_transfer and not preview:
+                # Deleting from unrelated DMs/groups is not part of this option.
+                # Require channel ownership or explicit Delete Messages rights.
+                from telethon.tl.types import Channel
+                rights = getattr(source_entity, "admin_rights", None)
+                if not isinstance(source_entity, Channel):
+                    raise ValueError("الحذف التلقائي متاح لقنوات Telegram فقط، مش المحادثات الخاصة.")
+                if not (getattr(source_entity, "creator", False)
+                        or getattr(rights, "delete_messages", False)):
+                    raise PermissionError(
+                        "حذف الرسائل يحتاج أن تكون مالك القناة أو أدمن لديه صلاحية Delete Messages."
+                    )
             # Preview may query existing folders but must never create a new one.
             finder = find_existing_drive_destination if preview else ensure_drive_destination
             dest_id = await asyncio.to_thread(finder, service, destination)
             return await transfer_telegram_to_drive(
                 client, source_entity, service, state, dest_id, max_files, preview,
                 subfolder_name=drive_subfolder,
+                delete_after_transfer=delete_after_transfer,
             )
         raise ValueError("اتجاه النقل غير معروف.")
     finally:
@@ -1889,9 +1903,13 @@ def run_transfer(
     max_files: int = 20, recursive: bool = True, preview: bool = True,
     login_method: str = "code", reupload_selected: bool = False,
     selected_numbers: str = "", drive_subfolder: str = "",
-    telegram_hashtag: str = "",
+    telegram_hashtag: str = "", delete_after_transfer: bool = False,
 ) -> None:
     """Entry point called by the small GitHub-backed Colab launcher cell."""
+    if not isinstance(delete_after_transfer, bool):
+        raise ValueError("خيار حذف Telegram لازم يكون True أو False.")
+    if direction != "telegram_to_drive" and delete_after_transfer:
+        raise ValueError("خيار حذف Telegram متاح فقط عند نقل Telegram → Drive.")
     drive_subfolder = normalize_transfer_subfolder(drive_subfolder)
     telegram_hashtag = normalize_transfer_hashtag(telegram_hashtag)
     if direction == "drive_to_telegram" and drive_subfolder:
@@ -1920,16 +1938,23 @@ def run_transfer(
         sys.stdout = _Tee(old_out, log)
         sys.stderr = _Tee(old_err, log)
         try:
-            print("📦 Media Lite — File Transfer | ملفاتك الأصلية لن تُحذف.")
+            if delete_after_transfer and not preview:
+                print("⚠️ وضع نقل ثم حذف مفعّل — الحذف من Telegram نهائي للقناة "
+                      "وللملفات التي تم رفعها والتحقق منها فقط.")
+            else:
+                print("📦 Media Lite — File Transfer | الملفات الأصلية محفوظة.")
             with single_run():
                 result = asyncio.get_event_loop().run_until_complete(
                     _run_transfer(
                         service, direction, source, destination, max_files, recursive,
                         preview, login_method, reupload_selected, selected_numbers,
-                        drive_subfolder, telegram_hashtag,
+                        drive_subfolder, telegram_hashtag, delete_after_transfer,
                     )
                 )
-            print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']} • {time.time()-started:.0f} ثانية")
+            print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']}"
+                  f" • حذف من Telegram {result.get('deleted', 0)}"
+                  f" • حذف فشل {result.get('delete_failed', 0)}"
+                  f" • {time.time()-started:.0f} ثانية")
             if not preview:
                 save_json(APP_DIR / "last_run_summary.json", {
                     "direction": direction, "finished": int(time.time()),
@@ -1937,6 +1962,7 @@ def run_transfer(
                     "selected_numbers": selected_numbers if reupload_selected else "",
                     "drive_subfolder": drive_subfolder if direction == "telegram_to_drive" else "",
                     "telegram_hashtag": telegram_hashtag if direction == "drive_to_telegram" else "",
+                    "delete_after_transfer": delete_after_transfer,
                     **result,
                 })
         except KeyboardInterrupt:
