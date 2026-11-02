@@ -1165,6 +1165,10 @@ class TelegramSafeDeleteTests(unittest.TestCase):
             async def iter_messages(self, _channel, limit):
                 yield message
 
+            async def download_media(self, _msg, *, file, progress_callback):
+                Path(file).write_bytes(payload)
+                return file
+
             async def delete_messages(self, *_args, **_kwargs):
                 raise AssertionError("Default and Preview must not delete")
 
@@ -1177,16 +1181,23 @@ class TelegramSafeDeleteTests(unittest.TestCase):
             ))
         self.assertEqual(result["ok"], 0)
 
-        with patch("telethon.utils.get_peer_id", return_value=-10012), \
-             patch.object(transfer, "ensure_child_folder", return_value="folder-dst"), \
-             patch.object(transfer, "existing_drive_copy", return_value={"id":"already", "size":len(payload)}):
-            state = transfer.new_state()
-            result = asyncio.run(transfer.transfer_telegram_to_drive(
-                Telegram(), channel, object(), state, "folder", 0, False,
-                delete_after_transfer=False,
-            ))
-        self.assertEqual(result["deleted"], 0)
-        self.assertEqual(result["skipped"], 1)
+        # With delete disabled, a newly transferred file stays in Telegram.
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(transfer, "TEMP_ROOT", Path(td)), \
+                 patch.object(transfer, "STATE_PATH", Path(td) / "state.json"), \
+                 patch("telethon.utils.get_peer_id", return_value=-10012), \
+                 patch.object(transfer, "ensure_child_folder", return_value="folder-dst"), \
+                 patch.object(transfer, "existing_drive_copy", return_value=None), \
+                 patch.object(transfer, "upload_drive_file",
+                              return_value={"id": "already", "size": len(payload),
+                                            "md5Checksum": md5}):
+                state = transfer.new_state()
+                result = asyncio.run(transfer.transfer_telegram_to_drive(
+                    Telegram(), channel, object(), state, "folder", 0, False,
+                    delete_after_transfer=False,
+                ))
+        self.assertEqual((result["ok"], result["deleted"]), (1, 0))
+        self.assertNotIn("delete_pending", next(iter(state["telegram_to_drive"].values())))
 
     def test_successful_upload_deletes_exact_original_only_after_persisted_md5(self):
         payload, md5, channel, message = self.setup_transfer()
