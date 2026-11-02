@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import uuid
+import unicodedata
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -160,6 +161,67 @@ def clean_filename(name: str) -> str:
     name = str(name or "").replace("\\", "/").split("/")[-1].strip()
     name = "".join("_" if c in '\x00\r\n\t' else c for c in name)
     return name[:180] or "unnamed_file"
+
+
+def normalize_transfer_subfolder(value: str) -> str:
+    """Single safe child-folder name, never a path or arbitrary Drive URL."""
+    name = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not name:
+        return ""
+    if (len(name) > 120 or name in {".", ".."} or
+            not name.strip(". ") or
+            any(c in "/\\\\" or unicodedata.category(c).startswith("C") for c in name)):
+        raise ValueError(
+            "اسم الفولدر لازم يكون اسمًا واحدًا من 1 إلى 120 حرفًا، "
+            "بدون / أو \\\\ أو أسطر جديدة."
+        )
+    return name
+
+
+def normalize_transfer_hashtag(value: str) -> str:
+    """Accept #arabic_tag, or an unprefixed label; spaces become underscores."""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not text:
+        return ""
+    tag = re.sub(r"\s+", "_", text[1:] if text.startswith("#") else text)
+    if not tag or len(tag) > 64 or not all(c == "_" or c.isalnum() for c in tag):
+        raise ValueError("اكتب هاشتاج واحدًا من حروف/أرقام و_ فقط (مثل #محاضرات_2026).")
+    if not any(c.isalpha() for c in tag):
+        raise ValueError("الهاشتاج لازم يحتوي على حرف واحد على الأقل.")
+    return "#" + tag
+
+
+def add_transfer_hashtag(caption: str, hashtag: str = "") -> str:
+    """Keep MLTX markers intact; the hashtag is appended on its own line."""
+    return f"{caption}\n{hashtag}" if hashtag else caption
+
+
+def telegram_drive_state_key(peer_id: int, message_id: int,
+                             parent_id: str, subfolder_name: str) -> str:
+    """New named destinations keep independent receipts; old default keys survive."""
+    original = origin_key(peer_id, message_id)
+    if not subfolder_name:
+        return original
+    scope = hashlib.sha256(
+        f"{parent_id}\0{subfolder_name}".encode("utf-8")
+    ).hexdigest()[:18]
+    return f"folder-{scope}:{original}"
+
+
+def find_existing_drive_destination(service, folder_ref: str) -> str:
+    """Read-only lookup for Preview; never create the selected folder."""
+    folder_mime = "application/vnd.google-apps.folder"
+    if folder_ref:
+        folder_id = parse_drive_id(folder_ref)
+        if get_drive_metadata(service, folder_id)["mimeType"] != folder_mime:
+            raise ValueError("الوجهة على Drive لازم تكون فولدرًا مش ملفًا.")
+        return folder_id
+    result = service.files().list(
+        q=f"name = '{DEFAULT_DRIVE_FOLDER}' and mimeType = '{folder_mime}' and 'root' in parents and trashed = false",
+        fields="files(id)", pageSize=10,
+    ).execute(num_retries=3)
+    found = result.get("files", [])
+    return found[0]["id"] if found else ""
 
 
 # Exact, common Drive MIME types. Generic application/octet-stream needs
