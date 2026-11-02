@@ -1746,6 +1746,10 @@ async def transfer_telegram_to_drive(
             find_child_folder, service, folder_id, target_name
         )
     known_origins = transferred_telegram_origins(state)
+    if not known_origins:
+        print("⚠️ مفيش سجل سابق لنقل Telegram على Google Drive. "
+              "لو نقلت ملفات قبل كده، اتأكد إن Colab متصل بالدرايف الصحيح "
+              "وإن ملف سجل النقل محفوظ قبل ما تختار تنفيذ النقل أو الحذف.")
     sent_from_drive = known_drive_to_telegram_message_ids(state, channel)
     downloaded = []
     pending_for_deletion = []
