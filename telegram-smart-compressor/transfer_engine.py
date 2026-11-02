@@ -1673,7 +1673,8 @@ async def _run_transfer(
     state = load_json(STATE_PATH, new_state())
     if direction == "drive_to_telegram" and preview:
         return await transfer_drive_to_telegram(
-            None, None, service, state, parse_drive_id(source), recursive, max_files, True
+            None, None, service, state, parse_drive_id(source), recursive, max_files, True,
+            telegram_hashtag=telegram_hashtag,
         )
 
     account = load_account_config()
