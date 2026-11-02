@@ -1844,11 +1844,13 @@ async def transfer_telegram_to_drive(
         return counters
 
     dst_folder = target_id
-    if not subfolder_name:
+    if not subfolder_name or (jobs and not dst_folder):
         dst_folder = await asyncio.to_thread(
             ensure_child_folder, service, folder_id, target_name, folder_cache
         )
         print(f"✅ فولدر الحفظ جاهز: {target_name}")
+        if subfolder_name:
+            target_id = dst_folder  # Scope new receipts to the real Drive folder ID.
     # Retry *only* deletions explicitly queued after a previously verified
     # upload. Reverify Drive metadata before every attempt.
     for msg, key in pending_for_deletion:
@@ -1882,6 +1884,7 @@ async def transfer_telegram_to_drive(
             existing = await asyncio.to_thread(existing_drive_copy, service, dst_folder, remote_key, size)
             if existing:
                 records[key] = {"drive_id": existing["id"], "size": size}
+                remember_telegram_transfer(state, remote_key, records[key])
                 save_json(STATE_PATH, state)
                 counters["skipped"] += 1
                 continue
@@ -1910,6 +1913,7 @@ async def transfer_telegram_to_drive(
                               "مطابقًا، لذلك لن نحذف الأصل.")
                 # Persist the verified destination before ANY destructive step.
                 records[key] = record
+                remember_telegram_transfer(state, remote_key, record)
                 save_json(STATE_PATH, state)
                 counters["ok"] += 1
                 print(f"✅ [{index}/{len(jobs)}] {name}")
