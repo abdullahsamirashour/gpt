@@ -1016,7 +1016,13 @@ class CustomTransferOptionsTests(unittest.TestCase):
                 self.assertEqual(files.created[0][1]["parents"], ["base-folder"])
                 self.assertEqual(files.created[0][1]["name"], "محاضرات نوفمبر")
                 self.assertEqual(uploads[0][0], "subfolder_1")
-                self.assertNotEqual(uploads[0][2], old_key)
+                # Drive appProperties keeps the original provenance token,
+                # while the local state key is specific to this destination.
+                self.assertEqual(uploads[0][2], old_key)
+                scoped = transfer.telegram_drive_state_key(
+                    -10012, 42, "base-folder", "محاضرات نوفمبر")
+                self.assertNotEqual(scoped, old_key)
+                self.assertIn(scoped, state["telegram_to_drive"])
                 self.assertEqual(run("محاضرات نوفمبر")["ok"], 0)
                 self.assertEqual(client.downloads, 1)
                 self.assertEqual(len(files.created), 1)
