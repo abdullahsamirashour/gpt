@@ -1202,6 +1202,12 @@ class TelegramSafeDeleteTests(unittest.TestCase):
                 progress_callback(len(payload), len(payload))
                 return file
 
+            async def get_messages(self, selected_channel, *, ids):
+                self_check = transfer.load_json(transfer.STATE_PATH, {})
+                assert any(r.get("delete_pending") for r in self_check["telegram_to_drive"].values())
+                assert selected_channel is channel and ids == 42
+                return message
+
             async def delete_messages(self, selected_channel, ids, *, revoke):
                 self_check = transfer.load_json(transfer.STATE_PATH, {})
                 record = next(iter(self_check["telegram_to_drive"].values()))
@@ -1295,6 +1301,10 @@ class TelegramSafeDeleteTests(unittest.TestCase):
             async def download_media(self, _msg, *, file, progress_callback):
                 Path(file).write_bytes(payload)
                 return file
+            async def get_messages(self, _channel, *, ids):
+                assert ids == 42
+                return message
+
             async def delete_messages(self, _channel, ids, *, revoke):
                 deletes.append(ids)
                 if len(deletes) == 1:
@@ -1362,6 +1372,22 @@ class TelegramSafeDeleteTests(unittest.TestCase):
             asyncio.run(transfer.delete_telegram_after_confirmed_drive_upload(
                 Telegram(), channel, changed, object(), "destination-folder", record,
             ))
+
+        class EditedTelegram(Telegram):
+            async def get_messages(self, _channel, *, ids):
+                return changed
+
+        # The original Telegram message can be edited during the upload:
+        # re-fetching it immediately before deletion prevents losing new media.
+        with patch.object(transfer, "get_drive_metadata", return_value={
+            "id": "file", "size": str(len(payload)),
+            "md5Checksum": md5, "parents": ["destination-folder"]
+        }):
+            with self.assertRaisesRegex(RuntimeError, "اتغيّر"):
+                asyncio.run(transfer.delete_telegram_after_confirmed_drive_upload(
+                    EditedTelegram(), channel, message, object(),
+                    "destination-folder", record,
+                ))
 
     def test_new_form_checkbox_defaults_false_and_wires_exactly_to_transfer(self):
         nb = json.loads(Path(__file__).with_name("Smart_Compressor.ipynb").read_text("utf-8"))
