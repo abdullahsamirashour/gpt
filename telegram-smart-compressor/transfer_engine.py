@@ -1709,9 +1709,12 @@ async def delete_telegram_after_confirmed_drive_upload(
 async def transfer_telegram_to_drive(
     client, channel, service, state: dict, folder_id: str, max_files: int, preview: bool,
     subfolder_name: str = "", delete_after_transfer: bool = False,
+    recopy_previously_transferred: bool = False,
 ) -> dict:
     from telethon import utils
 
+    if recopy_previously_transferred and delete_after_transfer:
+        raise ValueError("مينفعش الجمع بين إعادة نسخ القديم وحذف رسائل Telegram. اقفل الحذف أولًا.")
     subfolder_name = normalize_transfer_subfolder(subfolder_name)
     peer_id = utils.get_peer_id(channel)
     records = state_section(state, "telegram_to_drive")
@@ -1722,17 +1725,12 @@ async def transfer_telegram_to_drive(
     folder_cache = {}
     target_id = ""
     if subfolder_name:
-        # Resolve the actual destination before filtering saved receipts.
-        # When an old custom folder is deleted/recreated its ID changes, so
-        # previously transferred files must be copied to the new folder.
-        finder = find_child_folder if preview else ensure_child_folder
-        if preview:
-            target_id = await asyncio.to_thread(finder, service, folder_id, target_name)
-        else:
-            target_id = await asyncio.to_thread(
-                finder, service, folder_id, target_name, folder_cache
-            )
-            print(f"✅ فولدر الحفظ جاهز: {target_name}")
+        # Never create a new folder during scanning or preview. Existing
+        # folders may be looked up for deletion retry; missing folders are
+        # created only when there is an actual new upload.
+        target_id = await asyncio.to_thread(
+            find_child_folder, service, folder_id, target_name
+        )
     downloaded = []
     pending_for_deletion = []
     if delete_after_transfer:
