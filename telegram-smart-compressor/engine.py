@@ -1005,6 +1005,19 @@ def clean_name(name: str, fallback: str) -> str:
     return name[:180] or fallback
 
 
+def delivery_filename(source_name: str, output_extension: str) -> str:
+    """Present the source filename, not Colab's ID/timestamp temp path.
+
+    Retain Arabic and spaces, changing only the extension for conversion.
+    """
+    suffix = "." + output_extension.lstrip(".").lower()
+    if suffix not in {".ogg", ".m4a", ".mp3", ".mp4"}:
+        raise ValueError("Unsupported output file extension")
+    source = clean_name(source_name, "telegram_file")
+    stem = Path(source).stem.strip().rstrip(". ") or "telegram_file"
+    return stem[:180 - len(suffix)] + suffix
+
+
 def detect_nvenc() -> bool:
     if shutil.which("nvidia-smi") is None:
         return False
@@ -2215,7 +2228,7 @@ async def prepare_job(client, job, index: int, total: int):
 
 
 async def process_job(client, channel, state, prepared, nvenc: bool, index: int, total: int):
-    from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
+    from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo, DocumentAttributeFilename
 
     job = prepared["job"]
     msg = prepared["msg"]
@@ -2297,6 +2310,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
                 selected_audio["audio_codec"] if selected_audio else "opus"
             ]
             dst = TMP_DIR / f"{src.stem}_compressed{suffix}"
+            upload_filename = delivery_filename(name, suffix)
             label = ("صوت صغير جدًا" if selected_audio is None else
                      f"صوت • {selected_audio['audio_codec'].upper()} "
                      f"{selected_audio['audio_kbps']} kbps")
@@ -2315,6 +2329,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
 
             title = Path(name).stem[:60]
             attrs = [
+                DocumentAttributeFilename(file_name=upload_filename),
                 DocumentAttributeAudio(
                     duration=max(0, int(out_info.duration)),
                     voice=False,
@@ -2327,6 +2342,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
             final_size = dst.stat().st_size
             saved_pct = max(0.0, (original_size - final_size) / original_size * 100) if original_size else 0
 
+            print(f"📎 اسم الملف النهائي: {upload_filename}")
             upload = LiveProgress("رفع", "⬆️")
             upload_started = time.time()
             sent = await client.send_file(
@@ -2351,6 +2367,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
 
         else:
             dst = TMP_DIR / f"{src.stem}_compressed.mp4"
+            upload_filename = delivery_filename(name, ".mp4")
             labels = {
                 "VIDEO_BALANCED": "فيديو متوازن",
                 "VIDEO_FAST": "فيديو سريع",
@@ -2378,6 +2395,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
             saved_pct = max(0.0, (original_size - final_size) / original_size * 100) if original_size else 0
             quality_hint = f"{out_info.height}p" if out_info.height else ""
 
+            print(f"📎 اسم الملف النهائي: {upload_filename}")
             upload = LiveProgress("رفع", "⬆️")
             upload_started = time.time()
             sent = await client.send_file(
@@ -2393,6 +2411,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
                 mime_type="video/mp4",
                 supports_streaming=True,
                 attributes=[
+                    DocumentAttributeFilename(file_name=upload_filename),
                     DocumentAttributeVideo(
                         duration=max(0, int(out_info.duration)),
                         w=max(1, int(out_info.width)),

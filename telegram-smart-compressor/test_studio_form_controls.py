@@ -185,6 +185,25 @@ class NativeStudioFormTests(unittest.TestCase):
         self.assertEqual(result["settings"]["audio_codec"], "aac")
         self.assertEqual(result["settings"]["audio_kbps"], 48)
 
+    def test_delivery_filename_preserves_original_basename_and_changes_only_extension(self):
+        for src, ext, expected in (
+            ("Principles of general and regional anaesthesia.mp4", ".ogg",
+             "Principles of general and regional anaesthesia.ogg"),
+            ("Post OP pain management.mp4", ".mp3",
+             "Post OP pain management.mp3"),
+            ("محاضرة قلبية.mp4", ".m4a", "محاضرة قلبية.m4a"),
+            ("Lecture.with.multiple.dots.m4a", ".ogg",
+             "Lecture.with.multiple.dots.ogg"),
+            ("Recording.mp4", ".mp4", "Recording.mp4"),
+            ("telegram_489.ogg", ".ogg", "telegram_489.ogg"),
+            ("123.mp4", ".ogg", "123.ogg"),
+        ):
+            with self.subTest(src=src, ext=ext):
+                self.assertEqual(engine.delivery_filename(src, ext), expected)
+        self.assertLessEqual(len(engine.delivery_filename("a" * 200 + ".mp4", ".ogg")), 180)
+        with self.assertRaises(ValueError):
+            engine.delivery_filename("lecture.mp4", ".exe")
+
     def test_form_hourly_size_table_uses_kilobits_not_kilobytes(self):
         self.assertIn("📊 حجم ساعة واحدة من الصوت", CODE)
         for kbps in (8, 16, 24, 32, 48, 64, 96, 128, 192):
@@ -233,6 +252,7 @@ class NativeStudioFormTests(unittest.TestCase):
                         "has_video": output_info.has_video,
                         "mime": kwargs.get("mime_type"),
                         "attrs": kwargs.get("attributes"),
+                        "real_path_name": Path(output).name,
                         "reply_to": kwargs.get("reply_to"),
                     })
                     return SimpleNamespace(id=991)
@@ -244,7 +264,7 @@ class NativeStudioFormTests(unittest.TestCase):
                 "job": {"source": message, "command": None, "profile": None,
                         "target_mb": None, "rerun": False},
                 "msg": message,
-                "name": "classroom.mp4", "src": src, "info": info,
+                "name": "Principles of general and regional anaesthesia.mp4", "src": src, "info": info,
                 "started_at": 0.0, "download_seconds": 0.0,
                 "probe_seconds": 0.0, "error": None,
             }
@@ -261,6 +281,24 @@ class NativeStudioFormTests(unittest.TestCase):
             self.assertTrue(captures[0]["has_audio"])
             self.assertFalse(captures[0]["has_video"])
             self.assertEqual(captures[0]["reply_to"], 777)
+            from telethon import utils
+            from telethon.tl.types import DocumentAttributeFilename
+            attrs, _ = utils.get_attributes(
+                str(src.parent / captures[0]["real_path_name"]),
+                mime_type="audio/mpeg",
+                attributes=captures[0]["attrs"],
+            )
+            sent_filename = next(
+                attr.file_name for attr in attrs
+                if isinstance(attr, DocumentAttributeFilename)
+            )
+            self.assertEqual(
+                sent_filename,
+                "Principles of general and regional anaesthesia.mp3",
+            )
+            self.assertNotIn("179360", sent_filename)
+            self.assertNotIn("_compressed", sent_filename)
+            self.assertIn("_compressed", captures[0]["real_path_name"])
             self.assertEqual(state["lineage"]["991"]["profile"], "AUDIO_CUSTOM")
             self.assertEqual(state["lineage"]["991"]["media_settings"]["source"], "audio")
             self.assertIn(777, state["processed_source_ids"])
@@ -300,6 +338,8 @@ class NativeStudioFormTests(unittest.TestCase):
                         "suffix": path.suffix,
                         "audio": result.has_audio, "video": result.has_video,
                         "mime": kwargs["mime_type"],
+                        "attrs": kwargs["attributes"],
+                        "local_name": path.name,
                     })
                     return SimpleNamespace(id=995)
 
@@ -310,7 +350,7 @@ class NativeStudioFormTests(unittest.TestCase):
             prepared = {
                 "job": {"source": msg, "command": None, "profile": None,
                         "target_mb": None, "rerun": False},
-                "msg": msg, "name": "lecture.wav", "src": src,
+                "msg": msg, "name": "محاضرة قلبية.wav", "src": src,
                 "info": original_info, "started_at": 0.0,
                 "download_seconds": 0.0, "probe_seconds": 0.0,
                 "error": None,
@@ -322,12 +362,103 @@ class NativeStudioFormTests(unittest.TestCase):
                     FakeTelegram(), object(), state, prepared, False, 1, 1
                 ))
             self.assertTrue(result["ok"], result)
-            self.assertEqual(uploads, [{
-                "suffix": ".ogg", "audio": True,
-                "video": False, "mime": "audio/ogg",
-            }])
+            self.assertEqual(len(uploads), 1)
+            self.assertEqual(uploads[0]["suffix"], ".ogg")
+            self.assertTrue(uploads[0]["audio"])
+            self.assertFalse(uploads[0]["video"])
+            self.assertEqual(uploads[0]["mime"], "audio/ogg")
+            from telethon.tl.types import DocumentAttributeFilename
+            self.assertEqual(
+                [a.file_name for a in uploads[0]["attrs"]
+                 if isinstance(a, DocumentAttributeFilename)],
+                ["محاضرة قلبية.ogg"],
+            )
+            self.assertIn("_compressed", uploads[0]["local_name"])
             self.assertEqual(state["lineage"]["995"]["profile"], "AUDIO_CUSTOM")
             self.assertEqual(state["lineage"]["995"]["media_settings"]["audio_kbps"], 32)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
+                         "Real FFmpeg is required")
+    def test_real_video_preserves_original_name_in_telegram_upload_metadata(self):
+        from telethon import utils
+        from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
+
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            src = temp / "476_1793603614357_Post OP pain management.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=12",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
+                "-t", "1.4", "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac", "-b:a", "96k", str(src),
+            ], check=True, timeout=30)
+
+            chosen = {
+                **FORM, "content_kind": "🎬 فيديو — احتفظ بالصورة",
+                "video_preset": "أسرع معالجة",
+                "skip_if_no_saving": False,
+                "advanced_video": True,
+                "video_codec": "H.264 (الأكثر توافقًا)",
+                "video_resolution": "480",
+                "video_fps": "12",
+                "video_speed": "سريع",
+                "video_rate_mode": "جودة CRF",
+                "video_crf": 30,
+            }
+            engine.apply_studio_settings(forms.collect_form_settings(engine, chosen))
+            msg = SimpleNamespace(
+                id=476, video=True, audio=None, voice=None,
+                file=SimpleNamespace(mime_type="video/mp4",
+                                     name="Post OP pain management.mp4"),
+            )
+            uploaded = []
+
+            class FakeTelegram:
+                async def send_file(self, _channel, output, **kwargs):
+                    actual = engine.ffprobe(Path(output))
+                    attrs, mime = utils.get_attributes(
+                        output, mime_type=kwargs["mime_type"],
+                        attributes=kwargs["attributes"],
+                        supports_streaming=kwargs["supports_streaming"],
+                    )
+                    uploaded.append({
+                        "local": Path(output).name,
+                        "mime": mime,
+                        "audio": actual.has_audio,
+                        "video": actual.has_video,
+                        "filenames": [a.file_name for a in attrs
+                                      if isinstance(a, DocumentAttributeFilename)],
+                        "video_attr": any(isinstance(a, DocumentAttributeVideo) for a in attrs),
+                    })
+                    return SimpleNamespace(id=996)
+
+                async def send_message(self, *_args, **_kwargs):
+                    raise AssertionError("Normal video encoding must succeed")
+
+            prepared = {
+                "job": {"source": msg, "command": None, "profile": None,
+                        "target_mb": None, "rerun": False},
+                "msg": msg, "name": "Post OP pain management.mp4",
+                "src": src, "info": engine.ffprobe(src), "started_at": 0.0,
+                "download_seconds": 0.0, "probe_seconds": 0.0, "error": None,
+            }
+            state = engine.default_state()
+            with patch.object(engine, "TMP_DIR", temp), \
+                 patch.object(engine, "STATE_PATH", temp / "state.json"), \
+                 patch.object(engine, "ERROR_LOG", temp / "error.log"):
+                result = asyncio.run(engine.process_job(
+                    FakeTelegram(), object(), state, prepared, False, 1, 1,
+                ))
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(len(uploaded), 1)
+            self.assertEqual(uploaded[0]["mime"], "video/mp4")
+            self.assertTrue(uploaded[0]["video"])
+            self.assertTrue(uploaded[0]["video_attr"])
+            self.assertEqual(uploaded[0]["filenames"], ["Post OP pain management.mp4"])
+            self.assertIn("476_1793603614357_", uploaded[0]["local"])
+            self.assertIn("_compressed.mp4", uploaded[0]["local"])
+            self.assertEqual(state["lineage"]["996"]["profile"], "VIDEO_CUSTOM")
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
                          "Real FFmpeg is required")
