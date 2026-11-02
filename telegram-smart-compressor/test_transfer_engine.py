@@ -527,6 +527,7 @@ class TransferEngineTests(unittest.TestCase):
             "md5Checksum": hashlib.md5(payload).hexdigest(),
         }
         telegram = FakeTelegram()
+        channel = SimpleNamespace(id=909, title="Media Lite Transfer")
         state = transfer.new_state()
         old_root, old_state, old_limit = transfer.TEMP_ROOT, transfer.STATE_PATH, transfer.MAX_TG_PART
         try:
@@ -540,7 +541,7 @@ class TransferEngineTests(unittest.TestCase):
                 service = FakeDrive(FakeFiles(metas={source_id: meta}))
                 with patch.object(transfer, "download_drive_file", fake_download):
                     result = asyncio.run(transfer.transfer_drive_to_telegram(
-                        telegram, object(), service, state, source_id, True, 20, False
+                        telegram, channel, service, state, source_id, True, 20, False
                     ))
                     self.assertEqual(result["ok"], 1)
                     self.assertEqual([m[2] for m in telegram.messages[:3]], [3, 3, 2])
@@ -550,10 +551,14 @@ class TransferEngineTests(unittest.TestCase):
                         "archive.bin.part001", "archive.bin.part002", "archive.bin.part003"
                     ])
                     self.assertEqual(len(telegram.messages), 4)  # 3 parts and manifest
+                    self.assertEqual(
+                        set(state["drive_to_telegram_message_ids"]["909"]),
+                        {"100", "101", "102", "103"},
+                    )
                     token = transfer.transfer_token(meta)
                     self.assertTrue(state["drive_to_telegram"][token]["done"])
                     repeat = asyncio.run(transfer.transfer_drive_to_telegram(
-                        telegram, object(), service, state, source_id, True, 20, False
+                        telegram, channel, service, state, source_id, True, 20, False
                     ))
                     self.assertEqual(repeat["skipped"], 1)
                     self.assertEqual(len(telegram.messages), 4)
