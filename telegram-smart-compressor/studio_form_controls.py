@@ -122,18 +122,22 @@ def show_settings(settings, origin):
     audio_kbps = settings["audio_kbps"]
     print(f"🎧 صوت: {settings['audio_codec'].upper()} | {audio_kbps} kbps | {settings['audio_channels']}")
     print(f"📦 حجم ساعة تسجيل متوقع: حوالي {audio_kbps * 0.45:.1f} MB للصوت (تقريبي؛ يختلف مع VBR).")
-    video_mode = settings["video_rate_mode"]
-    video_quality = (
-        f"CRF {settings['video_crf']}" if video_mode == "quality" else
-        f"{settings['video_bitrate_kbps']} kbps" if video_mode == "bitrate" else
-        f"{settings['video_target_mb']} MiB مستهدف"
-    )
-    resolution = ("الأصلية" if settings["video_resolution"] == "source"
-                  else settings["video_resolution"] + "p")
-    print(
-        f"🎬 فيديو: {settings['video_codec'].upper()} | "
-        f"{resolution} | {settings['video_fps']} FPS | {video_quality}"
-    )
+    if settings["source"] == "audio":
+        print("🎞️ → 🎧 الفيديوهات هتخرج ملفات صوت فقط؛ لا ترميز فيديو ولا H.264/CRF.")
+        print("🎬 إعدادات الفيديو مش هتتطبق في الوضع ده.")
+    else:
+        video_mode = settings["video_rate_mode"]
+        video_quality = (
+            f"CRF {settings['video_crf']}" if video_mode == "quality" else
+            f"{settings['video_bitrate_kbps']} kbps" if video_mode == "bitrate" else
+            f"{settings['video_target_mb']} MiB مستهدف"
+        )
+        resolution = ("الأصلية" if settings["video_resolution"] == "source"
+                      else settings["video_resolution"] + "p")
+        print(
+            f"🎬 فيديو: {settings['video_codec'].upper()} | "
+            f"{resolution} | {settings['video_fps']} FPS | {video_quality}"
+        )
     print("💾 الإعدادات المحفوظة تخص الضغط فقط؛ لا تحتوي جلسات Telegram أو كلمات المرور.")
 
 
@@ -144,6 +148,19 @@ def perform_form_action(engine, action, source, values):
     engine.mount_drive()
     settings, origin = pick_studio_settings(engine, source, values)
     show_settings(settings, origin)
+    if source != "form":
+        print("ℹ️ وضع استرجاع Drive: إعدادات الصوت والفيديو الظاهرة في الفورم مش بتتطبق.")
+        # A stale Colab tab can still show the old 'Last used' default.
+        # Never allow an explicit audio-only choice to start H.264/CRF video
+        # work silently just because the source selector was not switched.
+        requested_kind = _option(CONTENT_KINDS, values["content_kind"], "نوع المحتوى")
+        if action in {"run", "save_default"} and requested_kind != "auto" and requested_kind != settings["source"]:
+            raise ValueError(
+                "نوع المحتوى الظاهر في الفورم مختلف عن المحفوظ على Drive. "
+                "لن نبدأ ضغط فيديو بدل صوت بالغلط. "
+                "اختار «📝 تطبيق حقول الفورم الظاهرة» من «مصدر الإعدادات»، "
+                "أو غيّر نوع المحتوى الظاهر ليتوافق مع المحفوظ."
+            )
     if action == "preview":
         print("👁️ معاينة فقط: لا ضغط، ولا تغيير في تفضيلات Drive.")
         return {"action": action, "settings": settings}
