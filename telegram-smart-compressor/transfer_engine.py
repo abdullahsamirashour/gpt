@@ -1844,6 +1844,10 @@ async def transfer_telegram_to_drive(
             ledger[origin] = receipt
             migrated += 1
     if migrated:
+        # Retain a one-time recoverable pre-migration copy on Drive.
+        backup = STATE_PATH.with_name("state_v1_before_global_dedup.json")
+        if STATE_PATH.exists() and not backup.exists():
+            shutil.copy2(STATE_PATH, backup)
         save_json(STATE_PATH, state)
         print(f"✅ تم استرجاع سجل {migrated} رسالة من النقل القديم، بدون تحميلها مرة تانية.")
 
