@@ -920,5 +920,229 @@ class TransferEngineTests(unittest.TestCase):
         self.assertEqual(transfer.clean_filename("../notes.pdf"), "notes.pdf")
 
 
+
+class CustomTransferOptionsTests(unittest.TestCase):
+    """No live Google Drive or Telegram account is required."""
+
+    def test_validate_names_and_Arabic_hashtags(self):
+        self.assertEqual(transfer.normalize_transfer_subfolder("  محاضرات نوفمبر  "), "محاضرات نوفمبر")
+        self.assertEqual(transfer.normalize_transfer_subfolder(""), "")
+        for invalid in ("../notes", "notes/child", r"notes\child", ".", "..", "test\nbad",
+                        "x" * 121, "\x00"):
+            with self.subTest(folder=invalid), self.assertRaises(ValueError):
+                transfer.normalize_transfer_subfolder(invalid)
+        self.assertEqual(transfer.normalize_transfer_hashtag(""), "")
+        self.assertEqual(transfer.normalize_transfer_hashtag("محاضرات 2026"), "#محاضرات_2026")
+        self.assertEqual(transfer.normalize_transfer_hashtag("#فيزياء_ثالثة"), "#فيزياء_ثالثة")
+        self.assertEqual(transfer.normalize_transfer_hashtag("   #Physics_2026   "), "#Physics_2026")
+        for invalid in ("#bad-hashtag", "##two", "#", "#hello!", "123", "a" * 65):
+            with self.subTest(hashtag=invalid), self.assertRaises(ValueError):
+                transfer.normalize_transfer_hashtag(invalid)
+        self.assertEqual(
+            transfer.add_transfer_hashtag("📁 file.pdf\nMLTX:0123456789abcdefab:1/1",
+                                          "#محاضرات_2026"),
+            "📁 file.pdf\nMLTX:0123456789abcdefab:1/1\n#محاضرات_2026",
+        )
+        self.assertEqual(
+            transfer.add_transfer_hashtag("original caption", ""), "original caption"
+        )
+
+    def test_named_drive_folder_is_created_once_and_destination_receipts_are_separate(self):
+        class FolderFiles:
+            def __init__(self):
+                self.children = {}
+                self.created = []
+                self.list_queries = []
+
+            def list(self, q, **_kwargs):
+                self.list_queries.append(q)
+                items = [
+                    {"id": fid} for (parent, name), fid in self.children.items()
+                    if f"'{parent}' in parents" in q and f"name = '{name}'" in q
+                ]
+                return Reply({"files": items})
+
+            def create(self, *, body, **_kwargs):
+                fid = f"subfolder_{len(self.created) + 1}"
+                self.created.append((fid, body))
+                self.children[(body["parents"][0], body["name"])] = fid
+                return Reply({"id": fid})
+
+        class FakeTelegram:
+            def __init__(self):
+                self.downloads = 0
+
+            async def iter_messages(self, _channel, limit):
+                yield SimpleNamespace(
+                    id=42, message="lecture recording",
+                    file=SimpleNamespace(size=4, name="lecture.ogg", ext=".ogg"),
+                )
+
+            async def download_media(self, _msg, *, file, progress_callback):
+                self.downloads += 1
+                Path(file).write_bytes(b"OggS")
+                progress_callback(4, 4)
+                return file
+
+        files = FolderFiles()
+        drive = FakeDrive(files)
+        client = FakeTelegram()
+        channel = SimpleNamespace(id=12, title="Channel Name")
+        state = transfer.new_state()
+        old_key = transfer.origin_key(-10012, 42)
+        state["telegram_to_drive"][old_key] = {"drive_id": "old-default-copy"}
+        uploads = []
+
+        def fake_upload(_service, local, folder_id, name, key):
+            self.assertEqual(Path(local).read_bytes(), b"OggS")
+            uploads.append((folder_id, name, key))
+            return {"id": f"saved_{len(uploads)}"}
+
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(transfer, "TEMP_ROOT", Path(td)), \
+                 patch.object(transfer, "STATE_PATH", Path(td) / "state.json"), \
+                 patch("telethon.utils.get_peer_id", return_value=-10012), \
+                 patch.object(transfer, "existing_drive_copy", return_value=None), \
+                 patch.object(transfer, "upload_drive_file", side_effect=fake_upload):
+                def run(name, preview=False):
+                    return asyncio.run(transfer.transfer_telegram_to_drive(
+                        client, channel, drive, state, "base-folder", 0, preview,
+                        subfolder_name=name))
+
+                self.assertEqual(run("محاضرات نوفمبر", preview=True)["ok"], 0)
+                self.assertEqual(len(files.created), 0)
+                self.assertEqual(client.downloads, 0)
+                self.assertEqual(run("محاضرات نوفمبر")["ok"], 1)
+                self.assertEqual(files.created[0][1]["parents"], ["base-folder"])
+                self.assertEqual(files.created[0][1]["name"], "محاضرات نوفمبر")
+                self.assertEqual(uploads[0][0], "subfolder_1")
+                # Drive appProperties keeps the original provenance token,
+                # while the local state key is specific to this destination.
+                self.assertEqual(uploads[0][2], old_key)
+                scoped = transfer.telegram_drive_state_key(
+                    -10012, 42, "subfolder_1", "محاضرات نوفمبر")
+                self.assertNotEqual(scoped, old_key)
+                self.assertIn(scoped, state["telegram_to_drive"])
+                self.assertEqual(run("محاضرات نوفمبر")["ok"], 0)
+                self.assertEqual(client.downloads, 1)
+                self.assertEqual(len(files.created), 1)
+                self.assertEqual(run("مراجعة")["ok"], 1)
+                self.assertEqual(len(files.created), 2)
+                self.assertEqual(uploads[-1][0], "subfolder_2")
+                # If the named folder was deleted, it is recreated and the
+                # same Telegram message is copied into this new folder.
+                del files.children[("base-folder", "محاضرات نوفمبر")]
+                self.assertEqual(run("محاضرات نوفمبر")["ok"], 1)
+                self.assertEqual(files.created[-1][0], "subfolder_3")
+                self.assertEqual(uploads[-1][0], "subfolder_3")
+                self.assertEqual(run("")["ok"], 0)  # Legacy default remains done.
+                self.assertEqual(len(files.created), 3)
+
+    def test_drive_preview_folder_lookup_never_calls_create(self):
+        service = MagicMock()
+        service.files.return_value.list.return_value.execute.return_value = {
+            "files": [{"id": "base"}]
+        }
+        self.assertEqual(transfer.find_existing_drive_destination(service, ""), "base")
+        service.files.return_value.create.assert_not_called()
+
+        service.files.return_value.list.return_value.execute.return_value = {"files": []}
+        self.assertEqual(transfer.find_existing_drive_destination(service, ""), "")
+        service.files.return_value.create.assert_not_called()
+
+    def test_hashtag_is_on_all_split_parts_and_manifest_and_forced_reupload(self):
+        class FakeTelegram:
+            def __init__(self):
+                self.messages = []
+                self.uploads = []
+
+            async def iter_messages(self, _channel, limit=0):
+                for message in reversed(self.messages):
+                    yield message
+
+            async def get_messages(self, _channel, limit=0):
+                return list(reversed(self.messages))
+
+            async def upload_file(self, file, *, file_size, file_name, part_size_kb, progress_callback):
+                data = Path(file).read_bytes() if isinstance(file, str) else file.read()
+                self.asserted_size = (len(data), file_size)
+                self.uploads.append((file_name, data))
+                return SimpleNamespace(name=file_name, size=file_size)
+
+            async def send_file(self, _channel, file, **kwargs):
+                size = Path(file).stat().st_size if isinstance(file, str) else file.size
+                message = SimpleNamespace(
+                    id=500 + len(self.messages), message=kwargs["caption"],
+                    file=SimpleNamespace(size=size),
+                )
+                self.messages.append(message)
+                return message
+
+        payload = b"abcdefgh"
+        source_id = "abcdefghijklmnopqrstuvwxyzABCDE"
+        meta = {
+            "id": source_id, "name": "lectures.bin", "mimeType": "application/octet-stream",
+            "size": str(len(payload)), "modifiedTime": "2026-10-01T00:00:00Z",
+            "md5Checksum": hashlib.md5(payload).hexdigest(),
+        }
+        state = transfer.new_state()
+        telegram = FakeTelegram()
+        service = FakeDrive(FakeFiles(metas={source_id: meta}))
+        def download(_service, _meta, path):
+            path.write_bytes(payload)
+            return len(payload), hashlib.sha256(payload).hexdigest()
+
+        with tempfile.TemporaryDirectory() as td:
+            with patch.object(transfer, "TEMP_ROOT", Path(td)), \
+                 patch.object(transfer, "STATE_PATH", Path(td) / "state.json"), \
+                 patch.object(transfer, "MAX_TG_PART", 3), \
+                 patch.object(transfer, "download_drive_file", side_effect=download):
+                first = asyncio.run(transfer.transfer_drive_to_telegram(
+                    telegram, object(), service, state, source_id, True, 0, False,
+                    telegram_hashtag="محاضرات 2026"))
+                self.assertEqual((first["ok"], first["failed"]), (1, 0))
+                self.assertEqual(len(telegram.messages), 4)  # 3 parts + manifest.
+                for message in telegram.messages:
+                    self.assertTrue(message.message.endswith("#محاضرات_2026"))
+                    self.assertIn("MLTX:", message.message)
+                self.assertEqual(
+                    len([m for m in telegram.messages if
+                         transfer.TAG_PATTERN.search(m.message)]), 3
+                )
+                token = transfer.transfer_token(meta)
+                self.assertEqual(state["drive_to_telegram"][token]["hashtag"],
+                                 "#محاضرات_2026")
+                second = asyncio.run(transfer.transfer_drive_to_telegram(
+                    telegram, object(), service, state, source_id, True, 0, False,
+                    telegram_hashtag="#another_tag"))
+                self.assertEqual(second["skipped"], 1)
+                self.assertEqual(len(telegram.messages), 4)  # Done messages unchanged.
+                forced = asyncio.run(transfer.transfer_drive_to_telegram(
+                    telegram, object(), service, state, source_id, True, 0, False,
+                    reupload_selected=True, selected_numbers="1",
+                    telegram_hashtag="#إعادة_الرفع"))
+                self.assertEqual((forced["ok"], forced["failed"]), (1, 0))
+                self.assertEqual(len(telegram.messages), 8)
+                for message in telegram.messages[-4:]:
+                    self.assertTrue(message.message.endswith("#إعادة_الرفع"))
+                    self.assertIn("MLTX:", message.message)
+
+    def test_new_form_parameters_pass_optional_settings_without_touching_compressor(self):
+        nb = json.loads(Path(__file__).with_name("Smart_Compressor.ipynb").read_text(
+            encoding="utf-8"))
+        self.assertEqual(len(nb["cells"]), 6)
+        first = "".join(nb["cells"][1]["source"])
+        from_drive = "".join(nb["cells"][3]["source"])
+        to_drive = "".join(nb["cells"][5]["source"])
+        self.assertIn('ENGINE_REL = "telegram-smart-compressor/engine.py"', first)
+        self.assertIn("هاشتاج_الملفات", from_drive)
+        self.assertIn("telegram_hashtag=هاشتاج_الملفات.strip()", from_drive)
+        self.assertIn("اسم_الفولدر_الفرعي", to_drive)
+        self.assertIn("drive_subfolder=اسم_الفولدر_الفرعي.strip()", to_drive)
+        compile(from_drive, "drive-to-telegram-colab", "exec")
+        compile(to_drive, "telegram-to-drive-colab", "exec")
+
+
+
 if __name__ == "__main__":
     unittest.main()

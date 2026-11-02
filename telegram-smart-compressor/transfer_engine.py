@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import uuid
+import unicodedata
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -160,6 +161,67 @@ def clean_filename(name: str) -> str:
     name = str(name or "").replace("\\", "/").split("/")[-1].strip()
     name = "".join("_" if c in '\x00\r\n\t' else c for c in name)
     return name[:180] or "unnamed_file"
+
+
+def normalize_transfer_subfolder(value: str) -> str:
+    """Single safe child-folder name, never a path or arbitrary Drive URL."""
+    name = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not name:
+        return ""
+    if (len(name) > 120 or name in {".", ".."} or
+            not name.strip(". ") or
+            any(c in "/\\\\" or unicodedata.category(c).startswith("C") for c in name)):
+        raise ValueError(
+            "اسم الفولدر لازم يكون اسمًا واحدًا من 1 إلى 120 حرفًا، "
+            "بدون / أو \\\\ أو أسطر جديدة."
+        )
+    return name
+
+
+def normalize_transfer_hashtag(value: str) -> str:
+    """Accept #arabic_tag, or an unprefixed label; spaces become underscores."""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not text:
+        return ""
+    tag = re.sub(r"\s+", "_", text[1:] if text.startswith("#") else text)
+    if not tag or len(tag) > 64 or not all(c == "_" or c.isalnum() for c in tag):
+        raise ValueError("اكتب هاشتاج واحدًا من حروف/أرقام و_ فقط (مثل #محاضرات_2026).")
+    if not any(c.isalpha() for c in tag):
+        raise ValueError("الهاشتاج لازم يحتوي على حرف واحد على الأقل.")
+    return "#" + tag
+
+
+def add_transfer_hashtag(caption: str, hashtag: str = "") -> str:
+    """Keep MLTX markers intact; the hashtag is appended on its own line."""
+    return f"{caption}\n{hashtag}" if hashtag else caption
+
+
+def telegram_drive_state_key(peer_id: int, message_id: int,
+                             parent_id: str, subfolder_name: str) -> str:
+    """New named destinations keep independent receipts; old default keys survive."""
+    original = origin_key(peer_id, message_id)
+    if not subfolder_name:
+        return original
+    scope = hashlib.sha256(
+        f"{parent_id}\0{subfolder_name}".encode("utf-8")
+    ).hexdigest()[:18]
+    return f"folder-{scope}:{original}"
+
+
+def find_existing_drive_destination(service, folder_ref: str) -> str:
+    """Read-only lookup for Preview; never create the selected folder."""
+    folder_mime = "application/vnd.google-apps.folder"
+    if folder_ref:
+        folder_id = parse_drive_id(folder_ref)
+        if get_drive_metadata(service, folder_id)["mimeType"] != folder_mime:
+            raise ValueError("الوجهة على Drive لازم تكون فولدرًا مش ملفًا.")
+        return folder_id
+    result = service.files().list(
+        q=f"name = '{DEFAULT_DRIVE_FOLDER}' and mimeType = '{folder_mime}' and 'root' in parents and trashed = false",
+        fields="files(id)", pageSize=10,
+    ).execute(num_retries=3)
+    found = result.get("files", [])
+    return found[0]["id"] if found else ""
 
 
 # Exact, common Drive MIME types. Generic application/octet-stream needs
@@ -566,18 +628,27 @@ def ensure_drive_destination(service, folder_ref: str) -> str:
     return folder_id
 
 
+def find_child_folder(service, parent_id: str, name: str) -> str:
+    """Read-only child-folder lookup for safe previews and scoped receipts."""
+    if not parent_id:
+        return ""
+    name = clean_filename(name)
+    safe = name.replace("\\", "\\\\").replace("'", "\\'")
+    result = service.files().list(
+        q=f"'{parent_id}' in parents and name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+        fields="files(id)", pageSize=10,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute(num_retries=3)
+    entries = result.get("files", [])
+    return entries[0]["id"] if entries else ""
+
+
 def ensure_child_folder(service, parent_id: str, name: str, cache: dict) -> str:
     name = clean_filename(name)
     key = (parent_id, name)
     if key not in cache:
-        safe = name.replace("\\", "\\\\").replace("'", "\\'")
-        result = service.files().list(
-            q=f"'{parent_id}' in parents and name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-            fields="files(id)", pageSize=10,
-            supportsAllDrives=True, includeItemsFromAllDrives=True,
-        ).execute(num_retries=3)
-        entries = result.get("files", [])
-        cache[key] = entries[0]["id"] if entries else service.files().create(
+        existing = find_child_folder(service, parent_id, name)
+        cache[key] = existing or service.files().create(
             body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]},
             fields="id", supportsAllDrives=True,
         ).execute(num_retries=3)["id"]
@@ -992,8 +1063,11 @@ def parse_file_numbers(spec: str, total: int) -> list[int]:
 async def transfer_drive_to_telegram(
     client, channel, service, state: dict, source_id: str, recursive: bool,
     max_files: int, preview: bool, reupload_selected: bool = False,
-    selected_numbers: str = "",
+    selected_numbers: str = "", telegram_hashtag: str = "",
 ) -> dict:
+    telegram_hashtag = normalize_transfer_hashtag(telegram_hashtag)
+    if telegram_hashtag:
+        print(f"🏷️ هيتضاف الهاشتاج {telegram_hashtag} لوصف كل ملف/جزء جديد.")
     all_items = list_drive_sources(service, source_id, recursive)
     if not all_items:
         print("📭 مفيش ملفات في المجلد المحدد (أو هو فاضي).")
@@ -1022,9 +1096,19 @@ async def transfer_drive_to_telegram(
         batches = state.setdefault("reupload_batches", {})
         redo_batch = batches.get(batch_fingerprint)
         if not isinstance(redo_batch, dict) or redo_batch.get("done"):
-            redo_batch = {"completed": [], "done": False, "started_at": int(time.time())}
+            redo_batch = {
+                "completed": [], "done": False, "started_at": int(time.time()),
+                "hashtag": telegram_hashtag,
+            }
             batches[batch_fingerprint] = redo_batch
             save_json(STATE_PATH, state)
+        # A partially completed reupload batch must keep its original tag.
+        # Old batches without a tag were untagged; do not silently mix styles.
+        batch_hashtag = normalize_transfer_hashtag(redo_batch.get("hashtag", ""))
+        if telegram_hashtag != batch_hashtag:
+            print(f"ℹ️ إعادة الرفع دي بدأت بهاشتاج {batch_hashtag or '(بدون)'}؛ "
+                  "هنكمل بيه عشان الأجزاء المرسلة قبل كده تفضل متسقة.")
+        telegram_hashtag = batch_hashtag
         completed = set(redo_batch.get("completed", []))
         items = [m for m in selected_items if transfer_token(m) not in completed]
         skipped = len(selected_items) - len(items)
@@ -1086,10 +1170,23 @@ async def transfer_drive_to_telegram(
                     save_json(STATE_PATH, state)
                 receipt_token = repair["tag"]
                 existing = dict(repair.get("parts", {}))
+                # A partially sent reupload uses its original tag on resume.
+                effective_hashtag = (
+                    normalize_transfer_hashtag(repair.get("hashtag", ""))
+                    if existing else telegram_hashtag
+                )
+                repair["hashtag"] = effective_hashtag
             else:
                 repair = None
                 receipt_token = token
                 existing = dict(previous.get("parts", {}))
+                effective_hashtag = (
+                    normalize_transfer_hashtag(previous.get("hashtag", ""))
+                    if existing else telegram_hashtag
+                )
+                if existing and effective_hashtag != telegram_hashtag:
+                    print(f"ℹ️ {meta['name']}: استكمال الأجزاء بالهاشتاج "
+                          f"{effective_hashtag or '(بدون)'} القديم.")
 
             def record_part(part_no: int, message_id: int) -> None:
                 existing[str(part_no)] = int(message_id)
@@ -1097,7 +1194,10 @@ async def transfer_drive_to_telegram(
                     repair["parts"] = existing
                     records[token] = previous
                 else:
-                    records[token] = {"parts": existing, "done": False}
+                    records[token] = {
+                        "parts": existing, "done": False,
+                        "hashtag": effective_hashtag,
+                    }
                 save_json(STATE_PATH, state)
 
             try:
@@ -1132,7 +1232,10 @@ async def transfer_drive_to_telegram(
                             continue
 
                         part_name = name if parts == 1 else f"{name}.part{part_no:03d}"
-                        caption = f"📁 {meta['relative_path'][-700:]}\n{marker}"
+                        caption = add_transfer_hashtag(
+                            f"📁 {meta['relative_path'][-700:]}\n{marker}",
+                            effective_hashtag,
+                        )
                         progress = Progress(f"⬆️ Telegram [{index}/{len(items)}] {part_name}")
                         if parts == 1:
                             uploaded = await send_transfer_document(
@@ -1175,7 +1278,10 @@ async def transfer_drive_to_telegram(
                         if not manifest_id:
                             receipt = await client.send_file(
                                 channel, str(manifest_path), force_document=True,
-                                caption=f"📋 خريطة تجميع الأجزاء\n{manifest_tag}",
+                                caption=add_transfer_hashtag(
+                                    f"📋 خريطة تجميع الأجزاء\n{manifest_tag}",
+                                    effective_hashtag,
+                                ),
                             )
                             manifest_id = int(receipt.id)
                         if repairing:
@@ -1199,6 +1305,7 @@ async def transfer_drive_to_telegram(
                     final_record.update({
                         "parts": existing, "done": True, "file_id": meta["id"],
                         "size": size, "sha256": digest, "name": name,
+                        "hashtag": effective_hashtag,
                     })
                     if manifest_id:
                         final_record["manifest_id"] = manifest_id
@@ -1425,18 +1532,39 @@ async def fetch_telegram_message(client, channel, msg, local: Path, size: int, d
 
 async def transfer_telegram_to_drive(
     client, channel, service, state: dict, folder_id: str, max_files: int, preview: bool,
+    subfolder_name: str = "",
 ) -> dict:
     from telethon import utils
 
+    subfolder_name = normalize_transfer_subfolder(subfolder_name)
     peer_id = utils.get_peer_id(channel)
+    records = state_section(state, "telegram_to_drive")
+    source_name = clean_filename(getattr(channel, "title", "") or "Telegram")
+    target_name = subfolder_name or source_name
+    print(f"📁 الحفظ: داخل فولدر Drive المختار / {target_name}"
+          + (" (فولدر مخصص؛ يُنشأ لو مش موجود)" if subfolder_name else ""))
+    folder_cache = {}
+    target_id = ""
+    if subfolder_name:
+        # Resolve the actual destination before filtering saved receipts.
+        # When an old custom folder is deleted/recreated its ID changes, so
+        # previously transferred files must be copied to the new folder.
+        finder = find_child_folder if preview else ensure_child_folder
+        if preview:
+            target_id = await asyncio.to_thread(finder, service, folder_id, target_name)
+        else:
+            target_id = await asyncio.to_thread(
+                finder, service, folder_id, target_name, folder_cache
+            )
+            print(f"✅ فولدر الحفظ جاهز: {target_name}")
     downloaded = []
     async for msg in client.iter_messages(channel, limit=SCAN_LIMIT):
         if not getattr(msg, "file", None):
             continue
         if "MLTX:" in (msg.message or ""):
             continue  # Drive → Telegram uploads must never bounce back to Drive.
-        key = origin_key(peer_id, int(msg.id))
-        if state_section(state, "telegram_to_drive").get(key):
+        key = telegram_drive_state_key(peer_id, int(msg.id), target_id, subfolder_name)
+        if records.get(key):
             continue
         downloaded.append(msg)
     jobs = list(reversed(downloaded))
@@ -1446,18 +1574,24 @@ async def transfer_telegram_to_drive(
     for msg in jobs[:10]:
         print(" •", clean_filename(getattr(msg.file, "name", "") or f"telegram_{msg.id}"))
     if preview:
-        print("👁️ معاينة فقط — لم يتم نقل ملفات.")
+        print("👁️ معاينة فقط — لم يتم نقل ملفات أو إنشاء فولدر.")
         return {"ok": 0, "skipped": 0, "failed": 0}
 
-    records = state_section(state, "telegram_to_drive")
     counters = {"ok": 0, "skipped": 0, "failed": 0}
-    folder_cache = {}
-    source_name = clean_filename(getattr(channel, "title", "") or "Telegram")
-    dst_folder = ensure_child_folder(service, folder_id, source_name, folder_cache)
+    if not jobs:
+        print("✅ مفيش ملفات جديدة للوجهة المختارة.")
+        return counters
+    dst_folder = target_id
+    if not subfolder_name:
+        dst_folder = await asyncio.to_thread(
+            ensure_child_folder, service, folder_id, target_name, folder_cache
+        )
+        print(f"✅ فولدر الحفظ جاهز: {target_name}")
     downloader = TelegramParallelDownloader(client) if TelegramParallelDownloader.supported(client) else None
     print(f"⚡ Telegram parallel download: من 5 MiB، {TG_PARALLEL_CONNECTIONS} اتصالات؛ fallback تلقائي.")
     for index, msg in enumerate(jobs, 1):
-        key = origin_key(peer_id, int(msg.id))
+        key = telegram_drive_state_key(peer_id, int(msg.id), target_id, subfolder_name)
+        remote_key = origin_key(peer_id, int(msg.id))  # Stable Drive appProperties across destinations.
         size = int(getattr(msg.file, "size", 0) or 0)
         name = clean_filename(
             getattr(msg.file, "name", None) or f"telegram_{msg.id}{getattr(msg.file, 'ext', '') or ''}"
@@ -1465,7 +1599,7 @@ async def transfer_telegram_to_drive(
         try:
             if size <= 0:
                 raise ValueError("Telegram لم يوفّر حجم الملف.")
-            existing = await asyncio.to_thread(existing_drive_copy, service, dst_folder, key, size)
+            existing = await asyncio.to_thread(existing_drive_copy, service, dst_folder, remote_key, size)
             if existing:
                 records[key] = {"drive_id": existing["id"], "size": size}
                 save_json(STATE_PATH, state)
@@ -1476,7 +1610,7 @@ async def transfer_telegram_to_drive(
             with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as td:
                 local = Path(td) / name
                 await fetch_telegram_message(client, channel, msg, local, size, downloader)
-                uploaded = await asyncio.to_thread(upload_drive_file, service, local, dst_folder, name, key)
+                uploaded = await asyncio.to_thread(upload_drive_file, service, local, dst_folder, name, remote_key)
                 records[key] = {"drive_id": uploaded["id"], "size": size, "name": name}
                 save_json(STATE_PATH, state)
                 counters["ok"] += 1
@@ -1557,13 +1691,17 @@ async def _run_transfer(
     service, direction: str, source: str, destination: str,
     max_files: int, recursive: bool, preview: bool, login_method: str = "code",
     reupload_selected: bool = False, selected_numbers: str = "",
+    drive_subfolder: str = "", telegram_hashtag: str = "",
 ) -> dict:
+    drive_subfolder = normalize_transfer_subfolder(drive_subfolder)
+    telegram_hashtag = normalize_transfer_hashtag(telegram_hashtag)
     from telethon import TelegramClient
 
     state = load_json(STATE_PATH, new_state())
     if direction == "drive_to_telegram" and preview:
         return await transfer_drive_to_telegram(
-            None, None, service, state, parse_drive_id(source), recursive, max_files, True
+            None, None, service, state, parse_drive_id(source), recursive, max_files, True,
+            telegram_hashtag=telegram_hashtag,
         )
 
     account = load_account_config()
@@ -1592,6 +1730,7 @@ async def _run_transfer(
             return await transfer_drive_to_telegram(
                 client, channel, service, state, parse_drive_id(source), recursive, max_files,
                 False, reupload_selected=reupload_selected, selected_numbers=selected_numbers,
+                telegram_hashtag=telegram_hashtag,
             )
         if direction == "telegram_to_drive":
             if source.strip():
@@ -1599,11 +1738,12 @@ async def _run_transfer(
                 source_entity = await client.get_entity(ref)
             else:
                 source_entity = await ensure_channel(client, transfer_config)
-            dest_id = "" if preview else await asyncio.to_thread(
-                ensure_drive_destination, service, destination
-            )
+            # Preview may query existing folders but must never create a new one.
+            finder = find_existing_drive_destination if preview else ensure_drive_destination
+            dest_id = await asyncio.to_thread(finder, service, destination)
             return await transfer_telegram_to_drive(
-                client, source_entity, service, state, dest_id, max_files, preview
+                client, source_entity, service, state, dest_id, max_files, preview,
+                subfolder_name=drive_subfolder,
             )
         raise ValueError("اتجاه النقل غير معروف.")
     finally:
@@ -1618,9 +1758,16 @@ def run_transfer(
     direction: str, source: str = "", destination: str = "",
     max_files: int = 20, recursive: bool = True, preview: bool = True,
     login_method: str = "code", reupload_selected: bool = False,
-    selected_numbers: str = "",
+    selected_numbers: str = "", drive_subfolder: str = "",
+    telegram_hashtag: str = "",
 ) -> None:
     """Entry point called by the small GitHub-backed Colab launcher cell."""
+    drive_subfolder = normalize_transfer_subfolder(drive_subfolder)
+    telegram_hashtag = normalize_transfer_hashtag(telegram_hashtag)
+    if direction == "drive_to_telegram" and drive_subfolder:
+        raise ValueError("اسم فولدر Drive الفرعي متاح فقط في Telegram → Drive.")
+    if direction == "telegram_to_drive" and telegram_hashtag:
+        raise ValueError("الهاشتاج متاح فقط في Drive → Telegram.")
     if login_method not in {"code", "qr"}:
         raise ValueError("طريقة تسجيل دخول Telegram غير معروفة.")
     source, destination = normalize_transfer_inputs(direction, source, destination)
@@ -1649,6 +1796,7 @@ def run_transfer(
                     _run_transfer(
                         service, direction, source, destination, max_files, recursive,
                         preview, login_method, reupload_selected, selected_numbers,
+                        drive_subfolder, telegram_hashtag,
                     )
                 )
             print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']} • {time.time()-started:.0f} ثانية")
@@ -1657,6 +1805,8 @@ def run_transfer(
                     "direction": direction, "finished": int(time.time()),
                     "reupload_selected": bool(reupload_selected),
                     "selected_numbers": selected_numbers if reupload_selected else "",
+                    "drive_subfolder": drive_subfolder if direction == "telegram_to_drive" else "",
+                    "telegram_hashtag": telegram_hashtag if direction == "drive_to_telegram" else "",
                     **result,
                 })
         except KeyboardInterrupt:
