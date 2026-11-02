@@ -562,7 +562,7 @@ def connect_drive():
 def get_drive_metadata(service, file_id: str) -> dict:
     return service.files().get(
         fileId=file_id, supportsAllDrives=True,
-        fields="id,name,mimeType,size,md5Checksum,modifiedTime,webViewLink,parents",
+        fields="id,name,mimeType,size,md5Checksum,modifiedTime,webViewLink,parents,trashed",
     ).execute(num_retries=3)
 
 
@@ -1565,6 +1565,7 @@ def confirmed_drive_copy_for_deletion(service, folder_id: str, record: dict) -> 
         and int(remote.get("size") or -1) == wanted_size
         and str(remote.get("md5Checksum") or "").lower() == wanted_md5
         and folder_id in (remote.get("parents") or [])
+        and remote.get("trashed") is not True
     )
 
 
