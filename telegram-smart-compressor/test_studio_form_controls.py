@@ -379,6 +379,89 @@ class NativeStudioFormTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
                          "Real FFmpeg is required")
+    def test_real_video_preserves_original_name_in_telegram_upload_metadata(self):
+        from telethon import utils
+        from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
+
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            src = temp / "476_1793603614357_Post OP pain management.mp4"
+            subprocess.run([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=12",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
+                "-t", "1.4", "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac", "-b:a", "96k", str(src),
+            ], check=True, timeout=30)
+
+            chosen = {
+                **FORM, "content_kind": "🎬 فيديو — احتفظ بالصورة",
+                "video_preset": "أسرع معالجة",
+                "skip_if_no_saving": False,
+                "advanced_video": True,
+                "video_codec": "H.264 (الأكثر توافقًا)",
+                "video_resolution": "480",
+                "video_fps": "12",
+                "video_speed": "سريع",
+                "video_rate_mode": "جودة CRF",
+                "video_crf": 30,
+            }
+            engine.apply_studio_settings(forms.collect_form_settings(engine, chosen))
+            msg = SimpleNamespace(
+                id=476, video=True, audio=None, voice=None,
+                file=SimpleNamespace(mime_type="video/mp4",
+                                     name="Post OP pain management.mp4"),
+            )
+            uploaded = []
+
+            class FakeTelegram:
+                async def send_file(self, _channel, output, **kwargs):
+                    actual = engine.ffprobe(Path(output))
+                    attrs, mime = utils.get_attributes(
+                        output, mime_type=kwargs["mime_type"],
+                        attributes=kwargs["attributes"],
+                        supports_streaming=kwargs["supports_streaming"],
+                    )
+                    uploaded.append({
+                        "local": Path(output).name,
+                        "mime": mime,
+                        "audio": actual.has_audio,
+                        "video": actual.has_video,
+                        "filenames": [a.file_name for a in attrs
+                                      if isinstance(a, DocumentAttributeFilename)],
+                        "video_attr": any(isinstance(a, DocumentAttributeVideo) for a in attrs),
+                    })
+                    return SimpleNamespace(id=996)
+
+                async def send_message(self, *_args, **_kwargs):
+                    raise AssertionError("Normal video encoding must succeed")
+
+            prepared = {
+                "job": {"source": msg, "command": None, "profile": None,
+                        "target_mb": None, "rerun": False},
+                "msg": msg, "name": "Post OP pain management.mp4",
+                "src": src, "info": engine.ffprobe(src), "started_at": 0.0,
+                "download_seconds": 0.0, "probe_seconds": 0.0, "error": None,
+            }
+            state = engine.default_state()
+            with patch.object(engine, "TMP_DIR", temp), \
+                 patch.object(engine, "STATE_PATH", temp / "state.json"), \
+                 patch.object(engine, "ERROR_LOG", temp / "error.log"):
+                result = asyncio.run(engine.process_job(
+                    FakeTelegram(), object(), state, prepared, False, 1, 1,
+                ))
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(len(uploaded), 1)
+            self.assertEqual(uploaded[0]["mime"], "video/mp4")
+            self.assertTrue(uploaded[0]["video"])
+            self.assertTrue(uploaded[0]["video_attr"])
+            self.assertEqual(uploaded[0]["filenames"], ["Post OP pain management.mp4"])
+            self.assertIn("476_1793603614357_", uploaded[0]["local"])
+            self.assertIn("_compressed.mp4", uploaded[0]["local"])
+            self.assertEqual(state["lineage"]["996"]["profile"], "VIDEO_CUSTOM")
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
+                         "Real FFmpeg is required")
     def test_silent_video_is_not_uploaded_or_marked_processed_as_audio(self):
         with tempfile.TemporaryDirectory() as td:
             temp = Path(td)
