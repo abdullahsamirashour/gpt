@@ -1289,6 +1289,7 @@ async def transfer_drive_to_telegram(
 
             def record_part(part_no: int, message_id: int) -> None:
                 existing[str(part_no)] = int(message_id)
+                remember_outbound_telegram_id(state, channel, message_id)
                 if repairing:
                     repair["parts"] = existing
                     records[token] = previous
@@ -1385,9 +1386,10 @@ async def transfer_drive_to_telegram(
                             manifest_id = int(receipt.id)
                         if repairing:
                             repair["manifest_id"] = manifest_id
-                            save_json(STATE_PATH, state)
                         else:
                             records[token]["manifest_id"] = manifest_id
+                        remember_outbound_telegram_id(state, channel, int(manifest_id))
+                        save_json(STATE_PATH, state)
 
                     if repairing:
                         history = previous.get("history", [])
