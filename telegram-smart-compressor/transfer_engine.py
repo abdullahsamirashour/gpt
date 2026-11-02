@@ -722,7 +722,9 @@ def _outgoing_ids_in_record(record: dict) -> set[int]:
         except (TypeError, ValueError):
             pass
     # Reuploads may be interrupted before the final record is completed.
-    ids.update(_outgoing_ids_in_record(record.get("reupload") or {}))
+    reupload = record.get("reupload")
+    if isinstance(reupload, dict) and reupload:
+        ids.update(_outgoing_ids_in_record(reupload))
     return ids
 
 
