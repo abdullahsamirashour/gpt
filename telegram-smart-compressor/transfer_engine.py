@@ -628,18 +628,27 @@ def ensure_drive_destination(service, folder_ref: str) -> str:
     return folder_id
 
 
+def find_child_folder(service, parent_id: str, name: str) -> str:
+    """Read-only child-folder lookup for safe previews and scoped receipts."""
+    if not parent_id:
+        return ""
+    name = clean_filename(name)
+    safe = name.replace("\\", "\\\\").replace("'", "\\'")
+    result = service.files().list(
+        q=f"'{parent_id}' in parents and name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+        fields="files(id)", pageSize=10,
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute(num_retries=3)
+    entries = result.get("files", [])
+    return entries[0]["id"] if entries else ""
+
+
 def ensure_child_folder(service, parent_id: str, name: str, cache: dict) -> str:
     name = clean_filename(name)
     key = (parent_id, name)
     if key not in cache:
-        safe = name.replace("\\", "\\\\").replace("'", "\\'")
-        result = service.files().list(
-            q=f"'{parent_id}' in parents and name = '{safe}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-            fields="files(id)", pageSize=10,
-            supportsAllDrives=True, includeItemsFromAllDrives=True,
-        ).execute(num_retries=3)
-        entries = result.get("files", [])
-        cache[key] = entries[0]["id"] if entries else service.files().create(
+        existing = find_child_folder(service, parent_id, name)
+        cache[key] = existing or service.files().create(
             body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]},
             fields="id", supportsAllDrives=True,
         ).execute(num_retries=3)["id"]
