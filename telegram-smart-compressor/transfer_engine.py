@@ -659,6 +659,105 @@ def origin_key(peer_id: int, message_id: int) -> str:
     return f"{peer_id}_{message_id}"
 
 
+def canonical_telegram_origin_from_receipt(receipt_key: str) -> str:
+    """Decode both old plain and named-folder-scoped receipt IDs."""
+    raw = str(receipt_key or "")
+    if re.fullmatch(r"-?\d+_\d+", raw):
+        return raw
+    scoped = re.fullmatch(r"folder-[0-9a-f]{18}:(-?\d+_\d+)", raw)
+    return scoped.group(1) if scoped else ""
+
+
+def transferred_telegram_origins(state: dict) -> dict:
+    """Stable global ever-transferred ledger, independent of destination.
+
+    Read existing v1 destination-scoped receipts without needing a migration
+    command. Do not perform Drive network checks in this function: if a
+    previously saved folder was emptied or deleted, the source is still
+    considered already transferred. The explicit recopy flag opts out.
+    """
+    stored = state.get("telegram_to_drive_seen")
+    known = dict(stored) if isinstance(stored, dict) else {}
+    for receipt_key, record in state.get("telegram_to_drive", {}).items():
+        if not isinstance(record, dict) or not record.get("drive_id"):
+            continue
+        origin = canonical_telegram_origin_from_receipt(receipt_key)
+        if origin:
+            known.setdefault(origin, {
+                "drive_id": str(record["drive_id"]),
+                "size": int(record.get("size") or 0),
+                "from_legacy_receipt": True,
+            })
+    return known
+
+
+def remember_telegram_transfer(state: dict, origin: str, record: dict) -> None:
+    """Persist global identity only after the Drive receipt is persisted."""
+    if not canonical_telegram_origin_from_receipt(origin):
+        raise ValueError("Telegram origin identity must be channel ID + message ID.")
+    ledger = state_section(state, "telegram_to_drive_seen")
+    ledger.setdefault(origin, {
+        "drive_id": str(record["drive_id"]),
+        "size": int(record.get("size") or 0),
+        "recorded_at": int(time.time()),
+    })
+
+
+def _outgoing_ids_in_record(record: dict) -> set[int]:
+    ids = set()
+    if not isinstance(record, dict):
+        return ids
+    for group in [record, *(record.get("history") or [])]:
+        if not isinstance(group, dict):
+            continue
+        for part_id in (group.get("parts") or {}).values():
+            try:
+                if int(part_id) > 0:
+                    ids.add(int(part_id))
+            except (TypeError, ValueError):
+                pass
+        try:
+            if int(group.get("manifest_id") or 0) > 0:
+                ids.add(int(group["manifest_id"]))
+        except (TypeError, ValueError):
+            pass
+    # Reuploads may be interrupted before the final record is completed.
+    ids.update(_outgoing_ids_in_record(record.get("reupload") or {}))
+    return ids
+
+
+def known_drive_to_telegram_message_ids(state: dict, channel) -> set[int]:
+    """Recognize own uploads even when their Telegram captions were edited."""
+    channel_id = getattr(channel, "id", getattr(channel, "channel_id", None))
+    if channel_id is None:
+        return set()
+    channel_id = str(channel_id)
+    found = set()
+    remembered = state.get("drive_to_telegram_message_ids")
+    if isinstance(remembered, dict):
+        channel_map = remembered.get(channel_id)
+        if isinstance(channel_map, dict):
+            found.update(int(msg_id) for msg_id in channel_map
+                         if str(msg_id).isdigit() and int(msg_id) > 0)
+    # Backfill old transfer state that predates the explicit outbound index.
+    if str(state.get("drive_to_telegram_channel_id")) == channel_id:
+        for record in state.get("drive_to_telegram", {}).values():
+            found.update(_outgoing_ids_in_record(record))
+    return found
+
+
+def remember_outbound_telegram_id(state: dict, channel, message_id: int) -> None:
+    """Durable provenance for every newly uploaded part/manifest, per channel."""
+    channel_id = getattr(channel, "id", getattr(channel, "channel_id", None))
+    if channel_id is None:
+        return  # Lightweight fake clients/legacy interfaces without a channel.
+    group = state_section(state, "drive_to_telegram_message_ids")
+    per_channel = group.setdefault(str(channel_id), {})
+    if not isinstance(per_channel, dict):
+        per_channel = group[str(channel_id)] = {}
+    per_channel[str(int(message_id))] = True
+
+
 def existing_drive_copy(service, folder_id: str, key: str, expected_size: int) -> dict | None:
     # appProperties lets us recover after a successful upload whose response was lost.
     q = (
