@@ -1020,7 +1020,7 @@ class CustomTransferOptionsTests(unittest.TestCase):
                 # while the local state key is specific to this destination.
                 self.assertEqual(uploads[0][2], old_key)
                 scoped = transfer.telegram_drive_state_key(
-                    -10012, 42, "base-folder", "محاضرات نوفمبر")
+                    -10012, 42, "subfolder_1", "محاضرات نوفمبر")
                 self.assertNotEqual(scoped, old_key)
                 self.assertIn(scoped, state["telegram_to_drive"])
                 self.assertEqual(run("محاضرات نوفمبر")["ok"], 0)
@@ -1029,8 +1029,14 @@ class CustomTransferOptionsTests(unittest.TestCase):
                 self.assertEqual(run("مراجعة")["ok"], 1)
                 self.assertEqual(len(files.created), 2)
                 self.assertEqual(uploads[-1][0], "subfolder_2")
+                # If the named folder was deleted, it is recreated and the
+                # same Telegram message is copied into this new folder.
+                del files.children[("base-folder", "محاضرات نوفمبر")]
+                self.assertEqual(run("محاضرات نوفمبر")["ok"], 1)
+                self.assertEqual(files.created[-1][0], "subfolder_3")
+                self.assertEqual(uploads[-1][0], "subfolder_3")
                 self.assertEqual(run("")["ok"], 0)  # Legacy default remains done.
-                self.assertEqual(len(files.created), 2)
+                self.assertEqual(len(files.created), 3)
 
     def test_drive_preview_folder_lookup_never_calls_create(self):
         service = MagicMock()
