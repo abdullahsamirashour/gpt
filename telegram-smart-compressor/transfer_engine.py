@@ -141,6 +141,18 @@ def bind_transfer_channel(state: dict, channel_id: int, previous_channel_id=None
     channel_id = int(channel_id)
     old_id = state.get("drive_to_telegram_channel_id") or previous_channel_id
     if old_id is not None and int(old_id) != channel_id:
+        # Preserve legacy receipts before resetting the old upload channel:
+        # even an edited or removed MLTX caption must not bounce back to Drive.
+        old_receipts = state.get("drive_to_telegram") or {}
+        if isinstance(old_receipts, dict):
+            old_ids = set()
+            for record in old_receipts.values():
+                old_ids.update(_outgoing_ids_in_record(record))
+            if old_ids:
+                registry = state_section(state, "drive_to_telegram_message_ids")
+                saved_ids = registry.setdefault(str(int(old_id)), {})
+                for msg_id in old_ids:
+                    saved_ids[str(msg_id)] = True
         state["drive_to_telegram"] = {}
         state.pop("reupload_batches", None)
         print("📣 قناة النقل اتغيرت؛ هراجع الملفات كأنها أول مرة للقناة الجديدة.")
