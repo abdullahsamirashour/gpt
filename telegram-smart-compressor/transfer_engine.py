@@ -562,7 +562,7 @@ def connect_drive():
 def get_drive_metadata(service, file_id: str) -> dict:
     return service.files().get(
         fileId=file_id, supportsAllDrives=True,
-        fields="id,name,mimeType,size,md5Checksum,modifiedTime,webViewLink,parents",
+        fields="id,name,mimeType,size,md5Checksum,modifiedTime,webViewLink,parents,trashed",
     ).execute(num_retries=3)
 
 
@@ -1530,9 +1530,84 @@ async def fetch_telegram_message(client, channel, msg, local: Path, size: int, d
     print(f"⏱️ Telegram {mode}: {elapsed:.1f} ثانية — {size / elapsed / (1024 * 1024):.2f} MiB/s")
 
 
+def file_md5_checksum(path: Path) -> str:
+    """Hash downloaded binary data; do not trust remote file size alone for deletion."""
+    digest = hashlib.md5()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(DRIVE_CHUNK), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def telegram_media_identity(msg) -> str:
+    """Detect media edits when retrying a pending deletion."""
+    media = getattr(msg, "document", None) or getattr(msg, "photo", None)
+    if media is None:
+        wrapper = getattr(msg, "media", None)
+        media = getattr(wrapper, "document", None) or getattr(wrapper, "photo", None)
+    return str(getattr(media, "id", "") or "")
+
+
+def confirmed_drive_copy_for_deletion(service, folder_id: str, record: dict) -> bool:
+    """Recheck an uploaded Drive file before *irreversibly* deleting Telegram."""
+    wanted_id = str(record.get("drive_id") or "")
+    wanted_md5 = str(record.get("verified_md5") or "").lower()
+    try:
+        wanted_size = int(record.get("size") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not wanted_id or not re.fullmatch(r"[a-f0-9]{32}", wanted_md5) or wanted_size <= 0:
+        return False
+
+    remote = get_drive_metadata(service, wanted_id)
+    return (
+        str(remote.get("id") or "") == wanted_id
+        and int(remote.get("size") or -1) == wanted_size
+        and str(remote.get("md5Checksum") or "").lower() == wanted_md5
+        and folder_id in (remote.get("parents") or [])
+        and remote.get("trashed") is not True
+    )
+
+
+async def delete_telegram_after_confirmed_drive_upload(
+    client, channel, msg, service, folder_id: str, record: dict,
+) -> None:
+    """Delete only the original message after fresh Drive metadata verification.
+
+    The caller must persist delete_pending before calling this function;
+    any failed check leaves the Telegram source intact and safely retryable.
+    """
+    if not record.get("delete_pending") or record.get("telegram_deleted"):
+        raise ValueError("الحذف يتطلب طلبًا محفوظًا بعد رفع موثق على Google Drive.")
+    size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
+    if size <= 0 or size != int(record.get("size") or 0):
+        raise ValueError("حجم رسالة Telegram اتغير؛ لن يتم حذفها.")
+    initial_media = str(record.get("telegram_media_id") or "")
+    if initial_media and telegram_media_identity(msg) != initial_media:
+        raise ValueError("هوية ملف Telegram اتغيرت؛ لن يتم حذف الرسالة.")
+    verified = await asyncio.to_thread(
+        confirmed_drive_copy_for_deletion, service, folder_id, record
+    )
+    if not verified:
+        raise RuntimeError("ملف Google Drive مش مثبت بالحجم وMD5 والفولدر الصحيح؛ لن نحذف رسالة Telegram.")
+    # Fetch the current channel message again: it may have been edited since
+    # the scan or while the file was being uploaded to Drive.
+    current = await client.get_messages(channel, ids=int(msg.id))
+    if (not current or int(getattr(current, "id", 0) or 0) != int(msg.id)
+            or int(getattr(getattr(current, "file", None), "size", 0) or 0) != size):
+        raise RuntimeError("رسالة Telegram اتغيرت أو اختفت بعد النقل؛ لن نحذفها.")
+    if initial_media and telegram_media_identity(current) != initial_media:
+        raise RuntimeError("محتوى رسالة Telegram اتغيّر بعد النقل؛ لن نحذفها.")
+    # Telethon's channel-aware call: never pass a bare message ID without
+    # an explicit channel, and never bulk-delete arbitrary message IDs.
+    receipt = await client.delete_messages(channel, [int(msg.id)], revoke=True)
+    if not receipt:
+        raise RuntimeError("Telegram لم يؤكد تنفيذ طلب حذف الرسالة.")
+
+
 async def transfer_telegram_to_drive(
     client, channel, service, state: dict, folder_id: str, max_files: int, preview: bool,
-    subfolder_name: str = "",
+    subfolder_name: str = "", delete_after_transfer: bool = False,
 ) -> dict:
     from telethon import utils
 
@@ -1558,27 +1633,41 @@ async def transfer_telegram_to_drive(
             )
             print(f"✅ فولدر الحفظ جاهز: {target_name}")
     downloaded = []
+    pending_for_deletion = []
+    if delete_after_transfer:
+        print("⚠️ حذف رسائل Telegram مفعّل: الحذف نهائي للقناة، وبعد إثبات نسخة Drive فقط.")
     async for msg in client.iter_messages(channel, limit=SCAN_LIMIT):
         if not getattr(msg, "file", None):
             continue
         if "MLTX:" in (msg.message or ""):
             continue  # Drive → Telegram uploads must never bounce back to Drive.
         key = telegram_drive_state_key(peer_id, int(msg.id), target_id, subfolder_name)
-        if records.get(key):
+        existing_record = records.get(key)
+        if existing_record:
+            # Never retroactively delete messages copied in older runs.
+            # Only explicitly queued, checksum-verified cleanup is resumable.
+            if (delete_after_transfer and existing_record.get("delete_pending")
+                    and not existing_record.get("telegram_deleted")):
+                pending_for_deletion.append((msg, key))
             continue
         downloaded.append(msg)
     jobs = list(reversed(downloaded))
+    pending_for_deletion.reverse()
     if max_files:
         jobs = jobs[:max_files]
+        pending_for_deletion = pending_for_deletion[:max_files]
     print(f"📦 Telegram → Drive | {len(jobs)} ملف جديد من آخر {SCAN_LIMIT} رسالة")
+    if delete_after_transfer:
+        print(f"🧹 عمليات حذف معلّقة من تشغيل سابق: {len(pending_for_deletion)}")
     for msg in jobs[:10]:
         print(" •", clean_filename(getattr(msg.file, "name", "") or f"telegram_{msg.id}"))
     if preview:
-        print("👁️ معاينة فقط — لم يتم نقل ملفات أو إنشاء فولدر.")
+        print("👁️ معاينة فقط — لن ننقل أو نحذف رسائل أو ننشئ فولدر.")
         return {"ok": 0, "skipped": 0, "failed": 0}
 
-    counters = {"ok": 0, "skipped": 0, "failed": 0}
-    if not jobs:
+    counters = {"ok": 0, "skipped": 0, "failed": 0,
+                "deleted": 0, "delete_failed": 0}
+    if not jobs and not pending_for_deletion:
         print("✅ مفيش ملفات جديدة للوجهة المختارة.")
         return counters
     dst_folder = target_id
@@ -1587,8 +1676,26 @@ async def transfer_telegram_to_drive(
             ensure_child_folder, service, folder_id, target_name, folder_cache
         )
         print(f"✅ فولدر الحفظ جاهز: {target_name}")
+    # Retry *only* deletions explicitly queued after a previously verified
+    # upload. Reverify Drive metadata before every attempt.
+    for msg, key in pending_for_deletion:
+        try:
+            await delete_telegram_after_confirmed_drive_upload(
+                client, channel, msg, service, dst_folder, records[key]
+            )
+            records[key]["telegram_deleted"] = True
+            records[key]["delete_pending"] = False
+            save_json(STATE_PATH, state)
+            counters["deleted"] += 1
+            print(f"🗑️ حُذفت رسالة Telegram رقم {msg.id} بعد التحقق من Drive.")
+        except Exception as exc:
+            counters["delete_failed"] += 1
+            print(f"⚠️ تعذر حذف الرسالة {msg.id}؛ النسخة على Drive محفوظة. "
+                  f"هنعيد المحاولة لو فعلت الخيار تاني. {type(exc).__name__}: {exc}")
+
     downloader = TelegramParallelDownloader(client) if TelegramParallelDownloader.supported(client) else None
-    print(f"⚡ Telegram parallel download: من 5 MiB، {TG_PARALLEL_CONNECTIONS} اتصالات؛ fallback تلقائي.")
+    if jobs:
+        print(f"⚡ Telegram parallel download: من 5 MiB، {TG_PARALLEL_CONNECTIONS} اتصالات؛ fallback تلقائي.")
     for index, msg in enumerate(jobs, 1):
         key = telegram_drive_state_key(peer_id, int(msg.id), target_id, subfolder_name)
         remote_key = origin_key(peer_id, int(msg.id))  # Stable Drive appProperties across destinations.
@@ -1610,11 +1717,43 @@ async def transfer_telegram_to_drive(
             with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as td:
                 local = Path(td) / name
                 await fetch_telegram_message(client, channel, msg, local, size, downloader)
-                uploaded = await asyncio.to_thread(upload_drive_file, service, local, dst_folder, name, remote_key)
-                records[key] = {"drive_id": uploaded["id"], "size": size, "name": name}
+                uploaded = await asyncio.to_thread(
+                    upload_drive_file, service, local, dst_folder, name, remote_key
+                )
+                record = {"drive_id": uploaded["id"], "size": size, "name": name}
+                if delete_after_transfer:
+                    # The Drive upload routine already validates the returned
+                    # size and, if present, MD5. Require the MD5 *again* as
+                    # an explicit deletion prerequisite; no checksum, no delete.
+                    remote_md5 = str(uploaded.get("md5Checksum") or "").lower()
+                    local_md5 = await asyncio.to_thread(file_md5_checksum, local)
+                    if remote_md5 and remote_md5 == local_md5:
+                        record["verified_md5"] = local_md5
+                        record["telegram_media_id"] = telegram_media_identity(msg)
+                        record["delete_pending"] = True
+                        record["telegram_deleted"] = False
+                    else:
+                        print("🛡️ رسالة Telegram محفوظة: Drive لم يوفّر MD5 "
+                              "مطابقًا، لذلك لن نحذف الأصل.")
+                # Persist the verified destination before ANY destructive step.
+                records[key] = record
                 save_json(STATE_PATH, state)
                 counters["ok"] += 1
                 print(f"✅ [{index}/{len(jobs)}] {name}")
+                if record.get("delete_pending"):
+                    try:
+                        await delete_telegram_after_confirmed_drive_upload(
+                            client, channel, msg, service, dst_folder, record
+                        )
+                        record["telegram_deleted"] = True
+                        record["delete_pending"] = False
+                        save_json(STATE_PATH, state)
+                        counters["deleted"] += 1
+                        print(f"🗑️ تم حذف رسالة Telegram رقم {msg.id} بعد التحقق.")
+                    except Exception as exc:
+                        counters["delete_failed"] += 1
+                        print(f"⚠️ النسخة اتحفظت على Drive، لكن حذف رسالة {msg.id} فشل. "
+                              f"الحذف معلّق للمحاولة القادمة. {type(exc).__name__}: {exc}")
         except Exception as exc:
             counters["failed"] += 1
             print(f"❌ [{index}/{len(jobs)}] {name}: {type(exc).__name__}: {exc}")
@@ -1692,6 +1831,7 @@ async def _run_transfer(
     max_files: int, recursive: bool, preview: bool, login_method: str = "code",
     reupload_selected: bool = False, selected_numbers: str = "",
     drive_subfolder: str = "", telegram_hashtag: str = "",
+    delete_after_transfer: bool = False,
 ) -> dict:
     drive_subfolder = normalize_transfer_subfolder(drive_subfolder)
     telegram_hashtag = normalize_transfer_hashtag(telegram_hashtag)
@@ -1738,12 +1878,25 @@ async def _run_transfer(
                 source_entity = await client.get_entity(ref)
             else:
                 source_entity = await ensure_channel(client, transfer_config)
+            if delete_after_transfer and not preview:
+                # Deleting from unrelated DMs/groups is not part of this option.
+                # Require channel ownership or explicit Delete Messages rights.
+                from telethon.tl.types import Channel
+                rights = getattr(source_entity, "admin_rights", None)
+                if not isinstance(source_entity, Channel):
+                    raise ValueError("الحذف التلقائي متاح لقنوات Telegram فقط، مش المحادثات الخاصة.")
+                if not (getattr(source_entity, "creator", False)
+                        or getattr(rights, "delete_messages", False)):
+                    raise PermissionError(
+                        "حذف الرسائل يحتاج أن تكون مالك القناة أو أدمن لديه صلاحية Delete Messages."
+                    )
             # Preview may query existing folders but must never create a new one.
             finder = find_existing_drive_destination if preview else ensure_drive_destination
             dest_id = await asyncio.to_thread(finder, service, destination)
             return await transfer_telegram_to_drive(
                 client, source_entity, service, state, dest_id, max_files, preview,
                 subfolder_name=drive_subfolder,
+                delete_after_transfer=delete_after_transfer,
             )
         raise ValueError("اتجاه النقل غير معروف.")
     finally:
@@ -1759,9 +1912,13 @@ def run_transfer(
     max_files: int = 20, recursive: bool = True, preview: bool = True,
     login_method: str = "code", reupload_selected: bool = False,
     selected_numbers: str = "", drive_subfolder: str = "",
-    telegram_hashtag: str = "",
+    telegram_hashtag: str = "", delete_after_transfer: bool = False,
 ) -> None:
     """Entry point called by the small GitHub-backed Colab launcher cell."""
+    if not isinstance(delete_after_transfer, bool):
+        raise ValueError("خيار حذف Telegram لازم يكون True أو False.")
+    if direction != "telegram_to_drive" and delete_after_transfer:
+        raise ValueError("خيار حذف Telegram متاح فقط عند نقل Telegram → Drive.")
     drive_subfolder = normalize_transfer_subfolder(drive_subfolder)
     telegram_hashtag = normalize_transfer_hashtag(telegram_hashtag)
     if direction == "drive_to_telegram" and drive_subfolder:
@@ -1790,16 +1947,23 @@ def run_transfer(
         sys.stdout = _Tee(old_out, log)
         sys.stderr = _Tee(old_err, log)
         try:
-            print("📦 Media Lite — File Transfer | ملفاتك الأصلية لن تُحذف.")
+            if delete_after_transfer and not preview:
+                print("⚠️ وضع نقل ثم حذف مفعّل — الحذف من Telegram نهائي للقناة "
+                      "وللملفات التي تم رفعها والتحقق منها فقط.")
+            else:
+                print("📦 Media Lite — File Transfer | الملفات الأصلية محفوظة.")
             with single_run():
                 result = asyncio.get_event_loop().run_until_complete(
                     _run_transfer(
                         service, direction, source, destination, max_files, recursive,
                         preview, login_method, reupload_selected, selected_numbers,
-                        drive_subfolder, telegram_hashtag,
+                        drive_subfolder, telegram_hashtag, delete_after_transfer,
                     )
                 )
-            print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']} • {time.time()-started:.0f} ثانية")
+            print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']}"
+                  f" • حذف من Telegram {result.get('deleted', 0)}"
+                  f" • حذف فشل {result.get('delete_failed', 0)}"
+                  f" • {time.time()-started:.0f} ثانية")
             if not preview:
                 save_json(APP_DIR / "last_run_summary.json", {
                     "direction": direction, "finished": int(time.time()),
@@ -1807,6 +1971,7 @@ def run_transfer(
                     "selected_numbers": selected_numbers if reupload_selected else "",
                     "drive_subfolder": drive_subfolder if direction == "telegram_to_drive" else "",
                     "telegram_hashtag": telegram_hashtag if direction == "drive_to_telegram" else "",
+                    "delete_after_transfer": delete_after_transfer,
                     **result,
                 })
         except KeyboardInterrupt:
