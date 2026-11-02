@@ -267,6 +267,70 @@ class NativeStudioFormTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
                          "Real FFmpeg is required")
+    def test_real_audio_file_remains_audio_with_selected_opus_bitrate(self):
+        with tempfile.TemporaryDirectory() as td:
+            temp = Path(td)
+            src = temp / "lecture.wav"
+            subprocess.run([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
+                "-t", "1.3", "-ac", "1", "-c:a", "pcm_s16le", str(src),
+            ], check=True, timeout=30)
+            chosen = {
+                **FORM, "content_kind": "🎧 صوت فقط — حتى الفيديو يتحول لصوت",
+                "advanced_audio": True, "audio_codec": "Opus / OGG",
+                "audio_kbps": "32", "audio_sample_rate": "24000",
+            }
+            with patch.object(engine, "run"):
+                forms.perform_form_action(engine, "run", "form", chosen)
+            original_info = engine.ffprobe(src)
+            self.assertTrue(original_info.has_audio)
+            self.assertFalse(original_info.has_video)
+            msg = SimpleNamespace(
+                id=784, audio=True, video=False, voice=False,
+                file=SimpleNamespace(mime_type="audio/wav", name="lecture.wav"),
+            )
+            uploads = []
+
+            class FakeTelegram:
+                async def send_file(self, channel, output, **kwargs):
+                    path = Path(output)
+                    result = engine.ffprobe(path)
+                    uploads.append({
+                        "suffix": path.suffix,
+                        "audio": result.has_audio, "video": result.has_video,
+                        "mime": kwargs["mime_type"],
+                    })
+                    return SimpleNamespace(id=995)
+
+                async def send_message(self, *_args, **_kwargs):
+                    raise AssertionError("Audio-to-audio must succeed")
+
+            state = engine.default_state()
+            prepared = {
+                "job": {"source": msg, "command": None, "profile": None,
+                        "target_mb": None, "rerun": False},
+                "msg": msg, "name": "lecture.wav", "src": src,
+                "info": original_info, "started_at": 0.0,
+                "download_seconds": 0.0, "probe_seconds": 0.0,
+                "error": None,
+            }
+            with patch.object(engine, "TMP_DIR", temp), \
+                 patch.object(engine, "STATE_PATH", temp / "state.json"), \
+                 patch.object(engine, "ERROR_LOG", temp / "error.log"):
+                result = asyncio.run(engine.process_job(
+                    FakeTelegram(), object(), state, prepared, False, 1, 1
+                ))
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(uploads, [{
+                "suffix": ".ogg", "audio": True,
+                "video": False, "mime": "audio/ogg",
+            }])
+            self.assertEqual(state["lineage"]["995"]["profile"], "AUDIO_CUSTOM")
+            self.assertEqual(state["lineage"]["995"]["media_settings"]["audio_kbps"], 32)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
+                         "Real FFmpeg is required")
     def test_silent_video_is_not_uploaded_or_marked_processed_as_audio(self):
         with tempfile.TemporaryDirectory() as td:
             temp = Path(td)
