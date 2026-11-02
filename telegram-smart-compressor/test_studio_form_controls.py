@@ -89,7 +89,7 @@ class NativeStudioFormTests(unittest.TestCase):
         compile(CODE, "native-colab-form-cell", "exec")
         self.assertTrue(
             "▶ تشغيل الضغط" in form_defaults["العملية"] and
-            "آخر تشغيل" in form_defaults["مصدر_الإعدادات"]
+            "تطبيق حقول الفورم الظاهرة" in form_defaults["مصدر_الإعدادات"]
         )
         drive = "".join(NOTEBOOK["cells"][3]["source"])
         telegram = "".join(NOTEBOOK["cells"][5]["source"])
@@ -110,6 +110,80 @@ class NativeStudioFormTests(unittest.TestCase):
             )
             self.assertEqual(engine.resolve_profile(video_message), "AUDIO_CUSTOM")
         self.assertEqual(forms.collect_form_settings(engine, FORM)["source"], "auto")
+
+    def test_native_form_default_applies_visible_audio_only_not_old_drive_last_used(self):
+        # This reproduces the iPad screenshot: visible Audio Only but the old
+        # selector silently selected a saved source=auto and encoded H264.
+        engine.save_studio_preferences(
+            {**engine.STUDIO_FACTORY_SETTINGS, "source": "auto",
+             "video_crf": 28},
+            save_default=True,
+        )
+        self.assertEqual(
+            form_defaults["مصدر_الإعدادات"],
+            "📝 تطبيق حقول الفورم الظاهرة",
+        )
+        chosen_form = {
+            **FORM, "content_kind": "🎧 صوت فقط — حتى الفيديو يتحول لصوت",
+            "advanced_audio": True, "audio_codec": "MP3", "audio_kbps": "64",
+        }
+        with patch.object(engine, "run") as run, \
+             patch("builtins.print") as printed:
+            result = forms.perform_form_action(engine, "run", "form", chosen_form)
+        run.assert_called_once()
+        self.assertEqual(result["settings"]["source"], "audio")
+        self.assertEqual(result["settings"]["audio_codec"], "mp3")
+        self.assertEqual(result["settings"]["audio_kbps"], 64)
+        self.assertEqual(engine.ACTIVE_STUDIO_SETTINGS["source"], "audio")
+        self.assertEqual(engine.load_studio_preferences()["last_used"]["source"], "audio")
+        video_message = SimpleNamespace(
+            video=True, audio=None, voice=None,
+            file=SimpleNamespace(mime_type="video/mp4"),
+        )
+        audio_message = SimpleNamespace(
+            video=None, audio=True, voice=None,
+            file=SimpleNamespace(mime_type="audio/m4a"),
+        )
+        self.assertEqual(engine.resolve_profile(video_message), "AUDIO_CUSTOM")
+        self.assertEqual(engine.resolve_profile(audio_message), "AUDIO_CUSTOM")
+        rendered = "\n".join(
+            str(a) for invocation in printed.call_args_list
+            for a in invocation.args
+        )
+        self.assertIn("الفيديوهات هتخرج ملفات صوت فقط", rendered)
+        self.assertNotIn("H264 |", rendered)
+        self.assertNotIn("CRF 28", rendered)
+
+    def test_old_notebook_tab_cannot_silently_run_h264_with_visible_audio_only(self):
+        # Older notebook tabs use 'last' by default. Protect them too: fail
+        # *before* engine.run, rather than waste hours on H264 processing.
+        engine.save_studio_preferences(
+            {**engine.STUDIO_FACTORY_SETTINGS, "source": "auto"})
+        with patch.object(engine, "run") as run:
+            with self.assertRaisesRegex(ValueError, "لن نبدأ ضغط فيديو بدل صوت"):
+                forms.perform_form_action(engine, "run", "last", {
+                    **FORM, "content_kind": "🎧 صوت فقط — حتى الفيديو يتحول لصوت",
+                })
+        run.assert_not_called()
+        self.assertEqual(engine.ACTIVE_STUDIO_SETTINGS, None)
+        # Preview remains allowed to inspect stored settings without encoding.
+        with patch.object(engine, "run") as run:
+            result = forms.perform_form_action(engine, "preview", "last", {
+                **FORM, "content_kind": "🎧 صوت فقط — حتى الفيديو يتحول لصوت",
+            })
+        self.assertEqual(result["settings"]["source"], "auto")
+        run.assert_not_called()
+
+    def test_explicit_saved_mode_still_restores_audio_profile(self):
+        saved = {**engine.STUDIO_FACTORY_SETTINGS, "source": "audio",
+                 "audio_codec": "aac", "audio_kbps": 48}
+        engine.save_studio_preferences(saved, save_default=True)
+        with patch.object(engine, "run") as run:
+            result = forms.perform_form_action(engine, "run", "last", FORM)
+        run.assert_called_once()
+        self.assertEqual(result["settings"]["source"], "audio")
+        self.assertEqual(result["settings"]["audio_codec"], "aac")
+        self.assertEqual(result["settings"]["audio_kbps"], 48)
 
     def test_form_hourly_size_table_uses_kilobits_not_kilobytes(self):
         self.assertIn("📊 حجم ساعة واحدة من الصوت", CODE)
