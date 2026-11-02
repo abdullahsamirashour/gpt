@@ -1731,44 +1731,118 @@ async def transfer_telegram_to_drive(
         target_id = await asyncio.to_thread(
             find_child_folder, service, folder_id, target_name
         )
+    known_origins = transferred_telegram_origins(state)
+    sent_from_drive = known_drive_to_telegram_message_ids(state, channel)
     downloaded = []
     pending_for_deletion = []
+    count_source_drive = 0
+    count_already_here = 0
+    count_already_elsewhere = 0
+    count_recopy = 0
+    count_changed_media = 0
+    scanned_messages = 0
+
     if delete_after_transfer:
         print("⚠️ حذف رسائل Telegram مفعّل: الحذف نهائي للقناة، وبعد إثبات نسخة Drive فقط.")
+    if recopy_previously_transferred:
+        print("⚠️ إعادة نسخ المنقول سابقًا مفعّلة يدويًا؛ الحذف مش مسموح في الوضع ده.")
+
     async for msg in client.iter_messages(channel, limit=SCAN_LIMIT):
+        scanned_messages += 1
         if not getattr(msg, "file", None):
             continue
-        if "MLTX:" in (msg.message or ""):
-            continue  # Drive → Telegram uploads must never bounce back to Drive.
-        key = telegram_drive_state_key(peer_id, int(msg.id), target_id, subfolder_name)
-        existing_record = records.get(key)
-        if existing_record:
-            # Never retroactively delete messages copied in older runs.
-            # Only explicitly queued, checksum-verified cleanup is resumable.
-            if (delete_after_transfer and existing_record.get("delete_pending")
-                    and not existing_record.get("telegram_deleted")):
-                pending_for_deletion.append((msg, key))
+
+        # Outbound provenance has two independent signals:
+        # 1. MLTX receipts embedded in captions (works after a state reset).
+        # 2. Channel-scoped message IDs saved during Drive -> Telegram uploads
+        #    (works if captions were edited/removed).
+        if "MLTX:" in (msg.message or "") or int(msg.id) in sent_from_drive:
+            count_source_drive += 1
             continue
+
+        origin = origin_key(peer_id, int(msg.id))
+        receipt_key = telegram_drive_state_key(
+            peer_id, int(msg.id), target_id, subfolder_name
+        )
+        local_receipt = records.get(receipt_key)
+        if isinstance(local_receipt, dict) and local_receipt.get("drive_id"):
+            count_already_here += 1
+            # No retroactive deletion of previously copied messages.
+            # Retry only explicitly persisted verified delete-pending receipts.
+            if (delete_after_transfer and local_receipt.get("delete_pending")
+                    and not local_receipt.get("telegram_deleted")):
+                pending_for_deletion.append((msg, receipt_key))
+            continue
+
+        previous = known_origins.get(origin)
+        if previous:
+            prior_size = int(previous.get("size") or 0)
+            current_size = int(getattr(msg.file, "size", 0) or 0)
+            if prior_size > 0 and current_size != prior_size:
+                # An edited media file is not safely identified by a message
+                # ID alone; do not silently copy/delete it.
+                count_changed_media += 1
+                continue
+            if not recopy_previously_transferred:
+                count_already_elsewhere += 1
+                continue
+            count_recopy += 1
         downloaded.append(msg)
+
     jobs = list(reversed(downloaded))
     pending_for_deletion.reverse()
     if max_files:
         jobs = jobs[:max_files]
         pending_for_deletion = pending_for_deletion[:max_files]
-    print(f"📦 Telegram → Drive | {len(jobs)} ملف جديد من آخر {SCAN_LIMIT} رسالة")
+
+    print(
+        f"📦 Telegram → Drive | جديد للنقل: {len(jobs)}"
+        f" • منقول سابقًا لفولدر تاني: {count_already_elsewhere}"
+        f" • موجود في الوجهة: {count_already_here}"
+        f" • أصله Drive فمستبعد: {count_source_drive}"
+    )
+    if count_recopy:
+        print(f"📤 ملفات قديمة اخترت إعادة نسخها يدويًا: {count_recopy}")
+    if count_changed_media:
+        print(f"⚠️ رسائل اتغير حجم ميدياها بعد النقل: {count_changed_media} — اتخطيناها للمراجعة.")
+    if scanned_messages >= SCAN_LIMIT:
+        print(f"ℹ️ الفحص شمل آخر {SCAN_LIMIT} رسالة فقط من القناة، مش الأرشيف كله.")
     if delete_after_transfer:
-        print(f"🧹 عمليات حذف معلّقة من تشغيل سابق: {len(pending_for_deletion)}")
+        print(f"🧹 عمليات حذف معلّقة بعد رفع سابق: {len(pending_for_deletion)}")
+
     for msg in jobs[:10]:
         print(" •", clean_filename(getattr(msg.file, "name", "") or f"telegram_{msg.id}"))
     if preview:
-        print("👁️ معاينة فقط — لن ننقل أو نحذف رسائل أو ننشئ فولدر.")
-        return {"ok": 0, "skipped": 0, "failed": 0}
+        print("👁️ معاينة فقط — من غير نقل أو حذف أو إنشاء فولدر أو تعديل سجل Drive.")
+        return {
+            "ok": 0, "skipped": 0, "failed": 0,
+            "already_transferred": count_already_here + count_already_elsewhere,
+            "from_drive": count_source_drive,
+            "new": len(jobs),
+        }
 
-    counters = {"ok": 0, "skipped": 0, "failed": 0,
-                "deleted": 0, "delete_failed": 0}
+    # One-time non-destructive migration: old per-folder receipts become a
+    # central, persistent ledger, preventing future copies into new folders.
+    ledger = state_section(state, "telegram_to_drive_seen")
+    migrated = 0
+    for origin, receipt in known_origins.items():
+        if origin not in ledger:
+            ledger[origin] = receipt
+            migrated += 1
+    if migrated:
+        save_json(STATE_PATH, state)
+        print(f"✅ تم استرجاع سجل {migrated} رسالة من النقل القديم، بدون تحميلها مرة تانية.")
+
+    counters = {
+        "ok": 0, "skipped": 0, "failed": 0,
+        "deleted": 0, "delete_failed": 0,
+        "already_transferred": count_already_here + count_already_elsewhere,
+        "from_drive": count_source_drive,
+    }
     if not jobs and not pending_for_deletion:
-        print("✅ مفيش ملفات جديدة للوجهة المختارة.")
+        print("✅ مفيش رسائل جديدة محتاجة نقل. سجل النقل شغال عبر كل فولدرات Drive.")
         return counters
+
     dst_folder = target_id
     if not subfolder_name:
         dst_folder = await asyncio.to_thread(
