@@ -1054,8 +1054,11 @@ def parse_file_numbers(spec: str, total: int) -> list[int]:
 async def transfer_drive_to_telegram(
     client, channel, service, state: dict, source_id: str, recursive: bool,
     max_files: int, preview: bool, reupload_selected: bool = False,
-    selected_numbers: str = "",
+    selected_numbers: str = "", telegram_hashtag: str = "",
 ) -> dict:
+    telegram_hashtag = normalize_transfer_hashtag(telegram_hashtag)
+    if telegram_hashtag:
+        print(f"🏷️ هيتضاف الهاشتاج {telegram_hashtag} لوصف كل ملف/جزء جديد.")
     all_items = list_drive_sources(service, source_id, recursive)
     if not all_items:
         print("📭 مفيش ملفات في المجلد المحدد (أو هو فاضي).")
@@ -1084,9 +1087,19 @@ async def transfer_drive_to_telegram(
         batches = state.setdefault("reupload_batches", {})
         redo_batch = batches.get(batch_fingerprint)
         if not isinstance(redo_batch, dict) or redo_batch.get("done"):
-            redo_batch = {"completed": [], "done": False, "started_at": int(time.time())}
+            redo_batch = {
+                "completed": [], "done": False, "started_at": int(time.time()),
+                "hashtag": telegram_hashtag,
+            }
             batches[batch_fingerprint] = redo_batch
             save_json(STATE_PATH, state)
+        # A partially completed reupload batch must keep its original tag.
+        # Old batches without a tag were untagged; do not silently mix styles.
+        batch_hashtag = normalize_transfer_hashtag(redo_batch.get("hashtag", ""))
+        if telegram_hashtag != batch_hashtag:
+            print(f"ℹ️ إعادة الرفع دي بدأت بهاشتاج {batch_hashtag or '(بدون)'}؛ "
+                  "هنكمل بيه عشان الأجزاء المرسلة قبل كده تفضل متسقة.")
+        telegram_hashtag = batch_hashtag
         completed = set(redo_batch.get("completed", []))
         items = [m for m in selected_items if transfer_token(m) not in completed]
         skipped = len(selected_items) - len(items)
@@ -1148,10 +1161,23 @@ async def transfer_drive_to_telegram(
                     save_json(STATE_PATH, state)
                 receipt_token = repair["tag"]
                 existing = dict(repair.get("parts", {}))
+                # A partially sent reupload uses its original tag on resume.
+                effective_hashtag = (
+                    normalize_transfer_hashtag(repair.get("hashtag", ""))
+                    if existing else telegram_hashtag
+                )
+                repair["hashtag"] = effective_hashtag
             else:
                 repair = None
                 receipt_token = token
                 existing = dict(previous.get("parts", {}))
+                effective_hashtag = (
+                    normalize_transfer_hashtag(previous.get("hashtag", ""))
+                    if existing else telegram_hashtag
+                )
+                if existing and effective_hashtag != telegram_hashtag:
+                    print(f"ℹ️ {meta['name']}: استكمال الأجزاء بالهاشتاج "
+                          f"{effective_hashtag or '(بدون)'} القديم.")
 
             def record_part(part_no: int, message_id: int) -> None:
                 existing[str(part_no)] = int(message_id)
@@ -1159,7 +1185,10 @@ async def transfer_drive_to_telegram(
                     repair["parts"] = existing
                     records[token] = previous
                 else:
-                    records[token] = {"parts": existing, "done": False}
+                    records[token] = {
+                        "parts": existing, "done": False,
+                        "hashtag": effective_hashtag,
+                    }
                 save_json(STATE_PATH, state)
 
             try:
@@ -1194,7 +1223,10 @@ async def transfer_drive_to_telegram(
                             continue
 
                         part_name = name if parts == 1 else f"{name}.part{part_no:03d}"
-                        caption = f"📁 {meta['relative_path'][-700:]}\n{marker}"
+                        caption = add_transfer_hashtag(
+                            f"📁 {meta['relative_path'][-700:]}\n{marker}",
+                            effective_hashtag,
+                        )
                         progress = Progress(f"⬆️ Telegram [{index}/{len(items)}] {part_name}")
                         if parts == 1:
                             uploaded = await send_transfer_document(
@@ -1237,7 +1269,10 @@ async def transfer_drive_to_telegram(
                         if not manifest_id:
                             receipt = await client.send_file(
                                 channel, str(manifest_path), force_document=True,
-                                caption=f"📋 خريطة تجميع الأجزاء\n{manifest_tag}",
+                                caption=add_transfer_hashtag(
+                                    f"📋 خريطة تجميع الأجزاء\n{manifest_tag}",
+                                    effective_hashtag,
+                                ),
                             )
                             manifest_id = int(receipt.id)
                         if repairing:
@@ -1261,6 +1296,7 @@ async def transfer_drive_to_telegram(
                     final_record.update({
                         "parts": existing, "done": True, "file_id": meta["id"],
                         "size": size, "sha256": digest, "name": name,
+                        "hashtag": effective_hashtag,
                     })
                     if manifest_id:
                         final_record["manifest_id"] = manifest_id
