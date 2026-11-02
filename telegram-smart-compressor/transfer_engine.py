@@ -1543,13 +1543,27 @@ async def transfer_telegram_to_drive(
     target_name = subfolder_name or source_name
     print(f"📁 الحفظ: داخل فولدر Drive المختار / {target_name}"
           + (" (فولدر مخصص؛ يُنشأ لو مش موجود)" if subfolder_name else ""))
+    folder_cache = {}
+    target_id = ""
+    if subfolder_name:
+        # Resolve the actual destination before filtering saved receipts.
+        # When an old custom folder is deleted/recreated its ID changes, so
+        # previously transferred files must be copied to the new folder.
+        finder = find_child_folder if preview else ensure_child_folder
+        if preview:
+            target_id = await asyncio.to_thread(finder, service, folder_id, target_name)
+        else:
+            target_id = await asyncio.to_thread(
+                finder, service, folder_id, target_name, folder_cache
+            )
+            print(f"✅ فولدر الحفظ جاهز: {target_name}")
     downloaded = []
     async for msg in client.iter_messages(channel, limit=SCAN_LIMIT):
         if not getattr(msg, "file", None):
             continue
         if "MLTX:" in (msg.message or ""):
             continue  # Drive → Telegram uploads must never bounce back to Drive.
-        key = telegram_drive_state_key(peer_id, int(msg.id), folder_id, subfolder_name)
+        key = telegram_drive_state_key(peer_id, int(msg.id), target_id, subfolder_name)
         if records.get(key):
             continue
         downloaded.append(msg)
@@ -1567,13 +1581,16 @@ async def transfer_telegram_to_drive(
     if not jobs:
         print("✅ مفيش ملفات جديدة للوجهة المختارة.")
         return counters
-    folder_cache = {}
-    dst_folder = ensure_child_folder(service, folder_id, target_name, folder_cache)
-    print(f"✅ فولدر الحفظ جاهز: {target_name}")
+    dst_folder = target_id
+    if not subfolder_name:
+        dst_folder = await asyncio.to_thread(
+            ensure_child_folder, service, folder_id, target_name, folder_cache
+        )
+        print(f"✅ فولدر الحفظ جاهز: {target_name}")
     downloader = TelegramParallelDownloader(client) if TelegramParallelDownloader.supported(client) else None
     print(f"⚡ Telegram parallel download: من 5 MiB، {TG_PARALLEL_CONNECTIONS} اتصالات؛ fallback تلقائي.")
     for index, msg in enumerate(jobs, 1):
-        key = telegram_drive_state_key(peer_id, int(msg.id), folder_id, subfolder_name)
+        key = telegram_drive_state_key(peer_id, int(msg.id), target_id, subfolder_name)
         remote_key = origin_key(peer_id, int(msg.id))  # Stable Drive appProperties across destinations.
         size = int(getattr(msg.file, "size", 0) or 0)
         name = clean_filename(
