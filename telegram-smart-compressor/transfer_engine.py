@@ -1589,6 +1589,14 @@ async def delete_telegram_after_confirmed_drive_upload(
     )
     if not verified:
         raise RuntimeError("ملف Google Drive مش مثبت بالحجم وMD5 والفولدر الصحيح؛ لن نحذف رسالة Telegram.")
+    # Fetch the current channel message again: it may have been edited since
+    # the scan or while the file was being uploaded to Drive.
+    current = await client.get_messages(channel, ids=int(msg.id))
+    if (not current or int(getattr(current, "id", 0) or 0) != int(msg.id)
+            or int(getattr(getattr(current, "file", None), "size", 0) or 0) != size):
+        raise RuntimeError("رسالة Telegram اتغيرت أو اختفت بعد النقل؛ لن نحذفها.")
+    if initial_media and telegram_media_identity(current) != initial_media:
+        raise RuntimeError("محتوى رسالة Telegram اتغيّر بعد النقل؛ لن نحذفها.")
     # Telethon's channel-aware call: never pass a bare message ID without
     # an explicit channel, and never bulk-delete arbitrary message IDs.
     receipt = await client.delete_messages(channel, [int(msg.id)], revoke=True)
