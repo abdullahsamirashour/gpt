@@ -1664,7 +1664,10 @@ async def _run_transfer(
     service, direction: str, source: str, destination: str,
     max_files: int, recursive: bool, preview: bool, login_method: str = "code",
     reupload_selected: bool = False, selected_numbers: str = "",
+    drive_subfolder: str = "", telegram_hashtag: str = "",
 ) -> dict:
+    drive_subfolder = normalize_transfer_subfolder(drive_subfolder)
+    telegram_hashtag = normalize_transfer_hashtag(telegram_hashtag)
     from telethon import TelegramClient
 
     state = load_json(STATE_PATH, new_state())
@@ -1699,6 +1702,7 @@ async def _run_transfer(
             return await transfer_drive_to_telegram(
                 client, channel, service, state, parse_drive_id(source), recursive, max_files,
                 False, reupload_selected=reupload_selected, selected_numbers=selected_numbers,
+                telegram_hashtag=telegram_hashtag,
             )
         if direction == "telegram_to_drive":
             if source.strip():
@@ -1706,11 +1710,12 @@ async def _run_transfer(
                 source_entity = await client.get_entity(ref)
             else:
                 source_entity = await ensure_channel(client, transfer_config)
-            dest_id = "" if preview else await asyncio.to_thread(
-                ensure_drive_destination, service, destination
-            )
+            # Preview may query existing folders but must never create a new one.
+            finder = find_existing_drive_destination if preview else ensure_drive_destination
+            dest_id = await asyncio.to_thread(finder, service, destination)
             return await transfer_telegram_to_drive(
-                client, source_entity, service, state, dest_id, max_files, preview
+                client, source_entity, service, state, dest_id, max_files, preview,
+                subfolder_name=drive_subfolder,
             )
         raise ValueError("اتجاه النقل غير معروف.")
     finally:
@@ -1725,9 +1730,16 @@ def run_transfer(
     direction: str, source: str = "", destination: str = "",
     max_files: int = 20, recursive: bool = True, preview: bool = True,
     login_method: str = "code", reupload_selected: bool = False,
-    selected_numbers: str = "",
+    selected_numbers: str = "", drive_subfolder: str = "",
+    telegram_hashtag: str = "",
 ) -> None:
     """Entry point called by the small GitHub-backed Colab launcher cell."""
+    drive_subfolder = normalize_transfer_subfolder(drive_subfolder)
+    telegram_hashtag = normalize_transfer_hashtag(telegram_hashtag)
+    if direction == "drive_to_telegram" and drive_subfolder:
+        raise ValueError("اسم فولدر Drive الفرعي متاح فقط في Telegram → Drive.")
+    if direction == "telegram_to_drive" and telegram_hashtag:
+        raise ValueError("الهاشتاج متاح فقط في Drive → Telegram.")
     if login_method not in {"code", "qr"}:
         raise ValueError("طريقة تسجيل دخول Telegram غير معروفة.")
     source, destination = normalize_transfer_inputs(direction, source, destination)
@@ -1756,6 +1768,7 @@ def run_transfer(
                     _run_transfer(
                         service, direction, source, destination, max_files, recursive,
                         preview, login_method, reupload_selected, selected_numbers,
+                        drive_subfolder, telegram_hashtag,
                     )
                 )
             print(f"\n🏁 نجاح {result['ok']} • تخطي {result['skipped']} • فشل {result['failed']} • {time.time()-started:.0f} ثانية")
@@ -1764,6 +1777,8 @@ def run_transfer(
                     "direction": direction, "finished": int(time.time()),
                     "reupload_selected": bool(reupload_selected),
                     "selected_numbers": selected_numbers if reupload_selected else "",
+                    "drive_subfolder": drive_subfolder if direction == "telegram_to_drive" else "",
+                    "telegram_hashtag": telegram_hashtag if direction == "drive_to_telegram" else "",
                     **result,
                 })
         except KeyboardInterrupt:
