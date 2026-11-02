@@ -1530,6 +1530,72 @@ async def fetch_telegram_message(client, channel, msg, local: Path, size: int, d
     print(f"⏱️ Telegram {mode}: {elapsed:.1f} ثانية — {size / elapsed / (1024 * 1024):.2f} MiB/s")
 
 
+def file_md5_checksum(path: Path) -> str:
+    """Hash downloaded binary data; do not trust remote file size alone for deletion."""
+    digest = hashlib.md5()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(DRIVE_CHUNK), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def telegram_media_identity(msg) -> str:
+    """Detect media edits when retrying a pending deletion."""
+    media = getattr(msg, "document", None) or getattr(msg, "photo", None)
+    if media is None:
+        wrapper = getattr(msg, "media", None)
+        media = getattr(wrapper, "document", None) or getattr(wrapper, "photo", None)
+    return str(getattr(media, "id", "") or "")
+
+
+def confirmed_drive_copy_for_deletion(service, folder_id: str, record: dict) -> bool:
+    """Recheck an uploaded Drive file before *irreversibly* deleting Telegram."""
+    wanted_id = str(record.get("drive_id") or "")
+    wanted_md5 = str(record.get("verified_md5") or "").lower()
+    try:
+        wanted_size = int(record.get("size") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not wanted_id or not re.fullmatch(r"[a-f0-9]{32}", wanted_md5) or wanted_size <= 0:
+        return False
+
+    remote = get_drive_metadata(service, wanted_id)
+    return (
+        str(remote.get("id") or "") == wanted_id
+        and int(remote.get("size") or -1) == wanted_size
+        and str(remote.get("md5Checksum") or "").lower() == wanted_md5
+        and folder_id in (remote.get("parents") or [])
+    )
+
+
+async def delete_telegram_after_confirmed_drive_upload(
+    client, channel, msg, service, folder_id: str, record: dict,
+) -> None:
+    """Delete only the original message after fresh Drive metadata verification.
+
+    The caller must persist delete_pending before calling this function;
+    any failed check leaves the Telegram source intact and safely retryable.
+    """
+    if not record.get("delete_pending") or record.get("telegram_deleted"):
+        raise ValueError("الحذف يتطلب طلبًا محفوظًا بعد رفع موثق على Google Drive.")
+    size = int(getattr(getattr(msg, "file", None), "size", 0) or 0)
+    if size <= 0 or size != int(record.get("size") or 0):
+        raise ValueError("حجم رسالة Telegram اتغير؛ لن يتم حذفها.")
+    initial_media = str(record.get("telegram_media_id") or "")
+    if initial_media and telegram_media_identity(msg) != initial_media:
+        raise ValueError("هوية ملف Telegram اتغيرت؛ لن يتم حذف الرسالة.")
+    verified = await asyncio.to_thread(
+        confirmed_drive_copy_for_deletion, service, folder_id, record
+    )
+    if not verified:
+        raise RuntimeError("ملف Google Drive مش مثبت بالحجم وMD5 والفولدر الصحيح؛ لن نحذف رسالة Telegram.")
+    # Telethon's channel-aware call: never pass a bare message ID without
+    # an explicit channel, and never bulk-delete arbitrary message IDs.
+    receipt = await client.delete_messages(channel, [int(msg.id)], revoke=True)
+    if not receipt:
+        raise RuntimeError("Telegram لم يؤكد تنفيذ طلب حذف الرسالة.")
+
+
 async def transfer_telegram_to_drive(
     client, channel, service, state: dict, folder_id: str, max_files: int, preview: bool,
     subfolder_name: str = "",
