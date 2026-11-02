@@ -1483,8 +1483,15 @@ class GlobalTelegramHistoryRegressionTests(unittest.TestCase):
         self.assertIn(49, transfer.known_drive_to_telegram_message_ids(state, channel))
         self.assertEqual(transfer.known_drive_to_telegram_message_ids(
             state, SimpleNamespace(id=12346)), set())
-        state["drive_to_telegram"] = {}  # Changing channel emptied legacy state.
-        self.assertEqual(transfer.known_drive_to_telegram_message_ids(state, channel), {49})
+        with patch.object(transfer, "save_json"):
+            transfer.bind_transfer_channel(state, 12346)  # Old history is retained.
+        self.assertEqual(state["drive_to_telegram"], {})
+        self.assertEqual(
+            transfer.known_drive_to_telegram_message_ids(state, channel),
+            {42, 43, 44, 45, 46, 47, 48, 49},
+        )
+        self.assertEqual(transfer.known_drive_to_telegram_message_ids(
+            state, SimpleNamespace(id=12346)), set())
 
     def test_new_only_scans_skip_old_receipts_and_drive_origin_posts_even_in_empty_folder(self):
         channel = SimpleNamespace(id=12, title="Lecture channel")
