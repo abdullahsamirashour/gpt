@@ -495,33 +495,62 @@ def run_quiet(args, check=True):
 
 
 def ensure_dependencies():
-    packages = [
-        "telethon==1.45.0",
-        "cryptg",
-        "nest_asyncio",
-        "aiofasttelethonhelper==0.1.3",
-    ]
-    needs_install = False
-    try:
-        import telethon  # noqa
-        import cryptg  # noqa
-        import nest_asyncio  # noqa
-        import aiofasttelethonhelper  # noqa
-        if getattr(telethon, "__version__", "") != "1.45.0":
-            needs_install = True
-    except Exception:
-        needs_install = True
+    """Install required modules reliably; Telegram accelerators are optional.
 
-    if needs_install:
-        print("🔧 تجهيز الأدوات المطلوبة لأول مرة...")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", "--upgrade", *packages],
-            check=True,
-        )
+    Never hide pip stderr: Colab Python versions and package wheels can change.
+    """
+    from importlib import import_module
+
+    def present(module, required_version=None):
+        try:
+            loaded = import_module(module)
+            return required_version is None or getattr(loaded, "__version__", "") == required_version
+        except Exception:
+            return False
+
+    def install(package, critical):
+        print(f"🔧 تثبيت {package}...")
+        command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+                   "--no-input", package]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode:
+            details = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()[-3500:]
+            _log_debug(f"pip failed: {package} (exit={result.returncode})\n{details}")
+            print(f"❌ تعذر تثبيت {package} (exit {result.returncode})")
+            if details:
+                print(details[-1800:])
+            if critical:
+                raise AppError("E110", f"تعذر تثبيت المكتبة الأساسية {package}. راجع رسالة pip فوق.", details)
+            print(f"⚠️ {package} مكتبة تسريع اختيارية؛ هنكمل بدونها.")
+            return False
+        return True
+
+    print("🔧 فحص أدوات التشغيل...")
+    for module, package, version in (
+        ("telethon", "telethon==1.45.0", "1.45.0"),
+        ("nest_asyncio", "nest_asyncio", None),
+    ):
+        if not present(module, version):
+            install(package, critical=True)
+
+    # Telethon supports a slower pure-Python path without cryptg.
+    # The downloader already falls back if parallel-download helpers are absent.
+    for module, package in (
+        ("cryptg", "cryptg"),
+        ("aiofasttelethonhelper", "aiofasttelethonhelper==0.1.3"),
+        ("aiofiles", "aiofiles"),
+    ):
+        if not present(module):
+            install(package, critical=False)
 
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-        subprocess.run(["apt-get", "-qq", "update"], check=True)
-        subprocess.run(["apt-get", "-qq", "install", "-y", "ffmpeg"], check=True)
+        for command in (["apt-get", "-qq", "update"],
+                        ["apt-get", "-qq", "install", "-y", "ffmpeg"]):
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode:
+                details = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()[-3500:]
+                _log_debug(f"ffmpeg setup failed: {command}\n{details}")
+                raise AppError("E111", "تعذر تجهيز FFmpeg في Colab.", details)
 
 
 
