@@ -460,20 +460,21 @@ def show_log_controls(log_path: Path) -> None:
 
 
 def ensure_dependencies() -> None:
+    from importlib.metadata import version as package_version
     try:
         import cryptg  # Native Telegram encryption, if an earlier Colab cell did not install it.
         import telethon
         import googleapiclient
         import google.auth
         import nest_asyncio
-        if telethon.__version__ == "1.45.0":
+        if telethon.__version__ == "1.45.0" and package_version("cryptg") == "0.6.0":
             return
     except ImportError:
         pass
     print("🔧 تجهيز أدوات النقل لأول مرة...")
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "-q",
-         "telethon==1.45.0", "cryptg", "nest_asyncio",
+         "telethon==1.45.0", "--only-binary=cryptg", "cryptg==0.6.0", "nest_asyncio",
          "google-api-python-client", "google-auth", "google-auth-httplib2"],
         check=True,
     )
