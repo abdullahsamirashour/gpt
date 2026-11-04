@@ -500,11 +500,16 @@ def ensure_dependencies():
     Never hide pip stderr: Colab Python versions and package wheels can change.
     """
     from importlib import import_module
+    from importlib.metadata import version as package_version
 
     def present(module, required_version=None):
         try:
             loaded = import_module(module)
-            return required_version is None or getattr(loaded, "__version__", "") == required_version
+            if required_version is None:
+                return True
+            if module == "cryptg":
+                return package_version("cryptg") == required_version
+            return getattr(loaded, "__version__", "") == required_version
         except Exception:
             return False
 
@@ -512,6 +517,8 @@ def ensure_dependencies():
         print(f"🔧 تثبيت {package}...")
         command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
                    "--no-input", package]
+        if package.startswith("cryptg=="):
+            command.insert(-1, "--only-binary=cryptg")
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode:
             details = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()[-3500:]
@@ -535,13 +542,16 @@ def ensure_dependencies():
 
     # Telethon supports a slower pure-Python path without cryptg.
     # The downloader already falls back if parallel-download helpers are absent.
-    for module, package in (
-        ("cryptg", "cryptg"),
-        ("aiofasttelethonhelper", "aiofasttelethonhelper==0.1.3"),
-        ("aiofiles", "aiofiles"),
+    for module, package, required_version in (
+        ("cryptg", "cryptg==0.6.0", "0.6.0"),
+        ("aiofasttelethonhelper", "aiofasttelethonhelper==0.1.3", None),
+        ("aiofiles", "aiofiles", None),
     ):
-        if not present(module):
+        if not present(module, required_version):
             install(package, critical=False)
+
+    if present("cryptg", "0.6.0"):
+        print("✅ cryptg 0.6.0 جاهزة لتسريع Telegram")
 
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         for command in (["apt-get", "-qq", "update"],
