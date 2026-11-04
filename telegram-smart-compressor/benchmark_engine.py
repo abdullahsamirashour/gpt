@@ -61,9 +61,14 @@ def run(cmd, *, check=True, capture=True, timeout=None, env=None):
 
 
 def ensure_dependencies():
+    from importlib.metadata import version as package_version, PackageNotFoundError
+    try:
+        cryptg_version = package_version("cryptg")
+    except PackageNotFoundError:
+        cryptg_version = None
     packages = [
         "telethon==1.45.0",
-        "cryptg",
+        "cryptg==0.6.0",
         "nest_asyncio",
         "aiofasttelethonhelper==0.1.3",
         "psutil",
@@ -73,20 +78,20 @@ def ensure_dependencies():
     missing = []
     for module, pkg in [
         ("telethon", packages[0]),
-        ("cryptg", "cryptg"),
+        ("cryptg", "cryptg==0.6.0"),
         ("nest_asyncio", "nest_asyncio"),
         ("aiofasttelethonhelper", "aiofasttelethonhelper==0.1.3"),
         ("psutil", "psutil"),
         ("pandas", "pandas"),
         ("tabulate", "tabulate"),
     ]:
-        if importlib.util.find_spec(module) is None:
+        if importlib.util.find_spec(module) is None or (module == "cryptg" and cryptg_version != "0.6.0"):
             missing.append(pkg)
 
     if missing:
         print("🔧 تجهيز مكتبات البنش مارك...")
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", "--upgrade", *missing],
+            [sys.executable, "-m", "pip", "install", "-q", "--upgrade", "--only-binary=cryptg", *missing],
             check=True,
         )
 
