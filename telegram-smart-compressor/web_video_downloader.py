@@ -59,16 +59,23 @@ def _safe_name(name, fallback="video"):
 
 
 def _normal_urls(lines):
-    urls = [item.strip() for line in (lines or "").splitlines()
-            for item in line.split() if item.strip()]
-    if not urls:
-        raise ValueError("الصق رابط فيديو واحدًا على الأقل.")
-    if len(urls) > 30:
-        raise ValueError("الحد الأقصى 30 رابط في التشغيل الواحد.")
-    for url in urls:
+    """Accept a paste of links separated by newlines, spaces, commas or semicolons."""
+    raw = re.split(r"[\s;؛،]+|,(?=https?://)", str(lines or "").strip())
+    urls, seen = [], set()
+    for item in raw:
+        url = item.strip().strip(",،؛;")
+        if not url:
+            continue
         parsed = urlparse(url)
         if parsed.scheme not in ("https", "http") or not parsed.netloc:
-            raise ValueError("مسموح بروابط http أو https فقط.")
+            raise ValueError("كل عنصر لازم يكون رابط http أو https صحيح.")
+        if url not in seen:
+            urls.append(url)
+            seen.add(url)
+    if not urls:
+        raise ValueError("الصق رابط فيديو واحدًا على الأقل.")
+    if len(urls) > 100:
+        raise ValueError("الحد الأقصى 100 رابط مختلف في كل Batch.")
     return urls
 
 
@@ -648,24 +655,267 @@ async def _valid_telegram_receipt(client, channel, msg_id, expected_size):
                 int(getattr(msg.file, "size", 0) or 0) == expected_size)
 
 
+
+# One output format per batch. Video MP4 is the default for Telegram playback.
+FORMAT_ALIASES = {
+    "mp4": "mp4", "webm": "webm", "mp3": "mp3",
+    "m4a": "m4a", "ogg": "ogg", "zip": "zip", "original": "original",
+}
+AUDIO_MIME = {"mp3": "audio/mpeg", "m4a": "audio/mp4", "ogg": "audio/ogg"}
+
+
+def _probe_media(path):
+    _ensure_ffmpeg()
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-show_format",
+         "-of", "json", str(path)],
+        capture_output=True, text=True,
+    )
+    if result.returncode:
+        raise RuntimeError(f"FFprobe لم يتمكن من قراءة الملف: {(result.stderr or '')[-280:]}")
+    try:
+        info = __import__("json").loads(result.stdout)
+    except ValueError as exc:
+        raise RuntimeError("تعذر قراءة معلومات الملف الناتج.") from exc
+    video = next((x for x in info.get("streams", []) if x.get("codec_type") == "video"), None)
+    audio = next((x for x in info.get("streams", []) if x.get("codec_type") == "audio"), None)
+    duration = (info.get("format") or {}).get("duration")
+    try:
+        seconds = float(duration or (video or audio or {}).get("duration") or 0)
+    except (ValueError, TypeError):
+        seconds = 0.0
+    return {
+        "video": video, "audio": audio,
+        "duration": max(0, int(seconds)),
+        "width": int((video or {}).get("width") or 0),
+        "height": int((video or {}).get("height") or 0),
+    }
+
+
+def _encode_media(src, dest, args):
+    _ensure_ffmpeg()
+    print(f"🔄 تجهيز {dest.suffix.upper().lstrip('.')} (بدون تغيير إعدادات الضغط الأساسية)...")
+    started = time.monotonic()
+    temp = dest.with_name(dest.stem + ".incomplete" + dest.suffix)
+    temp.unlink(missing_ok=True)
+    command = [
+        "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", str(src), *args, str(temp),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    if completed.returncode or not temp.exists() or temp.stat().st_size == 0:
+        temp.unlink(missing_ok=True)
+        raise RuntimeError(
+            "فشل تحويل الملف بهذه الصيغة: " + (completed.stderr or "")[-650:]
+        )
+    os.replace(temp, dest)
+    print(f"✅ تم التحويل خلال {time.monotonic() - started:.1f} ثانية")
+
+
+def _prepare_file(src, output_dir, fmt, audio_kbps=96, video_crf=20):
+    """Return the output file and its logical kind, keeping source intact."""
+    import zipfile
+    fmt = FORMAT_ALIASES.get(fmt, fmt)
+    if fmt not in FORMAT_ALIASES:
+        raise ValueError("صيغة الإخراج المطلوبة غير معروفة.")
+    audio_kbps = int(audio_kbps)
+    video_crf = int(video_crf)
+    if not 24 <= audio_kbps <= 192 or not 18 <= video_crf <= 32:
+        raise ValueError("قيمة Bitrate أو CRF خارج النطاق المسموح.")
+
+    src = Path(src)
+    if fmt == "original":
+        return src, "original"
+
+    ext = {
+        "mp4": ".mp4", "webm": ".webm",
+        "mp3": ".mp3", "m4a": ".m4a", "ogg": ".ogg", "zip": ".zip",
+    }[fmt]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fingerprint = hashlib.sha256(
+        f"{src.name}|{src.stat().st_size}|{fmt}|{audio_kbps}|{video_crf}".encode("utf-8")
+    ).hexdigest()[:9]
+    output = output_dir / f"{_safe_name(src.stem)[:100]}_{fingerprint}{ext}"
+    if output.exists() and output.stat().st_size > 0:
+        print(f"♻️ موجود من محاولة سابقة: {output.name}")
+        return output, fmt
+
+    if fmt == "zip":
+        temp = output.with_name(output.name + ".incomplete")
+        temp.unlink(missing_ok=True)
+        try:
+            with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+                archive.write(src, arcname=_safe_name(src.name))
+            os.replace(temp, output)
+        finally:
+            temp.unlink(missing_ok=True)
+        print("📦 تم إنشاء ZIP من الملف الأصلي بدون إعادة ترميز.")
+        return output, fmt
+
+    streams = _probe_media(src)
+    if fmt in ("mp4", "webm") and not streams["video"]:
+        raise RuntimeError("الملف مفيهوش مسار فيديو للتحويل للصيغة المختارة.")
+    if fmt in ("mp3", "m4a", "ogg") and not streams["audio"]:
+        raise RuntimeError("الفيديو مفيهوش مسار صوتي؛ مش هنطلع ملف صامت.")
+
+    video_codec = str((streams["video"] or {}).get("codec_name") or "").lower()
+    audio_codec = str((streams["audio"] or {}).get("codec_name") or "").lower()
+    if fmt == "mp4":
+        # Stream copy/remux on H.264 + AAC avoids a needless lossy conversion.
+        if video_codec == "h264" and audio_codec in ("aac", ""):
+            opts = ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+                    "-movflags", "+faststart"]
+            print("⚡ الفيديو H.264/AAC بالفعل؛ إعادة تغليف MP4 بدون إعادة ضغط.")
+        else:
+            video_opts = (["-c:v", "copy"] if video_codec == "h264" else
+                          ["-c:v", "libx264", "-preset", "veryfast", "-crf",
+                           str(video_crf), "-pix_fmt", "yuv420p",
+                           "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"])
+            audio_opts = (["-c:a", "copy"] if audio_codec in ("aac", "") else
+                          ["-c:a", "aac", "-b:a", "128k"])
+            opts = ["-map", "0:v:0", "-map", "0:a:0?", *video_opts,
+                    *audio_opts, "-movflags", "+faststart"]
+    elif fmt == "webm":
+        if src.suffix.lower() == ".webm" and video_codec in ("vp8", "vp9", "av1") and audio_codec in ("opus", "vorbis", ""):
+            return src, "webm"
+        opts = [
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "5",
+            "-crf", "30", "-b:v", "0", "-c:a", "libopus",
+            "-b:a", f"{audio_kbps}k",
+        ]
+    else:
+        codec = {
+            "mp3": ["-c:a", "libmp3lame", "-b:a", f"{audio_kbps}k"],
+            "m4a": ["-c:a", "aac", "-b:a", f"{audio_kbps}k"],
+            "ogg": ["-c:a", "libopus", "-b:a", f"{audio_kbps}k", "-vbr", "on"],
+        }[fmt]
+        opts = ["-map", "0:a:0", "-vn", "-sn", "-dn", *codec]
+    _encode_media(src, output, opts)
+    return output, fmt
+
+
+def _telegram_media_kind(file, fmt, show_as):
+    """Only preview known playable formats; never pretend ZIP/WebM is MP4."""
+    if show_as != "player":
+        return "document"
+    if fmt == "mp4":
+        return "video"
+    if fmt in AUDIO_MIME:
+        return "audio"
+    if fmt == "original":
+        extension = file.suffix.lower()
+        if extension in (".mp3", ".m4a", ".ogg"):
+            return "audio"
+        if extension == ".mp4":
+            metadata = _probe_media(file)
+            v = (metadata["video"] or {}).get("codec_name")
+            a = (metadata["audio"] or {}).get("codec_name")
+            if v == "h264" and a in ("aac", None):
+                return "video"
+    return "document"
+
+
+def _generate_thumb(file):
+    """Best-effort Telegram thumbnail for playable MP4."""
+    thumb = file.with_name(file.stem + "_telegram_thumbnail.jpg")
+    if thumb.exists() and 0 < thumb.stat().st_size < 200000:
+        return str(thumb)
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+         "-ss", "00:00:01", "-i", str(file), "-frames:v", "1",
+         "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+         "-q:v", "7", str(thumb)],
+        capture_output=True, text=True,
+    )
+    if result.returncode or not thumb.exists() or not (0 < thumb.stat().st_size < 200000):
+        thumb.unlink(missing_ok=True)
+        return None
+    return str(thumb)
+
+
+async def _send_playable_file(client, channel, transfer, uploader,
+                              file, size, name, caption, progress, kind):
+    """Reuse existing 6-connection uploader; send native Telegram video/audio."""
+    from telethon.tl.types import (
+        DocumentAttributeFilename, DocumentAttributeVideo, DocumentAttributeAudio,
+    )
+
+    handle = None
+    if (uploader is not None and not uploader.disabled
+            and size >= transfer.TG_UPLOAD_MIN_BYTES):
+        try:
+            handle = await uploader.upload_file(str(file), size, name, progress)
+        except Exception as exc:
+            if type(exc).__name__ in ("FloodWaitError", "FloodPremiumWaitError"):
+                raise
+            uploader.disabled = True
+            await uploader.close()
+            print("↪️ تعذر الرفع المتوازي؛ هنكمل بنفس مسار Telethon الاحتياطي.")
+
+    if handle is None:
+        handle = await client.upload_file(
+            str(file), file_size=size, file_name=name,
+            part_size_kb=transfer.UPLOAD_PART_KB, progress_callback=progress,
+        )
+
+    info = _probe_media(file)
+    if kind == "video":
+        thumb = _generate_thumb(file)
+        args = dict(
+            mime_type="video/mp4", force_document=False,
+            supports_streaming=True,
+            attributes=[
+                DocumentAttributeFilename(name),
+                DocumentAttributeVideo(
+                    duration=info["duration"], w=max(1, info["width"]),
+                    h=max(1, info["height"]), supports_streaming=True,
+                ),
+            ],
+        )
+        if thumb:
+            args["thumb"] = thumb
+    else:
+        mimetype = AUDIO_MIME.get(file.suffix.lower().lstrip("."), "audio/mpeg")
+        args = dict(
+            mime_type=mimetype, force_document=False,
+            attributes=[
+                DocumentAttributeFilename(name),
+                DocumentAttributeAudio(
+                    duration=info["duration"], voice=False,
+                    title=file.stem[:95], performer="",
+                ),
+            ],
+        )
+    return await client.send_file(channel, handle, caption=caption, **args)
+
+
 async def _upload_telegram_video(client, channel, transfer, state,
-                                 uploader, file, source_url, quality):
+                                 uploader, file, source_url, quality,
+                                 fmt="mp4", show_as="player",
+                                 audio_kbps=96, video_crf=20):
+    """Upload files to the existing channel, with actual Telegram playback metadata."""
     import math
     import json
 
     file = Path(file)
     size = file.stat().st_size
     if not size:
-        raise RuntimeError("ملف الفيديو فارغ؛ لا يمكن رفعه.")
+        raise RuntimeError("الملف الناتج فارغ؛ لا يمكن رفعه.")
     name = transfer.clean_filename(file.name)
+    kind = _telegram_media_kind(file, fmt, show_as)
     token = hashlib.sha256(
-        f"{source_url}\n{name}\n{size}\n{quality}".encode("utf-8")
+        f"{source_url}\n{name}\n{size}\n{quality}\n{fmt}\n{show_as}\n{audio_kbps}\n{video_crf}"
+        .encode("utf-8")
     ).hexdigest()[:18]
     records = state.setdefault("web_video_uploads", {})
     receipt = records.get(token)
     if not isinstance(receipt, dict) or receipt.get("channel_id") != int(channel.id):
-        receipt = {"channel_id": int(channel.id), "name": name,
-                   "size": size, "parts": {}, "done": False}
+        receipt = {
+            "channel_id": int(channel.id), "name": name,
+            "size": size, "parts": {}, "done": False, "format": fmt,
+            "telegram_display": kind,
+        }
         records[token] = receipt
         transfer.save_json(transfer.STATE_PATH, state)
 
@@ -677,24 +927,35 @@ async def _upload_telegram_video(client, channel, transfer, state,
         count = min(transfer.MAX_TG_PART, size - offset)
         recorded_id = saved_parts.get(str(number))
         if await _valid_telegram_receipt(client, channel, recorded_id, count):
-            print(f"↪️ الجزء {number}/{parts_count} موجود على القناة، مش هنكرره.")
+            print(f"↪️ الجزء {number}/{parts_count} موجود بالقناة، مش هنكرره.")
             continue
 
         part_name = name if parts_count == 1 else f"{name}.part{number:03d}"
         marker = f"MLTX:{token}:{number}/{parts_count}"
-        caption = f"🌐 فيديو من الإنترنت\n{name[:350]}\n{marker}"
-        progress = transfer.Progress(f"⬆️ Telegram {part_name}")
-        if parts_count == 1:
+        category = {"video": "🎬 فيديو", "audio": "🎧 صوت",
+                    "document": "📁 ملف"}.get(kind, "📁 ملف")
+        caption = f"🌐 {category} من الإنترنت\n{name[:300]}\n{marker}"
+        progress = transfer.Progress(f"⬆️ Telegram [{number}/{parts_count}] {part_name}")
+
+        if parts_count == 1 and kind in {"video", "audio"}:
+            message = await _send_playable_file(
+                client, channel, transfer, uploader, file, count, part_name,
+                caption, progress, kind,
+            )
+        elif parts_count == 1:
             message = await transfer.send_transfer_document(
                 client, channel, str(file), count, part_name, caption,
                 progress, parallel_uploader=uploader,
             )
         else:
+            if number == 1:
+                print("ℹ️ الملف أكبر من حد Telegram؛ هيترفع كأجزاء Document مع ملف تجميع.")
             with transfer.SegmentReader(file, offset, count, part_name) as segment:
                 message = await transfer.send_transfer_document(
                     client, channel, segment, count, part_name, caption,
                     progress, raw_part=True, parallel_uploader=uploader,
                 )
+
         actual_size = int(getattr(getattr(message, "file", None), "size", 0) or 0)
         if actual_size and actual_size != count:
             raise RuntimeError("حجم الملف المرفوع لا يطابق حجم الجزء الأصلي.")
@@ -705,20 +966,25 @@ async def _upload_telegram_video(client, channel, transfer, state,
 
     if parts_count > 1:
         manifest_id = receipt.get("manifest_id")
-        if not await _valid_telegram_receipt(client, channel, manifest_id, 
-                                             int(receipt.get("manifest_size", 0) or -1)):
+        expected_manifest_size = int(receipt.get("manifest_size", 0) or -1)
+        if not await _valid_telegram_receipt(
+            client, channel, manifest_id, expected_manifest_size
+        ):
             manifest = {
                 "format": "media-lite-parts-v1",
-                "name": name, "size": size,
-                "part_size": transfer.MAX_TG_PART,
-                "parts": [{"name": f"{name}.part{i:03d}",
-                           "message_id": saved_parts[str(i)]}
-                          for i in range(1, parts_count + 1)],
+                "name": name, "size": size, "part_size": transfer.MAX_TG_PART,
+                "parts": [
+                    {"name": f"{name}.part{i:03d}",
+                     "message_id": saved_parts[str(i)]}
+                    for i in range(1, parts_count + 1)
+                ],
                 "restore": "Concatenate the .part files in ascending order (binary mode).",
             }
             file_path = file.parent / f"{name}.parts.json"
-            file_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
-                                 encoding="utf-8")
+            file_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             try:
                 note = await client.send_file(
                     channel, str(file_path), force_document=True,
@@ -736,9 +1002,8 @@ async def _upload_telegram_video(client, channel, transfer, state,
     receipt["done"] = True
     receipt["uploaded_at"] = int(time.time())
     transfer.save_json(transfer.STATE_PATH, state)
-    print(f"✅ اترفع للقناة: {name} ({size / 1048576:.1f} MiB)")
+    print(f"✅ اترفع للقناة: {name} ({size / 1048576:.1f} MiB) — {kind}")
     return file
-
 
 async def _telegram_flow(urls, transfer, quality, browser_fallback,
                          account, login_method):
