@@ -693,27 +693,138 @@ def _probe_media(path):
     }
 
 
-def _encode_media(src, dest, args):
+class _EncodingProgress:
+    """A single updating Colab widget, with a throttled text fallback."""
+
+    def __init__(self, filename, duration):
+        self.filename = _safe_name(filename)
+        self.duration = max(0.0, float(duration or 0))
+        self.started = time.monotonic()
+        self.last_display = 0.0
+        self.last_bucket = -1
+        self.last_console = 0.0
+        self.widget = None
+        self.widget_failed = False
+        self.update(0.0, force=True)
+
+    @staticmethod
+    def _clock(seconds):
+        seconds = max(0, int(seconds))
+        hours, remain = divmod(seconds, 3600)
+        minutes, secs = divmod(remain, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def update(self, processed_seconds, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_display < 0.75:
+            return
+        self.last_display = now
+        elapsed = max(0.001, now - self.started)
+        progress_seconds = max(0.0, float(processed_seconds or 0))
+        pct = min(100.0, 100.0 * progress_seconds / self.duration) if self.duration > 0 else 0.0
+        speed = progress_seconds / elapsed
+        remaining = (self.duration - progress_seconds) / speed if self.duration > progress_seconds and speed > 0 else 0.0
+        status = (
+            f"{pct:.1f}% • {self._clock(progress_seconds)} / {self._clock(self.duration)}"
+            if self.duration else
+            f"مدة المعالجة: {self._clock(progress_seconds)}"
+        )
+        extra = f" • {speed:.1f}x" if speed > 0 else ""
+        eta = f" • باقي {self._clock(remaining)}" if remaining > 0 else ""
+        if not self.widget_failed:
+            try:
+                import ipywidgets as widgets
+                from IPython.display import display
+                safe_name = html.escape(self.filename)
+                markup = (
+                    '<div dir="rtl" style="font-family:Arial,sans-serif;'
+                    'border:1px solid #cbd5e1;border-radius:10px;'
+                    'padding:10px;margin:5px 0;max-width:760px;background:#f8fafc">'
+                    f'<b>🔄 تحويل: {safe_name}</b>'
+                    f'<div dir="ltr" style="text-align:right;margin:5px 0">{status}{extra}{eta}</div>'
+                    f'<progress value="{pct:.2f}" max="100" style="width:100%;height:15px"></progress>'
+                    '</div>'
+                )
+                if self.widget is None:
+                    self.widget = widgets.HTML(value=markup, layout=widgets.Layout(width="100%"))
+                    display(self.widget)
+                else:
+                    self.widget.value = markup
+                return
+            except Exception:
+                self.widget_failed = True
+                print("ℹ️ عرض Colab التفاعلي مش متاح؛ هنعرض تقدم التحويل كنص.")
+        bucket = int(pct // 5) if self.duration else int(elapsed // 10)
+        if force or (bucket > self.last_bucket and now - self.last_console >= 2.0):
+            self.last_bucket = bucket
+            self.last_console = now
+            print(f"🔄 تحويل {self.filename}: {status}{extra}{eta}", flush=True)
+
+    def finish(self):
+        self.update(self.duration if self.duration else
+                    time.monotonic() - self.started, force=True)
+
+
+def _encode_media(src, dest, args, duration=0):
+    """Run FFmpeg with live progress instead of buffering its full output."""
     _ensure_ffmpeg()
-    print(f"🔄 تجهيز {dest.suffix.upper().lstrip('.')} (بدون تغيير إعدادات الضغط الأساسية)...")
+    print(f"🔄 تجهيز {dest.suffix.upper().lstrip('.')}...")
     started = time.monotonic()
     temp = dest.with_name(dest.stem + ".incomplete" + dest.suffix)
     temp.unlink(missing_ok=True)
     command = [
         "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
-        "-i", str(src), *args, str(temp),
+        "-progress", "pipe:1", "-nostats", "-i", str(src), *args, str(temp),
     ]
-    completed = subprocess.run(command, capture_output=True, text=True)
-    if completed.returncode or not temp.exists() or temp.stat().st_size == 0:
+    progress = _EncodingProgress(dest.name, duration)
+    diagnostics = []
+    proc = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    try:
+        if proc.stdout is not None:
+            for raw in proc.stdout:
+                line = raw.strip()
+                if line.startswith(("out_time_us=", "out_time_ms=")):
+                    try:
+                        progress.update(int(line.split("=", 1)[1]) / 1_000_000)
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                elif line.startswith("out_time="):
+                    try:
+                        h, m, sec = line.split("=", 1)[1].split(":")
+                        progress.update(float(h) * 3600 + float(m) * 60 + float(sec))
+                    except (TypeError, ValueError):
+                        pass
+                elif line and not line.startswith(("progress=", "frame=", "fps=",
+                        "stream_", "total_size=", "bitrate=", "speed=", "dup_frames=",
+                        "drop_frames=")):
+                    diagnostics.append(line)
+                    diagnostics = diagnostics[-15:]
+        returncode = proc.wait()
+    except BaseException:
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+    if returncode or not temp.exists() or temp.stat().st_size == 0:
         temp.unlink(missing_ok=True)
-        raise RuntimeError(
-            "فشل تحويل الملف بهذه الصيغة: " + (completed.stderr or "")[-650:]
-        )
+        detail = "\n".join(diagnostics)[-750:]
+        raise RuntimeError(f"فشل تحويل الملف بهذه الصيغة: {detail or f'FFmpeg exit={returncode}'}")
     os.replace(temp, dest)
+    progress.finish()
     print(f"✅ تم التحويل خلال {time.monotonic() - started:.1f} ثانية")
 
-
-def _prepare_file(src, output_dir, fmt, audio_kbps=96, video_crf=20):
+def _prepare_file(src, output_dir, fmt, audio_kbps=96, video_crf=20, fast_opus_copy=False):
     """Return the output file and its logical kind, keeping source intact."""
     import zipfile
     fmt = FORMAT_ALIASES.get(fmt, fmt)
@@ -734,7 +845,7 @@ def _prepare_file(src, output_dir, fmt, audio_kbps=96, video_crf=20):
     }[fmt]
     output_dir.mkdir(parents=True, exist_ok=True)
     fingerprint = hashlib.sha256(
-        f"{src.name}|{src.stat().st_size}|{fmt}|{audio_kbps}|{video_crf}".encode("utf-8")
+        f"{src.name}|{src.stat().st_size}|{fmt}|{audio_kbps}|{video_crf}|{fast_opus_copy}".encode("utf-8")
     ).hexdigest()[:9]
     output = output_dir / f"{_safe_name(src.stem)[:100]}_{fingerprint}{ext}"
     if output.exists() and output.stat().st_size > 0:
@@ -794,7 +905,16 @@ def _prepare_file(src, output_dir, fmt, audio_kbps=96, video_crf=20):
             "ogg": ["-c:a", "libopus", "-b:a", f"{audio_kbps}k", "-vbr", "on"],
         }[fmt]
         opts = ["-map", "0:a:0", "-vn", "-sn", "-dn", *codec]
-    _encode_media(src, output, opts)
+        if fmt == "ogg" and audio_codec == "opus" and fast_opus_copy:
+            print("⚡ المصدر يحتوي Opus بالفعل؛ هنعمله OGG Stream Copy بدون إعادة ترميز أو فقد جودة.")
+            print("ℹ️ في الوضع السريع ده قيمة Audio Bitrate المختارة مش هتتطبق.")
+            copy_opts = ["-map", "0:a:0", "-vn", "-sn", "-dn", "-c:a", "copy"]
+            try:
+                _encode_media(src, output, copy_opts, duration=streams["duration"])
+                return output, fmt
+            except RuntimeError:
+                print("↪️ نقل Opus مباشرة لم ينجح؛ هنرجع للتحويل العادي بالـBitrate المختار.")
+    _encode_media(src, output, opts, duration=streams["duration"])
     return output, fmt
 
 
@@ -1027,7 +1147,7 @@ def _source_files(url, stage, quality, browser_fallback):
 
 async def _telegram_flow(urls, transfer, quality, browser_fallback,
                          account, login_method, fmt, show_as,
-                         audio_kbps, video_crf):
+                         audio_kbps, video_crf, fast_opus_copy):
     import asyncio
     from telethon import TelegramClient
 
@@ -1073,7 +1193,7 @@ async def _telegram_flow(urls, transfer, quality, browser_fallback,
                 for file in files:
                     output, actual_fmt = await asyncio.to_thread(
                         _prepare_file, file, stage / "prepared",
-                        fmt, audio_kbps, video_crf,
+                        fmt, audio_kbps, video_crf, fast_opus_copy,
                     )
                     uploaded = await _upload_telegram_video(
                         client, channel, transfer, state, uploader, output,
@@ -1111,7 +1231,7 @@ def _redact_error(detail, original_url):
 
 def _run_telegram(urls, quality, browser_fallback,
                   update_ytdlp, login_method, repo_commit, fmt, show_as,
-                  audio_kbps, video_crf):
+                  audio_kbps, video_crf, fast_opus_copy):
     import asyncio
     if login_method not in {"qr", "code"}:
         raise ValueError("طريقة دخول Telegram غير معروفة.")
@@ -1134,7 +1254,7 @@ def _run_telegram(urls, quality, browser_fallback,
         return asyncio.get_event_loop().run_until_complete(
             _telegram_flow(
                 urls, transfer, quality, browser_fallback, account, login_method,
-                fmt, show_as, audio_kbps, video_crf,
+                fmt, show_as, audio_kbps, video_crf, fast_opus_copy,
             )
         )
 
@@ -1142,7 +1262,8 @@ def _run_telegram(urls, quality, browser_fallback,
 def run(urls_text, destination="Google Drive", subfolder="",
         quality="الأصلية", browser_fallback=True, update_ytdlp=False,
         telegram_login="qr", repo_commit=None, output_format="mp4",
-        telegram_display="player", audio_kbps=96, video_crf=20):
+        telegram_display="player", audio_kbps=96, video_crf=20,
+        fast_opus_copy=False):
     """Native Colab Forms entry point. Downloads every unique URL in the batch."""
     urls = _normal_urls(urls_text)
     fmt = FORMAT_ALIASES.get(output_format)
@@ -1162,7 +1283,7 @@ def run(urls_text, destination="Google Drive", subfolder="",
         return _run_telegram(
             urls, quality, browser_fallback, update_ytdlp,
             telegram_login, repo_commit, fmt, telegram_display,
-            audio_kbps, video_crf,
+            audio_kbps, video_crf, fast_opus_copy,
         )
     if destination not in {"Google Drive", "Colab فقط"}:
         raise ValueError("اختار Google Drive أو Telegram أو Colab فقط.")
@@ -1183,7 +1304,8 @@ def run(urls_text, destination="Google Drive", subfolder="",
             prepared = []
             for file in files:
                 output, _kind = _prepare_file(
-                    file, stage / "prepared", fmt, audio_kbps, video_crf
+                    file, stage / "prepared", fmt, audio_kbps, video_crf,
+                    fast_opus_copy,
                 )
                 prepared.append(output)
             copies = _save_files(prepared, target)
