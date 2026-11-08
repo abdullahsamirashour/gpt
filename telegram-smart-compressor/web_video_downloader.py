@@ -456,10 +456,299 @@ def _download_url(url, stage, quality, browser_fallback, update_ytdlp):
     raise RuntimeError("لم نتمكن من تنزيل فيديو من الرابط؛ جرّب رابط الملف المباشر أو موقعًا مدعومًا من yt-dlp.")
 
 
+
+def _load_transfer_engine(commit):
+    """Reuse the existing transfer channel, isolated session, and six-way uploader."""
+    import types
+    import urllib.request
+
+    if not re.fullmatch(r"[0-9a-f]{40}", str(commit or "")):
+        raise RuntimeError("تعذر تحديد إصدار محرك النقل المطابق للـNotebook.")
+    cached = Path("/content/media_lite_url_transfer_engine.py")
+    stamp = cached.with_suffix(".commit")
+    source = None
+    if cached.exists() and stamp.exists():
+        try:
+            if stamp.read_text(encoding="ascii").strip() == commit:
+                saved = cached.read_text(encoding="utf-8")
+                if len(saved) > 50000:
+                    source = saved
+        except (OSError, UnicodeError):
+            pass
+    if source is None:
+        url = (f"https://raw.githubusercontent.com/abdullahsamirashour/gpt/"
+               f"{commit}/telegram-smart-compressor/transfer_engine.py")
+        request = urllib.request.Request(url, headers={"User-Agent": "Media-Lite-Web-Downloader"})
+        with urllib.request.urlopen(request, timeout=45) as response:
+            source = response.read().decode("utf-8")
+        if len(source) < 50000:
+            raise RuntimeError("محرك Telegram غير مكتمل؛ لن نرفع الملفات.")
+        temp = cached.with_suffix(".tmp")
+        temp.write_text(source, encoding="utf-8")
+        os.replace(temp, cached)
+        stamp_temp = stamp.with_suffix(".tmp")
+        stamp_temp.write_text(commit, encoding="ascii")
+        os.replace(stamp_temp, stamp)
+    module = types.ModuleType("media_lite_url_transfer")
+    module.__file__ = str(cached)
+    exec(compile(source, str(cached), "exec"), module.__dict__)
+    return module
+
+
+async def _existing_transfer_channel(client, transfer, settings):
+    """Locate the already-used private transfer channel; never create a channel."""
+    from telethon import types
+
+    def usable(channel):
+        rights = getattr(channel, "admin_rights", None)
+        can_post = bool(getattr(channel, "creator", False) or
+                        getattr(rights, "post_messages", False))
+        return bool(getattr(channel, "broadcast", False) and can_post
+                    and not getattr(channel, "username", None))
+
+    saved_id = settings.get("channel_id")
+    if saved_id:
+        try:
+            existing = await client.get_entity(types.PeerChannel(int(saved_id)))
+            if usable(existing) and getattr(existing, "title", None) == transfer.CHANNEL_TITLE:
+                print(f"📣 قناة النقل المحفوظة: {transfer.CHANNEL_TITLE}")
+                return existing
+        except Exception:
+            pass
+
+    matches = []
+    async for dialog in client.iter_dialogs():
+        if dialog.name == transfer.CHANNEL_TITLE and usable(dialog.entity):
+            matches.append(dialog.entity)
+    if len(matches) != 1:
+        raise RuntimeError(
+            "تعذر تحديد قناة 📁 Media Lite | File Transfer الموجودة بشكل آمن. "
+            "شغّل خلية Drive → Telegram الأصلية لتجهيز القناة/الجلسة، "
+            "ثم أعد المحاولة هنا. لن ننشئ قناة جديدة تلقائيًا."
+        )
+    channel = matches[0]
+    settings["channel_id"] = int(channel.id)
+    transfer.save_json(transfer.TRANSFER_CONFIG, settings)
+    print(f"📣 هنستخدم قناة النقل القديمة: {transfer.CHANNEL_TITLE}")
+    return channel
+
+
+async def _valid_telegram_receipt(client, channel, msg_id, expected_size):
+    if not msg_id:
+        return False
+    # A network failure must not be interpreted as a missing message.
+    msg = await client.get_messages(channel, ids=int(msg_id))
+    return bool(msg and getattr(msg, "file", None) and
+                int(getattr(msg.file, "size", 0) or 0) == expected_size)
+
+
+async def _upload_telegram_video(client, channel, transfer, state,
+                                 uploader, file, source_url, quality):
+    import math
+    import json
+
+    file = Path(file)
+    size = file.stat().st_size
+    if not size:
+        raise RuntimeError("ملف الفيديو فارغ؛ لا يمكن رفعه.")
+    name = transfer.clean_filename(file.name)
+    token = hashlib.sha256(
+        f"{source_url}\n{name}\n{size}\n{quality}".encode("utf-8")
+    ).hexdigest()[:18]
+    records = state.setdefault("web_video_uploads", {})
+    receipt = records.get(token)
+    if not isinstance(receipt, dict) or receipt.get("channel_id") != int(channel.id):
+        receipt = {"channel_id": int(channel.id), "name": name,
+                   "size": size, "parts": {}, "done": False}
+        records[token] = receipt
+        transfer.save_json(transfer.STATE_PATH, state)
+
+    parts_count = max(1, math.ceil(size / transfer.MAX_TG_PART))
+    saved_parts = receipt.setdefault("parts", {})
+
+    for number in range(1, parts_count + 1):
+        offset = (number - 1) * transfer.MAX_TG_PART
+        count = min(transfer.MAX_TG_PART, size - offset)
+        recorded_id = saved_parts.get(str(number))
+        if await _valid_telegram_receipt(client, channel, recorded_id, count):
+            print(f"↪️ الجزء {number}/{parts_count} موجود على القناة، مش هنكرره.")
+            continue
+
+        part_name = name if parts_count == 1 else f"{name}.part{number:03d}"
+        marker = f"MLTX:{token}:{number}/{parts_count}"
+        caption = f"🌐 فيديو من الإنترنت\n{name[:350]}\n{marker}"
+        progress = transfer.Progress(f"⬆️ Telegram {part_name}")
+        if parts_count == 1:
+            message = await transfer.send_transfer_document(
+                client, channel, str(file), count, part_name, caption,
+                progress, parallel_uploader=uploader,
+            )
+        else:
+            with transfer.SegmentReader(file, offset, count, part_name) as segment:
+                message = await transfer.send_transfer_document(
+                    client, channel, segment, count, part_name, caption,
+                    progress, raw_part=True, parallel_uploader=uploader,
+                )
+        actual_size = int(getattr(getattr(message, "file", None), "size", 0) or 0)
+        if actual_size and actual_size != count:
+            raise RuntimeError("حجم الملف المرفوع لا يطابق حجم الجزء الأصلي.")
+        saved_parts[str(number)] = int(message.id)
+        receipt["done"] = False
+        transfer.remember_outbound_telegram_id(state, channel, int(message.id))
+        transfer.save_json(transfer.STATE_PATH, state)
+
+    if parts_count > 1:
+        manifest_id = receipt.get("manifest_id")
+        if not await _valid_telegram_receipt(client, channel, manifest_id, 
+                                             int(receipt.get("manifest_size", 0) or -1)):
+            manifest = {
+                "format": "media-lite-parts-v1",
+                "name": name, "size": size,
+                "part_size": transfer.MAX_TG_PART,
+                "parts": [{"name": f"{name}.part{i:03d}",
+                           "message_id": saved_parts[str(i)]}
+                          for i in range(1, parts_count + 1)],
+                "restore": "Concatenate the .part files in ascending order (binary mode).",
+            }
+            file_path = file.parent / f"{name}.parts.json"
+            file_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+            try:
+                note = await client.send_file(
+                    channel, str(file_path), force_document=True,
+                    caption=f"📋 ملف تجميع أجزاء الفيديو\nMLTX:{token}:manifest",
+                )
+            finally:
+                file_path.unlink(missing_ok=True)
+            receipt["manifest_id"] = int(note.id)
+            receipt["manifest_size"] = int(
+                getattr(getattr(note, "file", None), "size", 0) or 0
+            )
+            transfer.remember_outbound_telegram_id(state, channel, int(note.id))
+            transfer.save_json(transfer.STATE_PATH, state)
+
+    receipt["done"] = True
+    receipt["uploaded_at"] = int(time.time())
+    transfer.save_json(transfer.STATE_PATH, state)
+    print(f"✅ اترفع للقناة: {name} ({size / 1048576:.1f} MiB)")
+    return file
+
+
+async def _telegram_flow(urls, transfer, quality, browser_fallback,
+                         account, login_method):
+    import asyncio
+    from telethon import TelegramClient
+
+    state = transfer.load_json(transfer.STATE_PATH, transfer.new_state())
+    settings = transfer.load_json(transfer.TRANSFER_CONFIG, {})
+    if transfer.PERSISTENT_SESSION.exists():
+        shutil.copy2(transfer.PERSISTENT_SESSION, transfer.LOCAL_SESSION)
+    else:
+        transfer.LOCAL_SESSION.unlink(missing_ok=True)
+
+    client = TelegramClient(
+        str(transfer.LOCAL_SESSION.with_suffix("")),
+        int(account["api_id"]), account["api_hash"],
+        connection_retries=5, request_retries=5,
+    )
+    uploader = None
+    success, failed = [], 0
+    try:
+        await transfer.authorize_telegram(client, account["phone"], login_method)
+        me = await client.get_me()
+        expected = re.sub(r"\D", "", str(account["phone"]))
+        actual = re.sub(r"\D", "", str(getattr(me, "phone", "")))
+        if actual and expected != actual:
+            raise RuntimeError("جلسة Telegram تخص حسابًا مختلفًا عن الحساب المحفوظ.")
+        channel = await _existing_transfer_channel(client, transfer, settings)
+        if transfer.TelegramParallelUploader.supported(client):
+            uploader = transfer.TelegramParallelUploader(client)
+            print("⚡ الرفع يستخدم محرك الـ6 اتصالات الموجود في نظام النقل.")
+        else:
+            print("ℹ️ محرك الرفع المتوازي غير متوافق مع هذه الجلسة؛ Telethon سيستخدم الرفع العادي.")
+        for idx, url in enumerate(urls, 1):
+            print(f"\n━━━━━━━━━━ فيديو {idx}/{len(urls)} ━━━━━━━━━━")
+            print(f"🌐 الموقع: {urlparse(url).hostname}")
+            stage = STAGING_ROOT / hashlib.sha256(url.encode("utf-8")).hexdigest()[:18]
+            stage.mkdir(parents=True, exist_ok=True)
+            try:
+                # Keep the Telegram event loop responsive during long network downloads.
+                files = await asyncio.to_thread(
+                    _download_url, url, stage, quality, browser_fallback, False
+                )
+                if not files:
+                    raise RuntimeError("لم ينتج أي ملف فيديو.")
+                for file in files:
+                    result = await _upload_telegram_video(
+                        client, channel, transfer, state, uploader, file, url, quality
+                    )
+                    success.append(result.name)
+                shutil.rmtree(stage, ignore_errors=True)
+            except Exception as exc:
+                failed += 1
+                detail = _redact_error(str(exc), url)
+                print(f"❌ لم يكتمل الفيديو {idx}: {detail[:450]}")
+                print("💾 النسخة المحلية المؤقتة باقية للاستكمال داخل نفس Runtime.")
+        print(f"\n✅ انتهى: {len(success)} فيديو إلى Telegram • فشل {failed} رابط")
+        print(f"📣 القناة: {transfer.CHANNEL_TITLE}")
+        return success
+    finally:
+        if uploader is not None:
+            await uploader.close()
+        try:
+            await client.disconnect()
+        finally:
+            if transfer.LOCAL_SESSION.exists():
+                shutil.copy2(transfer.LOCAL_SESSION, transfer.PERSISTENT_SESSION)
+
+
+def _redact_error(detail, original_url):
+    detail = str(detail).replace(original_url, "[private video URL]")
+    return re.sub(
+        r"([?&](?:key|token|sig|signature|auth|access_token)=)[^&\s]+",
+        r"\1[hidden]", detail, flags=re.I,
+    )
+
+
+def _run_telegram(urls, quality, browser_fallback,
+                  update_ytdlp, login_method, repo_commit):
+    import asyncio
+    if login_method not in {"qr", "code"}:
+        raise ValueError("طريقة دخول Telegram غير معروفة.")
+    if update_ytdlp:
+        _install_if_needed("yt_dlp", "yt-dlp", force=True)
+
+    # Only authorization/session/state metadata lives on Drive in this mode.
+    from google.colab import drive
+    if not os.path.ismount("/content/drive"):
+        drive.mount("/content/drive", force_remount=False)
+    transfer = _load_transfer_engine(repo_commit)
+    transfer.APP_DIR.mkdir(parents=True, exist_ok=True)
+    transfer.TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+    transfer.ensure_dependencies()
+    account = transfer.load_account_config()
+    import nest_asyncio
+    nest_asyncio.apply()
+    print("📣 الوجهة: قناة Media Lite | File Transfer القديمة — بدون رفع نسخة إلى Drive.")
+    with transfer.single_run():
+        return asyncio.get_event_loop().run_until_complete(
+            _telegram_flow(urls, transfer, quality, browser_fallback, account, login_method)
+        )
+
+
 def run(urls_text, destination="Google Drive", subfolder="",
-        quality="الأصلية", browser_fallback=True, update_ytdlp=False):
+        quality="الأصلية", browser_fallback=True, update_ytdlp=False,
+        telegram_login="qr", repo_commit=None):
     """Entry point from the independent Colab Forms cell."""
     urls = _normal_urls(urls_text)
+    if destination == "Telegram":
+        if subfolder.strip():
+            print("ℹ️ اسم المجلد الفرعي يخص Google Drive فقط؛ مش هيغير قناة Telegram.")
+        return _run_telegram(
+            urls, quality, browser_fallback, update_ytdlp, telegram_login, repo_commit
+        )
+    if destination not in {"Google Drive", "Colab فقط"}:
+        raise ValueError("اختار Google Drive أو Telegram أو Colab فقط.")
     if update_ytdlp:
         _install_if_needed("yt_dlp", "yt-dlp", force=True)
     target = _get_destination(destination, subfolder)
