@@ -1005,8 +1005,25 @@ async def _upload_telegram_video(client, channel, transfer, state,
     print(f"✅ اترفع للقناة: {name} ({size / 1048576:.1f} MiB) — {kind}")
     return file
 
+def _stage_for_url(url, quality):
+    # Source downloads are shared across output formats, but not across qualities.
+    key = hashlib.sha256(f"{url}\n{quality}".encode("utf-8")).hexdigest()[:18]
+    stage = STAGING_ROOT / key
+    stage.mkdir(parents=True, exist_ok=True)
+    return stage
+
+
+def _source_files(url, stage, quality, browser_fallback):
+    existing = _media_files(stage)
+    if existing:
+        print(f"♻️ ملف الفيديو الأصلي موجود من محاولة سابقة: {len(existing)} ملف.")
+        return existing
+    return _download_url(url, stage, quality, browser_fallback, False)
+
+
 async def _telegram_flow(urls, transfer, quality, browser_fallback,
-                         account, login_method):
+                         account, login_method, fmt, show_as,
+                         audio_kbps, video_crf):
     import asyncio
     from telethon import TelegramClient
 
@@ -1036,31 +1053,38 @@ async def _telegram_flow(urls, transfer, quality, browser_fallback,
             uploader = transfer.TelegramParallelUploader(client)
             print("⚡ الرفع يستخدم محرك الـ6 اتصالات الموجود في نظام النقل.")
         else:
-            print("ℹ️ محرك الرفع المتوازي غير متوافق مع هذه الجلسة؛ Telethon سيستخدم الرفع العادي.")
+            print("ℹ️ الرفع المتوازي غير مدعوم في هذه الجلسة؛ Telethon سيستخدم المسار الاحتياطي.")
+        print(f"📋 Batch: {len(urls)} رابط • صيغة {fmt} • العرض {show_as}")
         for idx, url in enumerate(urls, 1):
-            print(f"\n━━━━━━━━━━ فيديو {idx}/{len(urls)} ━━━━━━━━━━")
+            print(f"\n━━━━━━━━━━ رابط {idx}/{len(urls)} ━━━━━━━━━━")
             print(f"🌐 الموقع: {urlparse(url).hostname}")
-            stage = STAGING_ROOT / hashlib.sha256(url.encode("utf-8")).hexdigest()[:18]
-            stage.mkdir(parents=True, exist_ok=True)
+            stage = _stage_for_url(url, quality)
             try:
-                # Keep the Telegram event loop responsive during long network downloads.
+                # Download/transcode in a worker so Telegram's event loop stays responsive.
                 files = await asyncio.to_thread(
-                    _download_url, url, stage, quality, browser_fallback, False
+                    _source_files, url, stage, quality, browser_fallback
                 )
                 if not files:
                     raise RuntimeError("لم ينتج أي ملف فيديو.")
                 for file in files:
-                    result = await _upload_telegram_video(
-                        client, channel, transfer, state, uploader, file, url, quality
+                    output, actual_fmt = await asyncio.to_thread(
+                        _prepare_file, file, stage / "prepared",
+                        fmt, audio_kbps, video_crf,
                     )
-                    success.append(result.name)
+                    uploaded = await _upload_telegram_video(
+                        client, channel, transfer, state, uploader, output,
+                        url, quality, fmt=actual_fmt, show_as=show_as,
+                        audio_kbps=audio_kbps, video_crf=video_crf,
+                    )
+                    success.append(uploaded.name)
                 shutil.rmtree(stage, ignore_errors=True)
+                print(f"✅ انتهى الرابط {idx}/{len(urls)}")
             except Exception as exc:
                 failed += 1
                 detail = _redact_error(str(exc), url)
-                print(f"❌ لم يكتمل الفيديو {idx}: {detail[:450]}")
-                print("💾 النسخة المحلية المؤقتة باقية للاستكمال داخل نفس Runtime.")
-        print(f"\n✅ انتهى: {len(success)} فيديو إلى Telegram • فشل {failed} رابط")
+                print(f"❌ فشل الرابط {idx}/{len(urls)}: {detail[:450]}")
+                print("💾 الملفات المكتملة أو الجزئية المحلية باقية في Colab للاستكمال.")
+        print(f"\n🏁 Batch: نجاح {len(success)} ملف • فشل {failed} رابط • إجمالي {len(urls)} روابط")
         print(f"📣 القناة: {transfer.CHANNEL_TITLE}")
         return success
     finally:
@@ -1082,14 +1106,15 @@ def _redact_error(detail, original_url):
 
 
 def _run_telegram(urls, quality, browser_fallback,
-                  update_ytdlp, login_method, repo_commit):
+                  update_ytdlp, login_method, repo_commit, fmt, show_as,
+                  audio_kbps, video_crf):
     import asyncio
     if login_method not in {"qr", "code"}:
         raise ValueError("طريقة دخول Telegram غير معروفة.")
     if update_ytdlp:
         _install_if_needed("yt_dlp", "yt-dlp", force=True)
 
-    # Only authorization/session/state metadata lives on Drive in this mode.
+    # No duplicate video on Drive: only Telegram auth/session/state are persisted.
     from google.colab import drive
     if not os.path.ismount("/content/drive"):
         drive.mount("/content/drive", force_remount=False)
@@ -1103,20 +1128,37 @@ def _run_telegram(urls, quality, browser_fallback,
     print("📣 الوجهة: قناة Media Lite | File Transfer القديمة — بدون رفع نسخة إلى Drive.")
     with transfer.single_run():
         return asyncio.get_event_loop().run_until_complete(
-            _telegram_flow(urls, transfer, quality, browser_fallback, account, login_method)
+            _telegram_flow(
+                urls, transfer, quality, browser_fallback, account, login_method,
+                fmt, show_as, audio_kbps, video_crf,
+            )
         )
 
 
 def run(urls_text, destination="Google Drive", subfolder="",
         quality="الأصلية", browser_fallback=True, update_ytdlp=False,
-        telegram_login="qr", repo_commit=None):
-    """Entry point from the independent Colab Forms cell."""
+        telegram_login="qr", repo_commit=None, output_format="mp4",
+        telegram_display="player", audio_kbps=96, video_crf=20):
+    """Native Colab Forms entry point. Downloads every unique URL in the batch."""
     urls = _normal_urls(urls_text)
+    fmt = FORMAT_ALIASES.get(output_format)
+    if fmt is None:
+        raise ValueError("صيغة إخراج غير معروفة.")
+    if telegram_display not in {"player", "document"}:
+        raise ValueError("طريقة عرض Telegram غير معروفة.")
+    audio_kbps = int(audio_kbps)
+    video_crf = int(video_crf)
+    if not 24 <= audio_kbps <= 192 or not 18 <= video_crf <= 32:
+        raise ValueError("Bitrate أو CRF خارج المدى المسموح.")
+    print(f"🔗 Batch Download: {len(urls)} روابط مختلفة • الصيغة {fmt}")
+
     if destination == "Telegram":
         if subfolder.strip():
-            print("ℹ️ اسم المجلد الفرعي يخص Google Drive فقط؛ مش هيغير قناة Telegram.")
+            print("ℹ️ اسم المجلد الفرعي خاص بـGoogle Drive فقط.")
         return _run_telegram(
-            urls, quality, browser_fallback, update_ytdlp, telegram_login, repo_commit
+            urls, quality, browser_fallback, update_ytdlp,
+            telegram_login, repo_commit, fmt, telegram_display,
+            audio_kbps, video_crf,
         )
     if destination not in {"Google Drive", "Colab فقط"}:
         raise ValueError("اختار Google Drive أو Telegram أو Colab فقط.")
@@ -1124,35 +1166,33 @@ def run(urls_text, destination="Google Drive", subfolder="",
         _install_if_needed("yt_dlp", "yt-dlp", force=True)
     target = _get_destination(destination, subfolder)
     print(f"📁 مكان الحفظ: {target}")
-    print("🎞️ الجودة: الأصلية حيثما توفرت؛ لن نعيد ترميز الفيديو عمدًا.")
-    print(f"🔗 عدد الروابط: {len(urls)}")
-    success = []
-    failed = 0
+    print(f"🎞️ الناتج: {fmt} | جودة المصدر: {quality}")
+    successful, failed = [], 0
     for idx, url in enumerate(urls, 1):
-        parsed = urlparse(url)
-        print(f"\n━━━━━━━━━━ فيديو {idx}/{len(urls)} ━━━━━━━━━━")
-        print(f"🌐 الموقع: {parsed.hostname or 'unknown'}")
-        stage = STAGING_ROOT / hashlib.sha256(url.encode("utf-8")).hexdigest()[:18]
-        stage.mkdir(parents=True, exist_ok=True)
+        print(f"\n━━━━━━━━━━ رابط {idx}/{len(urls)} ━━━━━━━━━━")
+        print(f"🌐 الموقع: {urlparse(url).hostname}")
+        stage = _stage_for_url(url, quality)
         try:
-            files = _download_url(url, stage, quality, browser_fallback, False)
+            files = _source_files(url, stage, quality, browser_fallback)
             if not files:
-                raise RuntimeError("لم ينتج أي ملف.")
-            copied = _save_files(files, target)
-            for file in copied:
-                print(f"✅ اتحفظ: {file.name} ({file.stat().st_size / 1048576:.1f} MiB)")
-                success.append(file)
+                raise RuntimeError("لم ينتج أي ملف فيديو.")
+            prepared = []
+            for file in files:
+                output, _kind = _prepare_file(
+                    file, stage / "prepared", fmt, audio_kbps, video_crf
+                )
+                prepared.append(output)
+            copies = _save_files(prepared, target)
+            for copied in copies:
+                print(f"✅ اتحفظ: {copied.name} ({copied.stat().st_size / 1048576:.1f} MiB)")
+                successful.append(copied)
             shutil.rmtree(stage, ignore_errors=True)
+            print(f"✅ انتهى الرابط {idx}/{len(urls)}")
         except Exception as exc:
             failed += 1
-            detail = str(exc)
-            detail = detail.replace(url, "[private video URL]")
-            detail = re.sub(
-                r"([?&](?:key|token|sig|signature|auth|access_token)=)[^&\s]+",
-                r"\1[hidden]", detail, flags=re.I,
-            )
-            print(f"❌ لم يكتمل الفيديو {idx}: {detail[:450]}")
-            print("💾 أي ملفات جزئية باقية في Colab للتكملة داخل نفس الـRuntime.")
-    print(f"\n✅ انتهى: {len(success)} ملف • فشل {failed} رابط")
+            detail = _redact_error(str(exc), url)
+            print(f"❌ فشل الرابط {idx}/{len(urls)}: {detail[:450]}")
+            print("💾 أي ملفات جزئية باقية في Colab للتكملة داخل نفس Runtime.")
+    print(f"\n🏁 Batch: نجاح {len(successful)} ملف • فشل {failed} رابط • الإجمالي {len(urls)} روابط")
     print(f"📁 الملفات المكتملة: {target}")
-    return success
+    return successful
