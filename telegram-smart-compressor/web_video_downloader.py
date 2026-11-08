@@ -3,7 +3,8 @@
 
 Supports direct video/media URLs, yt-dlp-supported page URLs, and best-effort
 Awesome Screenshot share pages. No DRM, account, or download restriction bypass.
-Downloads to Colab disk first; copying to Drive is done after a complete file.
+Downloads to Colab disk first; outputs may be remuxed/transcoded into a requested format.
+Drive copies and Telegram uploads occur only after a complete output exists.
 """
 from __future__ import annotations
 
@@ -759,15 +760,17 @@ def _prepare_file(src, output_dir, fmt, audio_kbps=96, video_crf=20):
         raise RuntimeError("الفيديو مفيهوش مسار صوتي؛ مش هنطلع ملف صامت.")
 
     video_codec = str((streams["video"] or {}).get("codec_name") or "").lower()
+    pixel_format = str((streams["video"] or {}).get("pix_fmt") or "").lower()
     audio_codec = str((streams["audio"] or {}).get("codec_name") or "").lower()
+    mp4_video_compatible = video_codec == "h264" and pixel_format == "yuv420p"
     if fmt == "mp4":
-        # Stream copy/remux on H.264 + AAC avoids a needless lossy conversion.
-        if video_codec == "h264" and audio_codec in ("aac", ""):
+        # Stream copy/remux on 8-bit H.264 + AAC avoids a needless lossy conversion.
+        if mp4_video_compatible and audio_codec in ("aac", ""):
             opts = ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
                     "-movflags", "+faststart"]
             print("⚡ الفيديو H.264/AAC بالفعل؛ إعادة تغليف MP4 بدون إعادة ضغط.")
         else:
-            video_opts = (["-c:v", "copy"] if video_codec == "h264" else
+            video_opts = (["-c:v", "copy"] if mp4_video_compatible else
                           ["-c:v", "libx264", "-preset", "veryfast", "-crf",
                            str(video_crf), "-pix_fmt", "yuv420p",
                            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"])
@@ -811,7 +814,8 @@ def _telegram_media_kind(file, fmt, show_as):
             metadata = _probe_media(file)
             v = (metadata["video"] or {}).get("codec_name")
             a = (metadata["audio"] or {}).get("codec_name")
-            if v == "h264" and a in ("aac", None):
+            if (v == "h264" and a in ("aac", None)
+                    and (metadata["video"] or {}).get("pix_fmt") == "yuv420p"):
                 return "video"
     return "document"
 
