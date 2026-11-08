@@ -8,6 +8,7 @@ dispatches the requested action. All media encoding remains in engine.py.
 from __future__ import annotations
 
 import json
+import time
 
 
 FORM_SOURCE = ("last", "form", "default")
@@ -145,8 +146,12 @@ def perform_form_action(engine, action, source, values):
     """Run/Save Default/Preview. Native Colab's Interrupt button stops runs."""
     if action not in FORM_ACTION:
         raise ValueError("الأمر المطلوب غير معروف.")
+    drive_started = time.perf_counter()
     engine.mount_drive()
+    print(f"⏱️ توصيل Google Drive: {time.perf_counter() - drive_started:.2f} ثانية")
+    settings_started = time.perf_counter()
     settings, origin = pick_studio_settings(engine, source, values)
+    print(f"⏱️ قراءة الإعدادات: {time.perf_counter() - settings_started:.2f} ثانية")
     show_settings(settings, origin)
     if source != "form":
         print("ℹ️ وضع استرجاع Drive: إعدادات الصوت والفيديو الظاهرة في الفورم مش بتتطبق.")
@@ -165,14 +170,18 @@ def perform_form_action(engine, action, source, values):
         print("👁️ معاينة فقط: لا ضغط، ولا تغيير في تفضيلات Drive.")
         return {"action": action, "settings": settings}
     if action == "save_default":
+        save_started = time.perf_counter()
         engine.save_studio_preferences(settings, save_default=True)
-        print("✅ Save as Default: اتحفظت إعداداتك المفضلة على Google Drive.")
+        print(f"⏱️ إعدادات Drive: {time.perf_counter() - save_started:.2f} ثانية")
+        print("✅ Save as Default: الإعدادات المفضلة جاهزة على Google Drive.")
         print("↩️ لاسترجاعها بعد كده اختار «الإعدادات المثبتة ⭐» من مصدر الإعدادات.")
         return {"action": action, "settings": settings}
 
+    save_started = time.perf_counter()
     engine.save_studio_preferences(settings)
     engine.apply_studio_settings(settings)
-    print("✅ اتحفظت آخر إعدادات التشغيل تلقائيًا على Google Drive.")
+    print(f"⏱️ حفظ الإعدادات: {time.perf_counter() - save_started:.2f} ثانية")
+    print("✅ آخر إعدادات التشغيل جاهزة على Google Drive؛ مفيش إعادة كتابة لو لم تتغير.")
     print("⏹️ للإيقاف: اضغط مربع إيقاف الخلية في Colab أو Runtime → Interrupt execution.")
     engine.run()
     return {"action": action, "settings": settings}
