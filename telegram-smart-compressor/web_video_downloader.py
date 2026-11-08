@@ -311,9 +311,19 @@ def _browser_media_candidates(page_url):
             try:
                 page = browser.new_page(user_agent=USER_AGENT)
                 def record(request):
-                    if _direct_media(request.url):
+                    media_path = urlparse(request.url).path.lower()
+                    if media_path.endswith((".mp4", ".m4v", ".mkv", ".webm", ".mov", ".m3u8", ".mpd")):
                         captured.append(request.url)
+                def record_response(response):
+                    try:
+                        ctype = (response.headers.get("content-type") or "").lower()
+                        if ("video/" in ctype or "application/vnd.apple.mpegurl" in ctype
+                                or "application/dash+xml" in ctype):
+                            captured.append(response.url)
+                    except Exception:
+                        pass
                 page.on("request", record)
+                page.on("response", record_response)
                 page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(3500)
                 try:
@@ -450,6 +460,8 @@ def run(urls_text, destination="Google Drive", subfolder="",
         quality="الأصلية", browser_fallback=True, update_ytdlp=False):
     """Entry point from the independent Colab Forms cell."""
     urls = _normal_urls(urls_text)
+    if update_ytdlp:
+        _install_if_needed("yt_dlp", "yt-dlp", force=True)
     target = _get_destination(destination, subfolder)
     print(f"📁 مكان الحفظ: {target}")
     print("🎞️ الجودة: الأصلية حيثما توفرت؛ لن نعيد ترميز الفيديو عمدًا.")
@@ -463,7 +475,7 @@ def run(urls_text, destination="Google Drive", subfolder="",
         stage = STAGING_ROOT / hashlib.sha256(url.encode("utf-8")).hexdigest()[:18]
         stage.mkdir(parents=True, exist_ok=True)
         try:
-            files = _download_url(url, stage, quality, browser_fallback, update_ytdlp)
+            files = _download_url(url, stage, quality, browser_fallback, False)
             if not files:
                 raise RuntimeError("لم ينتج أي ملف.")
             copied = _save_files(files, target)
@@ -473,7 +485,13 @@ def run(urls_text, destination="Google Drive", subfolder="",
             shutil.rmtree(stage, ignore_errors=True)
         except Exception as exc:
             failed += 1
-            print(f"❌ لم يكتمل الفيديو {idx}: {str(exc)[:450]}")
+            detail = str(exc)
+            detail = detail.replace(url, "[private video URL]")
+            detail = re.sub(
+                r"([?&](?:key|token|sig|signature|auth|access_token)=)[^&\s]+",
+                r"\1[hidden]", detail, flags=re.I,
+            )
+            print(f"❌ لم يكتمل الفيديو {idx}: {detail[:450]}")
             print("💾 أي ملفات جزئية باقية في Colab للتكملة داخل نفس الـRuntime.")
     print(f"\n✅ انتهى: {len(success)} ملف • فشل {failed} رابط")
     print(f"📁 الملفات المكتملة: {target}")
