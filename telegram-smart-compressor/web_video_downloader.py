@@ -300,74 +300,152 @@ def _page_media_candidates(page_url):
 
 
 def _browser_media_candidates(page_url):
-    """Optional slow fallback for JS players; no login, access or DRM bypass."""
+    """Inspect the rendered player, nested frames, and actual media requests.
+
+    This is a best-effort public share-page extractor. It does not log in to
+    unrelated accounts, bypass DRM, or override site download restrictions.
+    """
     _install_if_needed("playwright", "playwright")
     from playwright.sync_api import sync_playwright
 
     def collect():
         captured = []
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            browser = p.chromium.launch(
+                headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
             try:
-                page = browser.new_page(user_agent=USER_AGENT)
-                def record(request):
-                    media_path = urlparse(request.url).path.lower()
-                    if media_path.endswith((".mp4", ".m4v", ".mkv", ".webm", ".mov", ".m3u8", ".mpd")):
-                        captured.append(request.url)
+                context = browser.new_context(user_agent=USER_AGENT)
+                page = context.new_page()
+
+                def add_url(value):
+                    if not value or not isinstance(value, str):
+                        return
+                    value = html.unescape(value.strip().replace("\\/", "/"))
+                    if value.startswith(("blob:", "data:", "javascript:")):
+                        return
+                    absolute = urljoin(page_url, value)
+                    scheme = urlparse(absolute).scheme
+                    if scheme in ("http", "https"):
+                        captured.append(absolute)
+
+                def record_request(request):
+                    url = request.url
+                    path = urlparse(url).path.lower()
+                    if path.endswith(MEDIA_EXTENSIONS):
+                        add_url(url)
+
                 def record_response(response):
                     try:
-                        ctype = (response.headers.get("content-type") or "").lower()
-                        if ("video/" in ctype or "application/vnd.apple.mpegurl" in ctype
-                                or "application/dash+xml" in ctype):
-                            captured.append(response.url)
+                        media_type = (response.headers.get("content-type") or "").lower()
+                        if (media_type.startswith(("video/", "audio/"))
+                                or "application/vnd.apple.mpegurl" in media_type
+                                or "application/x-mpegurl" in media_type
+                                or "application/dash+xml" in media_type
+                                or "application/octet-stream" in media_type
+                                and urlparse(response.url).path.lower().endswith(FILE_EXTENSIONS)):
+                            add_url(response.url)
                     except Exception:
-                        pass
-                page.on("request", record)
+                        return
+
+                page.on("request", record_request)
                 page.on("response", record_response)
                 page.goto(page_url, wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(3500)
-                try:
-                    page.locator("video").first.evaluate(
-                        "(video) => { video.muted = true; video.play().catch(() => {}); }",
-                        timeout=3000,
-                    )
-                except Exception:
-                    pass
-                page.wait_for_timeout(4500)
-                try:
-                    sources = page.locator("video, source").evaluate_all(
-                        "(els) => els.flatMap(el => [el.currentSrc, el.src]).filter(Boolean)"
-                    )
-                    captured.extend(sources)
-                except Exception:
-                    pass
-                try:
-                    for el in page.locator('meta[property="og:video"],meta[property="og:video:url"]').all():
-                        v = el.get_attribute("content")
-                        if v:
-                            captured.append(v)
-                except Exception:
-                    pass
-                return list(dict.fromkeys(
-                    urljoin(page_url, url) for url in captured
-                    if url and not url.startswith(("blob:", "data:"))
-                ))
+
+                # Each frame (including embedded players) may own its video tag.
+                # Try ordinary video.play() and a non-navigating play button.
+                for frame in list(page.frames):
+                    try:
+                        urls = frame.evaluate("""() => {
+                          const nodes = Array.from(document.querySelectorAll(
+                            'video, source, meta[property="og:video"], meta[property="og:video:url"]'
+                          ));
+                          return nodes.flatMap(el => [
+                            el.currentSrc, el.src, el.getAttribute('src'),
+                            el.getAttribute('data-src'), el.getAttribute('content')
+                          ]).filter(Boolean);
+                        }""")
+                        for item in urls:
+                            add_url(item)
+                    except Exception:
+                        pass
+                    try:
+                        frame.evaluate("""() => {
+                          document.querySelectorAll('video').forEach(video => {
+                            video.muted = true;
+                            video.play().catch(() => {});
+                          });
+                        }""")
+                    except Exception:
+                        pass
+                    try:
+                        buttons = frame.locator(
+                            'button[aria-label*="Play" i], '
+                            'button[title*="Play" i], '
+                            '[data-testid*="play" i]'
+                        )
+                        if buttons.count():
+                            buttons.first.click(timeout=1600, no_wait_after=True)
+                    except Exception:
+                        pass
+
+                page.wait_for_timeout(7000)
+                for frame in list(page.frames):
+                    try:
+                        urls = frame.evaluate("""() => Array.from(
+                          document.querySelectorAll('video, source')
+                        ).flatMap(el => [el.currentSrc, el.src, el.getAttribute('src')])
+                         .filter(Boolean)""")
+                        for item in urls:
+                            add_url(item)
+                    except Exception:
+                        pass
+
+                unique = []
+                seen = set()
+                for candidate in captured:
+                    if candidate not in seen and candidate != page_url:
+                        unique.append(candidate)
+                        seen.add(candidate)
+                return unique[:35]
             finally:
                 browser.close()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(collect).result(timeout=90)
+        return executor.submit(collect).result(timeout=120)
 
 
 def _ensure_browser():
+    """Install browser *and Linux runtime libraries* if needed by Colab."""
     _install_if_needed("playwright", "playwright")
-    # Browser download is deferred until both generic and HTML extraction fail.
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser_exists = Path(p.chromium.executable_path).exists()
+    if browser_exists:
+        return
+    print("🌐 أول تشغيل فقط: تجهيز Chromium ومكتبات Linux اللازمة...")
     result = subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        capture_output=True, text=True, timeout=240,
+        [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+        capture_output=True, text=True, timeout=360,
     )
     if result.returncode:
-        raise RuntimeError("تعذر تجهيز متصفح استخراج الفيديو.")
+        details = (result.stderr or result.stdout or "").strip().splitlines()
+        reason = details[-1] if details else "غير معروف"
+        raise RuntimeError(f"فشل تثبيت متصفح Chromium: {reason[:250]}")
+
+
+def _install_browser_linux_dependencies():
+    """Repair missing system libraries if a cached browser cannot launch."""
+    result = subprocess.run(
+        [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+        capture_output=True, text=True, timeout=300,
+    )
+    if result.returncode:
+        details = (result.stderr or result.stdout or "").strip().splitlines()
+        reason = details[-1] if details else "غير معروف"
+        raise RuntimeError(f"فشل تجهيز مكتبات تشغيل Chromium: {reason[:250]}")
 
 
 def _unique_path(folder, filename):
@@ -428,15 +506,8 @@ def _download_url(url, stage, quality, browser_fallback, update_ytdlp):
         candidates = []
         errors.append(type(exc).__name__)
 
-    if not candidates and browser_fallback and _awesome(url):
-        try:
-            print("🌐 صفحة Awesome Screenshot ديناميكية؛ تجهيز متصفح استخراج اختياري...")
-            _ensure_browser()
-            candidates = _browser_media_candidates(url)
-        except Exception as exc:
-            errors.append(type(exc).__name__)
-            print("⚠️ تعذر استخراج الفيديو باستخدام المتصفح.")
-
+    # Try static page candidates first. A page may contain preview URLs that
+    # fail; that must not prevent the JavaScript/browser fallback.
     for candidate in candidates:
         try:
             if _direct_media(candidate):
@@ -447,11 +518,46 @@ def _download_url(url, stage, quality, browser_fallback, update_ytdlp):
         except Exception as exc:
             errors.append(type(exc).__name__)
 
+    if browser_fallback and _awesome(url):
+        browser_candidates = []
+        try:
+            print("🌐 محاولة استخراج مصدر الفيديو من مشغل Awesome Screenshot...")
+            _ensure_browser()
+            try:
+                browser_candidates = _browser_media_candidates(url)
+            except Exception as exc:
+                # A downloaded Chromium binary may lack shared libraries on Colab.
+                detail = str(exc)
+                if ("Host system is missing dependencies" in detail
+                        or "error while loading shared libraries" in detail
+                        or "libnss3" in detail):
+                    print("🔧 Chromium موجود لكن مكتبات Linux ناقصة؛ جاري تجهيزها...")
+                    _install_browser_linux_dependencies()
+                    browser_candidates = _browser_media_candidates(url)
+                else:
+                    raise
+            print(f"🔎 مشغل الصفحة: {len(browser_candidates)} رابط وسائط محتمل.")
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+            # Never print a signed URL or a private share key in an error.
+            reason = _redact_error(str(exc), url)
+            print(f"⚠️ فشل تشغيل متصفح استخراج الفيديو: {type(exc).__name__} — {reason[:280]}")
+
+        for candidate in browser_candidates:
+            try:
+                if _direct_media(candidate):
+                    if urlparse(candidate).path.lower().endswith((".m3u8", ".mpd")):
+                        return _yt_download(candidate, stage, quality, referer=url)
+                    return _direct_download(candidate, stage, referer=url)
+                return _yt_download(candidate, stage, quality, referer=url)
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+
     if _awesome(url):
         raise RuntimeError(
-            "تعذر العثور على ملف فيديو قابل للتحميل من رابط المشاركة. "
-            "لو أنت صاحب الفيديو، افتحه في Awesome Screenshot واستخدم Download "
-            "ونسخ رابط الملف المباشر إن أمكن. بعض الملفات لا تسمح بتنزيلها حسب الحساب."
+            "صفحة المشاركة لم تُرجع ملف فيديو يمكن تنزيله تلقائيًا. "
+            "لو زر Download متاح لصاحب التسجيل، استخدمه أو انسخ رابط تنزيل الملف "
+            "المباشر إلى هذه الخلية. بعض روابط المشاهدة لا تسمح بالتنزيل من حساب آخر."
         )
     raise RuntimeError("لم نتمكن من تنزيل فيديو من الرابط؛ جرّب رابط الملف المباشر أو موقعًا مدعومًا من yt-dlp.")
 
