@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-ENGINE_BUNDLE_VERSION = "5.5.8"
+ENGINE_BUNDLE_VERSION = "5.5.9"
 APP_NAME = "اضغطها | Media Lite"
 WORKSPACE_TITLE = "🗜️ اضغطها | Media Lite"
 WORKSPACE_ALIASES = {
@@ -54,7 +54,7 @@ OLD_STATE_PATH = BASE_DIR / "processed_v4.json"
 ERROR_LOG = BASE_DIR / "last_error.log"
 SESSION_PATH = BASE_DIR / "telegram_user"
 RUN_LOG_DIR = Path("/content/telegram_smart_compressor_logs")
-SCAN_LIMIT = 3000
+# Incremental cursor replaces the fixed 3000-message scan window.
 
 RUN_LOG_PATH = None
 _RUN_LOG_HANDLE = None
@@ -251,9 +251,14 @@ def load_studio_preferences():
 
 
 def save_studio_preferences(settings, *, save_default=False):
-    """Autosave last-used only when Run is pressed; explicit pin saves default."""
+    """Persist changed preferences; preserve saved timestamps on no-op runs."""
     approved = normalize_studio_settings(settings)
     record = load_studio_preferences()
+    path = studio_settings_path()
+    last_same = record["last_used"] == approved and bool(record.get("last_saved_at"))
+    default_same = record["default"] == approved and bool(record.get("default_saved_at"))
+    if path.exists() and last_same and (not save_default or default_same):
+        return record
     record["last_used"] = approved
     record["last_saved_at"] = int(time.time())
     if save_default:
@@ -495,10 +500,8 @@ def run_quiet(args, check=True):
 
 
 def ensure_dependencies():
-    """Install required modules reliably; Telegram accelerators are optional.
-
-    Never hide pip stderr: Colab Python versions and package wheels can change.
-    """
+    """Require all Telegram dependencies, including native/parallel accelerators."""
+    import importlib
     from importlib import import_module
     from importlib.metadata import version as package_version
 
@@ -513,45 +516,45 @@ def ensure_dependencies():
         except Exception:
             return False
 
-    def install(package, critical):
-        print(f"🔧 تثبيت {package}...")
-        command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
-                   "--no-input", package]
-        if package.startswith("cryptg=="):
-            command.insert(-1, "--only-binary=cryptg")
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        if result.returncode:
-            details = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()[-3500:]
-            _log_debug(f"pip failed: {package} (exit={result.returncode})\n{details}")
-            print(f"❌ تعذر تثبيت {package} (exit {result.returncode})")
-            if details:
-                print(details[-1800:])
-            if critical:
-                raise AppError("E110", f"تعذر تثبيت المكتبة الأساسية {package}. راجع رسالة pip فوق.", details)
-            print(f"⚠️ {package} مكتبة تسريع اختيارية؛ هنكمل بدونها.")
-            return False
-        return True
-
-    print("🔧 فحص أدوات التشغيل...")
-    for module, package, version in (
+    requirements = (
         ("telethon", "telethon==1.45.0", "1.45.0"),
         ("nest_asyncio", "nest_asyncio", None),
-    ):
-        if not present(module, version):
-            install(package, critical=True)
-
-    # Telethon supports a slower pure-Python path without cryptg.
-    # The downloader already falls back if parallel-download helpers are absent.
-    for module, package, required_version in (
         ("cryptg", "cryptg==0.6.0", "0.6.0"),
         ("aiofasttelethonhelper", "aiofasttelethonhelper==0.1.3", None),
         ("aiofiles", "aiofiles", None),
-    ):
-        if not present(module, required_version):
-            install(package, critical=False)
+    )
+    print("🔧 فحص أدوات التشغيل والتسريع...")
+    missing = [package for module, package, required in requirements
+               if not present(module, required)]
+    if missing:
+        print(f"🔧 تثبيت المكتبات الناقصة معًا: {', '.join(missing)}")
+        cmd = [
+            sys.executable, "-m", "pip", "install",
+            "--disable-pip-version-check", "--no-input",
+            "--only-binary=cryptg", *missing,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode:
+            details = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()[-3500:]
+            _log_debug(f"pip failed ({result.returncode}): {details}")
+            raise AppError("E110", "تعذر تثبيت كل مكتبات التشغيل والتسريع؛ لن نكمل بدون التسريع.", details)
+        importlib.invalidate_caches()
 
-    if present("cryptg", "0.6.0"):
-        print("✅ cryptg 0.6.0 جاهزة لتسريع Telegram")
+    unavailable = [package for module, package, required in requirements
+                   if not present(module, required)]
+    try:
+        parallel_module = import_module("aiofasttelethonhelper.core.transfer")
+        if not getattr(parallel_module, "ParallelTransferrer", None):
+            unavailable.append("aiofasttelethonhelper.core.transfer")
+    except Exception:
+        unavailable.append("aiofasttelethonhelper.core.transfer")
+    if unavailable:
+        raise AppError(
+            "E110",
+            "مكتبات التشغيل أو التسريع غير جاهزة بالكامل؛ توقف التشغيل بدل تنزيل بطيء.",
+            ", ".join(unavailable),
+        )
+    print("✅ Telethon وcryptg وParallel Downloader وaiofiles جاهزين.")
 
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         for command in (["apt-get", "-qq", "update"],
@@ -561,7 +564,6 @@ def ensure_dependencies():
                 details = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()[-3500:]
                 _log_debug(f"ffmpeg setup failed: {command}\n{details}")
                 raise AppError("E111", "تعذر تجهيز FFmpeg في Colab.", details)
-
 
 
 def mount_drive():
@@ -613,6 +615,14 @@ def save_json(path: Path, value):
         json.dumps(value, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def save_config_if_changed(config):
+    """Avoid repeated Drive writes for unchanged channel/config metadata."""
+    if CONFIG_PATH.exists() and load_json(CONFIG_PATH, None) == config:
+        return False
+    save_json(CONFIG_PATH, config)
+    return True
 
 
 def load_config():
@@ -722,7 +732,7 @@ def first_time_setup(config):
         api_hash=api_hash,
         phone=phone,
     )
-    save_json(CONFIG_PATH, config)
+    save_config_if_changed(config)
     print("✅ تم حفظ إعداد تيليجرام. البوكس ده مش هيظهر في التشغيلات القادمة.")
     return config
 
@@ -821,7 +831,7 @@ async def apply_channel_branding(client, channel, config):
             print("↪️ تعذر تحديث لوجو القناة الآن؛ هنكمل عادي ونجرب في التشغيل القادم.")
 
     if changed:
-        save_json(CONFIG_PATH, config)
+        save_config_if_changed(config)
 
 
 def pinned_message_html():
@@ -847,19 +857,12 @@ async def ensure_pinned_brand_message(client, channel, config):
         except Exception:
             old_instruction = None
 
-    if (
-        old_instruction
-        and config.get("workspace_pin_version") == BRANDING_VERSION
-    ):
+    if old_instruction and config.get("workspace_pin_version") == BRANDING_VERSION:
+        if getattr(old_instruction, "pinned", False):
+            return old_instruction
         try:
-            updated = await client.edit_message(
-                channel,
-                old_instruction,
-                instructions,
-                parse_mode="html",
-            )
-            await client.pin_message(channel, updated or old_instruction, notify=False)
-            return updated or old_instruction
+            await client.pin_message(channel, old_instruction, notify=False)
+            return old_instruction
         except Exception:
             old_instruction = None
 
@@ -897,7 +900,7 @@ async def ensure_pinned_brand_message(client, channel, config):
 
     config["workspace_instruction_id"] = int(instruction.id)
     config["workspace_pin_version"] = BRANDING_VERSION
-    save_json(CONFIG_PATH, config)
+    save_config_if_changed(config)
 
     if old_instruction and int(old_instruction.id) != int(instruction.id):
         try:
@@ -2104,27 +2107,29 @@ async def ensure_workspace(client, config):
                     title=WORKSPACE_TITLE,
                 )
             )
-            channel = await client.get_entity(channel)
             print(f"✅ تم تحديث اسم القناة إلى «{WORKSPACE_TITLE}».")
         except Exception:
             pass
 
     config["workspace_id"] = int(channel.id)
-    save_json(CONFIG_PATH, config)
+    save_config_if_changed(config)
 
     await apply_channel_branding(client, channel, config)
     instruction = await ensure_pinned_brand_message(client, channel, config)
 
-    try:
-        input_peer = await client.get_input_entity(channel)
-        await client(
-            functions.messages.ToggleDialogPinRequest(
-                pinned=True,
-                peer=types.InputDialogPeer(peer=input_peer),
+    if not config.get("workspace_dialog_pin_applied"):
+        try:
+            input_peer = await client.get_input_entity(channel)
+            await client(
+                functions.messages.ToggleDialogPinRequest(
+                    pinned=True,
+                    peer=types.InputDialogPeer(peer=input_peer),
+                )
             )
-        )
-    except Exception:
-        pass
+            config["workspace_dialog_pin_applied"] = True
+            save_config_if_changed(config)
+        except Exception:
+            pass
 
     if created:
         print(f"✅ تم إنشاء قناة «{WORKSPACE_TITLE}» وحفظها للاستخدام القادم.")
@@ -2132,11 +2137,23 @@ async def ensure_workspace(client, config):
 
 
 async def collect_queue(client, channel, state):
+    """Scan new messages since the last completed pass; first pass audits history."""
     processed = set(int(x) for x in state["processed_source_ids"])
     outputs = set(int(x) for x in state["output_ids"])
     commands_done = set(int(x) for x in state["command_ids"])
+    channel_id = int(channel.id)
+    cursor = (int(state.get("scan_cursor", 0) or 0)
+              if state.get("scan_channel_id") == channel_id else 0)
 
-    messages = await client.get_messages(channel, limit=SCAN_LIMIT)
+    messages = []
+    newest_id = cursor
+    # No fixed limit: failed/interrupted runs never lose pending messages.
+    async for msg in client.iter_messages(channel, min_id=cursor, limit=None):
+        messages.append(msg)
+        newest_id = max(newest_id, int(msg.id))
+
+    print(f"📨 فحص Telegram: {len(messages)} رسالة "
+          + ("من أول الأرشيف (مرة انتقالية)" if cursor == 0 else "جديدة منذ آخر فحص مكتمل"))
     by_id = {m.id: m for m in messages}
     jobs = []
     rerun_source_ids = set()
@@ -2153,7 +2170,6 @@ async def collect_queue(client, channel, state):
     for msg in reversed(messages):
         if msg.id in commands_done or not getattr(msg, "message", None) or not getattr(msg, "reply_to_msg_id", None):
             continue
-
         command = parse_rerun_command(msg.message)
         if command is None:
             continue
@@ -2164,7 +2180,6 @@ async def collect_queue(client, channel, state):
                 target = await client.get_messages(channel, ids=msg.reply_to_msg_id)
             except Exception:
                 target = None
-
         if not target or not message_media_kind(target):
             if msg.id not in state["command_ids"]:
                 state["command_ids"].append(int(msg.id))
@@ -2188,7 +2203,6 @@ async def collect_queue(client, channel, state):
             continue
         if looks_like_generated_output(msg):
             continue
-
         jobs.append(
             {
                 "source": msg,
@@ -2198,8 +2212,36 @@ async def collect_queue(client, channel, state):
                 "rerun": False,
             }
         )
+    return jobs, newest_id
 
-    return jobs
+
+def queue_needs_video_gpu(jobs, state):
+    """Avoid probing NVENC when every planned output is audio."""
+    for job in jobs:
+        msg = job["source"]
+        if message_media_kind(msg) != "video":
+            continue
+        explicit = job["profile"]
+        if explicit is not None:
+            if str(explicit).startswith("VIDEO_"):
+                return True
+            continue
+        if job["rerun"]:
+            parent = state.get("lineage", {}).get(str(msg.id), {})
+            saved = parent.get("media_settings")
+            if isinstance(saved, dict):
+                if saved.get("source") != "audio":
+                    return True
+                continue
+            replay = parent.get("profile")
+            if isinstance(replay, str):
+                if replay.startswith("VIDEO_"):
+                    return True
+                if replay.startswith("AUDIO_"):
+                    continue
+        if ACTIVE_STUDIO_SETTINGS is None or ACTIVE_STUDIO_SETTINGS["source"] != "audio":
+            return True
+    return False
 
 
 async def prepare_job(client, job, index: int, total: int):
@@ -2563,7 +2605,9 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
 
 
 async def app():
+    drive_started = time.perf_counter()
     mount_drive()
+    print(f"⏱️ فحص Google Drive: {time.perf_counter() - drive_started:.2f} ثانية")
 
     from telethon import TelegramClient
 
@@ -2588,6 +2632,7 @@ async def app():
 
     print()
     print("🔐 تسجيل الدخول إلى Telegram...")
+    login_started = time.perf_counter()
     client = TelegramClient(
         local_session_base,
         int(config["api_id"]),
@@ -2614,9 +2659,12 @@ async def app():
                 str(exc),
             )
 
+        print(f"⏱️ اتصال Telegram: {time.perf_counter() - login_started:.2f} ثانية")
+        workspace_started = time.perf_counter()
         channel, _created = await ensure_workspace(client, config)
         state = migrate_old_state(channel, state)
         print(f"✅ القناة جاهزة: {WORKSPACE_TITLE}")
+        print(f"⏱️ تجهيز القناة: {time.perf_counter() - workspace_started:.2f} ثانية")
 
         try:
             client.session.save()
@@ -2625,15 +2673,32 @@ async def app():
         if local_session_file.exists():
             shutil.copy2(local_session_file, persistent_session)
 
-        nvenc = detect_nvenc()
-        print("⚡ GPU متاح." if nvenc else "💻 هنستخدم CPU للفيديو.")
-
-        jobs = await collect_queue(client, channel, state)
+        scan_started = time.perf_counter()
+        jobs, scan_tip = await collect_queue(client, channel, state)
+        print(f"⏱️ فحص الرسائل: {time.perf_counter() - scan_started:.2f} ثانية")
         save_json(STATE_PATH, state)
 
         if not jobs:
+            state["scan_cursor"] = scan_tip
+            state["scan_channel_id"] = int(channel.id)
+            save_json(STATE_PATH, state)
             await show_recent_operations(client, channel)
             return
+
+        gpu_started = time.perf_counter()
+        if queue_needs_video_gpu(jobs, state):
+            nvenc = detect_nvenc()
+            print("⚡ GPU متاح." if nvenc else "💻 هنستخدم CPU للفيديو.")
+        else:
+            nvenc = False
+            print("🎧 لا يوجد إخراج فيديو؛ تخطينا فحص GPU.")
+        print(f"⏱️ فحص GPU: {time.perf_counter() - gpu_started:.2f} ثانية")
+        boot_started = os.environ.get("TSC_BOOT_PERF")
+        if boot_started:
+            try:
+                print(f"⏱️ إجمالي التجهيز قبل أول تنزيل: {time.perf_counter() - float(boot_started):.2f} ثانية")
+            except ValueError:
+                pass
 
         print()
         print(f"📥 الملفات المنتظرة: {len(jobs)}")
@@ -2679,6 +2744,13 @@ async def app():
         ok = sum(1 for r in results if r["ok"])
         skipped = sum(1 for r in results if r.get("skipped"))
         failed = len(results) - ok - skipped
+        if failed == 0:
+            state["scan_cursor"] = scan_tip
+            state["scan_channel_id"] = int(channel.id)
+            save_json(STATE_PATH, state)
+            print(f"✅ اكتمل فحص الرسائل حتى ID {scan_tip}.")
+        else:
+            print("ℹ️ لم نحفظ مؤشر الرسائل الجديد بسبب مهام فاشلة؛ سيعاد فحصها في التشغيل القادم.")
         original = sum(r["original"] for r in results)
         final = sum(r["final"] for r in results)
         saved_pct = ((original - final) / original * 100) if original else 0
@@ -2718,7 +2790,9 @@ async def run_async():
             log_path = None
     print(f"✅ المحرك {ENGINE_BUNDLE_VERSION}")
     try:
+        deps_started = time.perf_counter()
         await asyncio.to_thread(ensure_dependencies)
+        print(f"⏱️ تجهيز المكتبات: {time.perf_counter() - deps_started:.2f} ثانية")
         check_stop()
         await app()
         return {"stopped": False, "error": None}
@@ -2766,7 +2840,9 @@ def run():
 
     print(f"✅ المحرك {ENGINE_BUNDLE_VERSION}")
     try:
+        deps_started = time.perf_counter()
         ensure_dependencies()
+        print(f"⏱️ تجهيز المكتبات: {time.perf_counter() - deps_started:.2f} ثانية")
         import nest_asyncio
         nest_asyncio.apply()
 
