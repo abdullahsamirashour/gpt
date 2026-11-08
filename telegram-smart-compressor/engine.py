@@ -264,7 +264,6 @@ def save_studio_preferences(settings, *, save_default=False):
     if save_default:
         record["default"] = dict(approved)
         record["default_saved_at"] = record["last_saved_at"]
-    path = studio_settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.name + ".tmp")
     try:
@@ -510,8 +509,8 @@ def ensure_dependencies():
             loaded = import_module(module)
             if required_version is None:
                 return True
-            if module == "cryptg":
-                return package_version("cryptg") == required_version
+            if module in {"cryptg", "aiofasttelethonhelper"}:
+                return package_version(module) == required_version
             return getattr(loaded, "__version__", "") == required_version
         except Exception:
             return False
@@ -520,7 +519,7 @@ def ensure_dependencies():
         ("telethon", "telethon==1.45.0", "1.45.0"),
         ("nest_asyncio", "nest_asyncio", None),
         ("cryptg", "cryptg==0.6.0", "0.6.0"),
-        ("aiofasttelethonhelper", "aiofasttelethonhelper==0.1.3", None),
+        ("aiofasttelethonhelper", "aiofasttelethonhelper==0.1.3", "0.1.3"),
         ("aiofiles", "aiofiles", None),
     )
     print("🔧 فحص أدوات التشغيل والتسريع...")
@@ -2176,10 +2175,8 @@ async def collect_queue(client, channel, state):
 
         target = by_id.get(msg.reply_to_msg_id)
         if target is None:
-            try:
-                target = await client.get_messages(channel, ids=msg.reply_to_msg_id)
-            except Exception:
-                target = None
+            # Network failures must abort the scan, not discard a rerun command.
+            target = await client.get_messages(channel, ids=msg.reply_to_msg_id)
         if not target or not message_media_kind(target):
             if msg.id not in state["command_ids"]:
                 state["command_ids"].append(int(msg.id))
@@ -2555,7 +2552,7 @@ async def process_job(client, channel, state, prepared, nvenc: bool, index: int,
 
         if skipped and not job["rerun"] and msg.id not in state["processed_source_ids"]:
             state["processed_source_ids"].append(int(msg.id))
-        if command_msg and command_msg.id not in state["command_ids"]:
+        if skipped and command_msg and command_msg.id not in state["command_ids"]:
             state["command_ids"].append(int(command_msg.id))
         save_json(STATE_PATH, state)
 
