@@ -420,7 +420,9 @@ def _web_media(web, url: str, stage: Path) -> Path:
     ext = Path(urllib.parse.urlsplit(url).path).suffix.lower()
     if ext in AUDIO_SUFFIXES:
         requests = web._install_if_needed("requests", "requests")
-        target = stage / ("internet" + ext)
+        original_name = urllib.parse.unquote(Path(urllib.parse.urlsplit(url).path).name)
+        safe_original = _clean_name(original_name, "internet" + ext)
+        target = stage / safe_original
         if target.exists() and target.stat().st_size:
             return target
         partial = stage / ("download" + ext + ".part")
@@ -568,7 +570,7 @@ def _telegram_jobs(message_list, channel_id: int) -> list[dict]:
             continue
         name = str(getattr(file, "name", "") or f"Telegram_{msg.id}")
         mime = str(getattr(file, "mime_type", "") or "")
-        if not _is_media(name, mime):
+        if not _is_media(name, mime, allow_unknown=bool(getattr(msg, "audio", None) or getattr(msg, "voice", None))):
             continue
         size = int(getattr(file, "size", 0) or 0)
         if not size:
@@ -697,7 +699,14 @@ async def _process_many(jobs, transfer, engine, web, service, state, state_file,
                     print(f"📁 فولدر النتائج: {_drive_link(new_folder[0])}")
                 folder_id, folder_name = new_folder
             folder_ids.add(folder_id)
-            stem = record.get("stem") or Path(job["name"]).stem
+            print("⬇️ Fetch → Compress → Split → Drive")
+            if job["kind"] == "telegram":
+                source = await download_tg(job, stage)
+            else:
+                source = await asyncio.to_thread(_download_job, job, stage, transfer, service, web)
+            # yt-dlp supplies the real media title only after downloading.
+            stem = record.get("stem") or (Path(source).stem if job["kind"] == "internet"
+                                          else Path(job["name"]).stem)
             stem = _clean_name(stem)
             # Avoid distinct source files with the same visible name in one batch.
             if not record.get("stem"):
@@ -705,11 +714,6 @@ async def _process_many(jobs, transfer, engine, web, service, state, state_file,
                 if collision_key in used_names and used_names[collision_key] != uid:
                     stem = f"{stem}_{uid[:5]}"
                 used_names[collision_key] = uid
-            print("⬇️ Fetch → Compress → Split → Drive")
-            if job["kind"] == "telegram":
-                source = await download_tg(job, stage)
-            else:
-                source = await asyncio.to_thread(_download_job, job, stage, transfer, service, web)
             result = await asyncio.to_thread(
                 _process, job, transfer, engine, web, service, state, state_file,
                 config["settings"], config["setting_id"], config["max_bytes"],
