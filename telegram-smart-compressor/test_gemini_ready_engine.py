@@ -204,3 +204,93 @@ async def test_never_delete_before_remote_verification():
     record = {"folder_id": "folder123", "parts": [{"id": "missing", "size": 25, "md5": "xx"}]}
     assert not await gr._maybe_delete(client, channel, message, service, record)
     assert client.deleted == []
+
+
+def test_settings_follow_original_studio_defaults():
+    class Original:
+        STUDIO_FACTORY_SETTINGS = {"source": "auto", "audio_preset": "speech", "audio_codec": "opus",
+                                   "audio_kbps": 24, "audio_channels": "mono", "audio_sample_rate": "24000",
+                                   "audio_noise": "off", "skip_if_no_saving": True}
+        STUDIO_AUDIO_PRESETS = {
+            "speech": {"audio_codec": "opus", "audio_kbps": 24, "audio_channels": "mono",
+                       "audio_sample_rate": "24000", "audio_noise": "off"},
+            "clear": {"audio_codec": "opus", "audio_kbps": 32, "audio_channels": "mono",
+                      "audio_sample_rate": "48000", "audio_noise": "off"},
+        }
+        @staticmethod
+        def normalize_studio_settings(config):
+            return config
+    normal = gr._settings(Original, "speech", False, "mp3", 128, "stereo", "48000", "light")
+    assert normal["audio_codec"] == "opus" and normal["audio_kbps"] == 24
+    assert normal["audio_sample_rate"] == "24000"
+    assert normal["skip_if_no_saving"] is False
+    custom = gr._settings(Original, "speech", True, "mp3", 64, "mono", "24000", "off")
+    assert custom["audio_codec"] == "mp3" and custom["audio_kbps"] == 64
+
+
+def test_bad_types_are_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        gr._required_part_count(1_000_000, 5_000)
+    with pytest.raises(ValueError):
+        gr.split_audio(tmp_path / "missing.mp3", tmp_path / "out", 9_000_000)
+
+
+def test_telegram_classifies_voice_and_unknown_extension():
+    voice_file = SimpleNamespace(name="Lecture 123", size=1234567, mime_type="application/octet-stream")
+    msg = SimpleNamespace(id=9, file=voice_file, audio=True, voice=False)
+    items = gr._telegram_jobs([msg], channel_id=99)
+    assert len(items) == 1
+    assert items[0]["key"] == "telegram:99:9:1234567"
+    assert items[0]["name"].startswith("Lecture 123")
+
+
+def test_manifest_creation_and_update(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    monkeypatch.setattr(gr, "WORK_DIR", tmp_path / "work")
+    library = types.ModuleType("googleapiclient")
+    library.__path__ = []
+    http = types.ModuleType("googleapiclient.http")
+
+    class MediaFileUpload:
+        def __init__(self, filename, **kwargs):
+            self.filename = filename
+
+    http.MediaFileUpload = MediaFileUpload
+    monkeypatch.setitem(sys.modules, "googleapiclient", library)
+    monkeypatch.setitem(sys.modules, "googleapiclient.http", http)
+
+    class Files:
+        def __init__(self):
+            self.stored = {}
+            self.actions = []
+
+        def list(self, **kwargs):
+            return FakeRequest(lambda: {"files": [{"id": "manifest_id"}] if self.stored else []})
+
+        def create(self, body, media_body, **kwargs):
+            return FakeRequest(lambda: self._write("create", media_body))
+
+        def update(self, fileId, media_body, **kwargs):
+            assert fileId == "manifest_id"
+            return FakeRequest(lambda: self._write("update", media_body))
+
+        def _write(self, action, upload):
+            data = Path(upload.filename).read_bytes()
+            self.stored["manifest_id"] = data
+            self.actions.append(action)
+            return {"id": "manifest_id", "size": len(data),
+                    "md5Checksum": hashlib.md5(data).hexdigest()}
+
+    files = Files()
+    service = SimpleNamespace(files=lambda: files)
+    state = {"items": {"entry1": {"done": True, "folder_id": "folderABC", "name": "Lecture.ogg",
+                                  "completed_at": "2026-01-01", "parts": [
+                                      {"name": "Lecture-pt01.ogg", "size": 18000, "duration": 10.1}]}}}
+    gr._publish_manifest(service, state, "folderABC")
+    assert files.actions == ["create"]
+    obj = json.loads(files.stored["manifest_id"].decode())
+    assert obj["files"][0]["outputs"][0]["name"] == "Lecture-pt01.ogg"
+    gr._publish_manifest(service, state, "folderABC")
+    assert files.actions == ["create", "update"]
