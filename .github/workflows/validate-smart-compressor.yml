@@ -387,7 +387,7 @@ jobs:
                   "command_ids": [],
                   "lineage": {},
               }
-              jobs = await engine.collect_queue(FakeClient(messages), object(), state)
+              jobs = await engine.collect_queue(FakeClient(messages), Obj(id=123), state)
               compact = [(j["source"].id, j["rerun"], j["profile"]) for j in jobs]
               assert compact == [
                   (2, True, "VIDEO_SMALLEST"),
