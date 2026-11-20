@@ -244,6 +244,204 @@ def test_telegram_classifies_voice_and_unknown_extension():
     assert items[0]["name"].startswith("Lecture 123")
 
 
+
+def _smart_options(settings, max_bytes, mode="smart", max_minutes=0, advanced=False):
+    return {
+        "settings": settings, "setting_id": gr._settings_signature(
+            settings, max_bytes / 1_000_000, max_minutes, mode, advanced),
+        "max_bytes": max_bytes, "max_minutes": max_minutes, "max_files": 10,
+        "force": False, "delete_tg": False, "batch": "Ortho Tests",
+        "preparation_mode": mode, "advanced_audio": advanced,
+    }
+
+
+def _local_job(path: Path, prefix="drive:fixture"):
+    return {"kind": "drive", "key": prefix, "name": "Ortho Lesson" + path.suffix,
+            "size": path.stat().st_size,
+            "meta": {"id": prefix, "name": path.name,
+                     "size": str(path.stat().st_size), "local_fixture": path}}
+
+
+def test_smart_preserves_small_ogg_and_remote_md5(sample_audio, tmp_path, monkeypatch):
+    monkeypatch.setattr(gr, "WORK_DIR", tmp_path / "work")
+    transfer, service = FakeTransfer(tmp_path), FakeService()
+    state_path = tmp_path / "state.json"
+    state = gr._read_state(state_path)
+
+    def should_not_encode(*_a, **_kw):
+        raise AssertionError("Smart path should not invoke lossy encoder")
+
+    monkeypatch.setattr(FakeEngine, "encode_audio", staticmethod(should_not_encode))
+    job = _local_job(sample_audio)
+    settings = {"audio_codec": "opus", "audio_kbps": 24}
+    result = asyncio.run(gr._process_many(
+        [job], transfer, FakeEngine, None, service, state, state_path,
+        _smart_options(settings, 9_000_000)))
+    assert result["ok"] == 1 and result["failed"] == 0
+    entry = next(iter(state["items"].values()))
+    assert entry["preparation"] == "kept"
+    assert entry["parts"][0]["name"] == "Ortho Lesson.ogg"
+    assert entry["parts"][0]["md5"] == hashlib.md5(sample_audio.read_bytes()).hexdigest()
+    assert gr._record_verified(service, entry)
+    assert transfer.uploads == 1 and transfer.downloads == 1
+
+
+def test_smart_splits_large_mp3_without_reencoding(sample_audio, tmp_path, monkeypatch):
+    encoded = tmp_path / "original.mp3"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(sample_audio),
+                    "-c:a", "libmp3lame", "-b:a", "64k", str(encoded)], check=True)
+    monkeypatch.setattr(gr, "WORK_DIR", tmp_path / "work")
+    transfer, service = FakeTransfer(tmp_path), FakeService()
+    state_path = tmp_path / "state.json"
+    state = gr._read_state(state_path)
+    def should_not_encode(*_a, **_kw):
+        raise AssertionError("Split should be stream-copy, not lossy encode")
+    monkeypatch.setattr(FakeEngine, "encode_audio", staticmethod(should_not_encode))
+    result = asyncio.run(gr._process_many(
+        [_local_job(encoded)], transfer, FakeEngine, None, service, state, state_path,
+        _smart_options({"audio_codec": "opus", "audio_kbps": 24}, 240_000)))
+    assert result["ok"] == 1 and result["failed"] == 0
+    entry = next(iter(state["items"].values()))
+    assert entry["preparation"] == "kept"
+    assert 2 <= len(entry["parts"]) <= gr.SMART_MAX_COPY_PARTS
+    assert all(p["name"].endswith(".mp3") and p["size"] < 240_000
+               for p in entry["parts"])
+    assert gr._record_verified(service, entry)
+
+
+def test_fast_audio_extraction_from_mp4_without_lossy_encode(tmp_path):
+    src = tmp_path / "lecture.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y",
+                    "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=8:duration=3",
+                    "-f", "lavfi", "-i", "sine=frequency=620:sample_rate=24000:duration=3",
+                    "-map", "0:v", "-map", "1:a", "-c:v", "libx264",
+                    "-preset", "ultrafast", "-c:a", "aac", "-b:a", "64k",
+                    str(src)], check=True, timeout=30)
+    prepared, reason = gr._fast_prepare_audio(
+        src, tmp_path, 9_000_000, 0, "smart", False, 24)
+    assert prepared is not None and prepared.suffix == ".m4a"
+    info = gr._media_probe(prepared)
+    assert info["valid"] and not info["video"] and info["codec"] == "aac"
+    assert "بدون إعادة ترميز" in reason
+    assert abs(info["duration"] - gr._duration(src)) < 1.5
+
+
+def test_smart_oversized_wav_falls_back_to_encoder(sample_audio, tmp_path):
+    wav = tmp_path / "lecture.wav"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(sample_audio),
+                    "-t", "10", "-c:a", "pcm_s16le", str(wav)], check=True)
+    chosen, reason = gr._fast_prepare_audio(
+        wav, tmp_path, 100_000, 0, "smart", False, 24)
+    assert chosen is None
+    assert "الصيغة" in reason
+    chosen_small, _ = gr._fast_prepare_audio(
+        wav, tmp_path, 9_000_000, 0, "smart", False, 24)
+    assert chosen_small == wav
+
+
+def test_advanced_audio_and_always_mode_override_smart(sample_audio, tmp_path):
+    ready, _ = gr._fast_prepare_audio(
+        sample_audio, tmp_path, 9_000_000, 0, "smart", False, 24)
+    assert ready == sample_audio
+    manual, reason = gr._fast_prepare_audio(
+        sample_audio, tmp_path, 9_000_000, 0, "smart", True, 24)
+    assert manual is None and "Advanced" in reason
+    legacy, reason = gr._fast_prepare_audio(
+        sample_audio, tmp_path, 9_000_000, 0, "always", False, 24)
+    assert legacy is None and "Always" in reason
+
+
+def test_large_high_bitrate_chooses_smart_encode_but_preserve_copies(
+        sample_audio, tmp_path):
+    mp3 = tmp_path / "long.mp3"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(sample_audio),
+                    "-c:a", "libmp3lame", "-b:a", "128k", str(mp3)], check=True)
+    max_bytes = 150_000
+    smart, msg = gr._fast_prepare_audio(
+        mp3, tmp_path, max_bytes, 0, "smart", False, 24)
+    original, _ = gr._fast_prepare_audio(
+        mp3, tmp_path, max_bytes, 0, "preserve", False, 24)
+    assert smart is None and "أجزاء" in msg
+    assert original == mp3
+
+
+def test_multi_audio_stream_prevents_unsafe_direct_copy(tmp_path):
+    src = tmp_path / "twoaudio.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y",
+                    "-f", "lavfi", "-i", "sine=frequency=500:duration=2",
+                    "-f", "lavfi", "-i", "sine=frequency=700:duration=2",
+                    "-map", "0:a", "-map", "1:a", "-c:a", "aac", str(src)],
+                   check=True, timeout=30)
+    selected, _ = gr._fast_prepare_audio(
+        src, tmp_path, 9_000_000, 0, "smart", False, 24)
+    assert selected is None
+
+
+def test_mode_receipts_are_isolated_and_old_telegram_not_reprocessed():
+    settings = {"audio_preset": "speech", "audio_codec": "opus", "audio_kbps": 24,
+                "audio_channels": "mono", "audio_sample_rate": "24000", "audio_noise": "off"}
+    signatures = {gr._settings_signature(settings, 9, 0, mode)
+                  for mode in gr.SMART_MODES}
+    assert len(signatures) == 3
+    job = {"key": "telegram:12:5:10000"}
+    state = {"items": {"prior": {"source_key": job["key"], "done": True,
+                                "settings": "old-sig"}}}
+    assert gr._done_in_any_mode(state, job)
+    assert not gr._done(state, job, "new-smart-settings")
+
+
+def test_preview_skips_web_and_ffmpeg_for_internet(tmp_path, monkeypatch):
+    import contextlib
+    import sys
+    import types
+
+    class PresetEngine:
+        STUDIO_FACTORY_SETTINGS = {
+            "source": "auto", "audio_preset": "speech", "audio_codec": "opus",
+            "audio_kbps": 24, "audio_channels": "mono",
+            "audio_sample_rate": "24000", "audio_noise": "off",
+            "skip_if_no_saving": True,
+        }
+        STUDIO_AUDIO_PRESETS = {
+            "speech": {"audio_codec": "opus", "audio_kbps": 24,
+                       "audio_channels": "mono", "audio_sample_rate": "24000",
+                       "audio_noise": "off"},
+        }
+
+        @staticmethod
+        def normalize_studio_settings(config):
+            return config
+
+    class PreviewTransfer:
+        BASE_DIR = tmp_path / "transfer"
+
+        @staticmethod
+        def connect_drive():
+            return FakeService()
+
+        @staticmethod
+        def single_run():
+            return contextlib.nullcontext()
+
+    loaded = []
+    def fake_component(commit, name):
+        loaded.append(name)
+        if name == "transfer_engine.py":
+            return PreviewTransfer
+        if name == "engine.py":
+            return PresetEngine
+        raise AssertionError("Preview unexpectedly loaded: " + name)
+
+    monkeypatch.setattr(gr, "_component", fake_component)
+    monkeypatch.setitem(sys.modules, "googleapiclient",
+                        types.ModuleType("googleapiclient"))
+    result = gr.run(source="internet", links="https://example.org/lecture.mp3",
+                    action="preview", repo_commit="a" * 40)
+    assert result["ok"] == 0 and result["failed"] == 0
+    assert loaded == ["transfer_engine.py", "engine.py"]
+
+
+
 def test_manifest_creation_and_update(tmp_path, monkeypatch):
     import sys
     import types
