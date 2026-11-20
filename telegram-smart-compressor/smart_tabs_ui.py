@@ -496,7 +496,7 @@ class SmartTabs:
                 max_minutes=v["اقصى_مدة_للجزء_بالدقائق"],
                 force_reprocess=v["إعادة_معالجة_المكتمل"], repo_commit=commit,
             )
-        print("✅ انتهى تنفيذ الأداة المختارة.")
+        print("ℹ️ انتهى تشغيل الأداة؛ راجع ملخص النتائج وأي أخطاء أعلاه.")
         return result
 
     def _sha(self):
