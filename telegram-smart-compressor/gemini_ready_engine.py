@@ -621,33 +621,70 @@ def _fast_prepare_audio(source: Path, stage: Path, max_bytes: int,
 
 def _process(job: dict, transfer, engine, web, service, state: dict, state_file: Path,
              settings: dict, setting_id: str, max_bytes: int, max_minutes: int,
-             folder_id: str, folder_name: str, stem: str, source_path: Path) -> dict:
+             folder_id: str, folder_name: str, stem: str, source_path: Path,
+             mode: str = "always", advanced_audio: bool = False) -> dict:
+    if mode not in SMART_MODES:
+        raise ValueError("Audio Preparation Mode غير معروف.")
     uid = _hash(job["key"] + ":" + setting_id)
     record = state["items"].setdefault(uid, {})
     record.update({"source_key": job["key"], "name": job["name"], "folder_id": folder_id,
-                   "folder_name": folder_name, "stem": stem, "settings": setting_id, "done": False})
+                   "folder_name": folder_name, "stem": stem, "settings": setting_id,
+                   "preparation_mode": mode, "done": False})
     _save_state(state_file, state)
     stage = source_path.parent
-    output = stage / ("compressed" + OUTPUT_SUFFIXES[settings["audio_codec"]])
-    if output.exists() and output.stat().st_size:
-        try:
-            engine.ffprobe(output)
-        except Exception:
-            output.unlink(missing_ok=True)
-    if not output.exists():
-        info = engine.ffprobe(source_path)
-        if not info.has_audio or info.duration <= 0:
-            raise RuntimeError("الملف المصدر لا يحتوي مسار صوت صالحًا.")
-        print(f"🎚️ Compress: {settings['audio_codec'].upper()} {settings['audio_kbps']} kbps")
-        incomplete = stage / ("pending" + output.suffix)
-        incomplete.unlink(missing_ok=True)
-        engine.encode_audio(source_path, incomplete, info, settings=settings)
-        if incomplete.stat().st_size == 0:
-            raise RuntimeError("فشل إنشاء ملف صوتي مضغوط.")
-        os.replace(incomplete, output)
-    parts = split_audio(output, stage / "segments", max_bytes, max_minutes)
-    names = _output_names(stem, settings["audio_codec"], len(parts))
+    chosen, reason = _fast_prepare_audio(
+        source_path, stage, max_bytes, max_minutes, mode,
+        advanced_audio, int(settings["audio_kbps"]))
+
+    def encode() -> Path:
+        output = stage / ("compressed" + OUTPUT_SUFFIXES[settings["audio_codec"]])
+        if output.exists() and output.stat().st_size:
+            try:
+                info = engine.ffprobe(output)
+                if not info.has_audio or info.duration <= 0:
+                    raise ValueError("invalid cached compressed file")
+            except Exception:
+                output.unlink(missing_ok=True)
+        if not output.exists():
+            info = engine.ffprobe(source_path)
+            if not info.has_audio or info.duration <= 0:
+                raise RuntimeError("الملف المصدر لا يحتوي مسار صوت صالحًا.")
+            print(f"🎚️ Encode: {settings['audio_codec'].upper()} {settings['audio_kbps']} kbps")
+            pending = stage / ("pending" + output.suffix)
+            pending.unlink(missing_ok=True)
+            try:
+                engine.encode_audio(source_path, pending, info, settings=settings)
+                if not pending.is_file() or pending.stat().st_size == 0:
+                    raise RuntimeError("فشل إنشاء ملف صوتي مضغوط.")
+                os.replace(pending, output)
+            finally:
+                pending.unlink(missing_ok=True)
+        return output
+
+    if chosen is None:
+        print(f"🎚️ {reason} → Encode")
+        output = encode()
+        preparation = "encoded"
+    else:
+        output = chosen
+        preparation = "kept" if output == source_path else "remuxed"
+        print(f"⚡ {reason}: {output.stat().st_size / 1_000_000:.2f} MB")
+
+    try:
+        parts = split_audio(output, stage / "segments", max_bytes, max_minutes)
+    except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        # A copy-only split may fail for unusual packet timestamps; fall back
+        # to the established encoder rather than silently dropping a lecture.
+        if preparation == "encoded":
+            raise
+        print(f"↪️ تقسيم بدون ضغط لم ينجح ({type(exc).__name__})؛ إعادة ترميز آمنة.")
+        output = encode()
+        preparation = "encoded"
+        parts = split_audio(output, stage / "segments", max_bytes, max_minutes)
+
+    names = _output_names(stem, settings["audio_codec"], len(parts), output.suffix.lower())
     print(f"✂️ ناتج {output.stat().st_size / 1_000_000:.2f} MB → {len(parts)} ملف")
+    record["preparation"] = preparation
     receipts = []
     for i, (part, name) in enumerate(zip(parts, names), 1):
         key = f"GR{uid}P{i:04d}"
