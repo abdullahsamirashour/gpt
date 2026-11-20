@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Media Lite Smart Tabs UI for Colab.
 
-All 68 original #@param fields are preserved (same underlying values).
+All 68 original #@param fields are preserved, plus one Gemini mode.
 UI construction is lazy and side-effect-free: only pressing the native
 Run cell executes any transfer, encoding, deletion or Drive mounting.
 Engines are loaded from one pinned Git commit per runtime.
@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 from html import escape
 
-FIELD_SCHEMA = json.loads(r'''{"compress":[{"key":"العملية","type":"choice","default":"▶ تشغيل الضغط","choices":["▶ تشغيل الضغط","💾 Save as Default — حفظ فقط","👁️ معاينة الإعدادات فقط"]},{"key":"مصدر_الإعدادات","type":"choice","default":"📝 تطبيق حقول الفورم الظاهرة","choices":["📝 تطبيق حقول الفورم الظاهرة","☁️ استرجاع آخر تشغيل (يتجاهل الحقول الظاهرة)","⭐ استرجاع الافتراضي المثبّت (يتجاهل الحقول الظاهرة)"]},{"key":"نوع_المحتوى","type":"choice","default":"تلقائي — حسب الملف","choices":["تلقائي — حسب الملف","🎧 صوت فقط — حتى الفيديو يتحول لصوت","🎬 فيديو — احتفظ بالصورة"]},{"key":"وضع_الصوت","type":"choice","default":"محاضرات واضحة (24 kbps)","choices":["محاضرات واضحة (24 kbps)","وضوح أعلى (32 kbps)","أصغر حجم (8 kbps)","موسيقى / صوت غني (96 kbps)"]},{"key":"وضع_الفيديو","type":"choice","default":"متوازن","choices":["متوازن","شرح وكتابة أوضح","أصغر حجم","أسرع معالجة"]},{"key":"تخطي_الملف_بدون_توفير_مفيد","type":"boolean","default":true},{"key":"تفعيل_Advanced_للصوت","type":"boolean","default":false},{"key":"صيغة_الصوت","type":"choice","default":"Opus / OGG","choices":["Opus / OGG","AAC / M4A","MP3"]},{"key":"جودة_الصوت_kbps","type":"choice","default":"24","choices":["8","12","16","24","32","48","64","96","128","160","192"]},{"key":"قنوات_الصوت","type":"choice","default":"Mono","choices":["Mono","Stereo"]},{"key":"Sample_Rate_Hz","type":"choice","default":"24000","choices":["auto","12000","16000","24000","48000"]},{"key":"إزالة_الضوضاء","type":"choice","default":"Off","choices":["Off","Light"]},{"key":"تفعيل_Advanced_للفيديو","type":"boolean","default":false},{"key":"صيغة_الفيديو","type":"choice","default":"H.264 (الأكثر توافقًا)","choices":["H.264 (الأكثر توافقًا)","H.265 (HEVC)"]},{"key":"دقة_الفيديو","type":"choice","default":"720","choices":["source","480","540","720","1080"]},{"key":"فريمات_الفيديو","type":"choice","default":"auto","choices":["auto","source","12","15","24","30"]},{"key":"نوع_التحكم_في_الجودة","type":"choice","default":"جودة CRF","choices":["جودة CRF","Bitrate يدوي","حجم مستهدف"]},{"key":"جودة_CRF","type":"slider","default":28,"min":18,"max":35,"step":1},{"key":"Video_Bitrate_kbps","type":"integer","default":1400},{"key":"الحجم_المستهدف_MiB","type":"integer","default":80},{"key":"سرعة_ترميز_الفيديو","type":"choice","default":"متوازن","choices":["سريع","متوازن","أبطأ / ملف أصغر غالبًا"]},{"key":"صوت_الفيديو_kbps","type":"choice","default":"64","choices":["32","40","48","64","96","128","160","192"]}],"drive_tg":[{"key":"رابط_Drive","type":"string","default":""},{"key":"هاشتاج_الملفات","type":"string","default":""},{"key":"عدد_الملفات","type":"integer","default":0},{"key":"ارقام_الملفات_لإعادة_الرفع","type":"string","default":""},{"key":"شامل_المجلدات_الفرعية","type":"boolean","default":true},{"key":"طريقة_الدخول","type":"choice","default":"QR بدون كود","choices":["QR بدون كود","كود داخل Telegram"]},{"key":"التشغيل","type":"choice","default":"معاينة فقط","choices":["معاينة فقط","تنفيذ النقل","إعادة رفع المحدد"]}],"tg_drive":[{"key":"قناة_Telegram_المصدر","type":"string","default":""},{"key":"فولدر_Drive_للحفظ","type":"string","default":""},{"key":"اسم_الفولدر_الفرعي","type":"string","default":""},{"key":"اعادة_نسخ_المنقول_سابقا","type":"boolean","default":false},{"key":"حذف_رسائل_Telegram_بعد_التحقق","type":"boolean","default":true},{"key":"عدد_الملفات","type":"integer","default":0},{"key":"طريقة_الدخول","type":"choice","default":"QR بدون كود","choices":["QR بدون كود","كود داخل Telegram"]},{"key":"التشغيل","type":"choice","default":"معاينة فقط","choices":["معاينة فقط","تنفيذ النقل"]}],"web":[{"key":"روابط_الفيديو","type":"string","default":""},{"key":"جودة_الفيديو","type":"choice","default":"الأصلية","choices":["الأصلية","1080p","720p","480p"]},{"key":"صيغة_الناتج","type":"choice","default":"🎬 فيديو MP4 (H.264/AAC — Telegram Preview)","choices":["🎬 فيديو MP4 (H.264/AAC — Telegram Preview)","🎞️ فيديو WebM (VP9/Opus)","🎵 صوت MP3","🎵 صوت M4A (AAC)","🎵 صوت OGG (Opus)","📦 أرشيف ZIP للملف الأصلي","📄 الملف الأصلي بدون تحويل"]},{"key":"Bitrate_الصوت_kbps","type":"choice","default":"96","choices":["24","32","48","64","96","128","160","192"]},{"key":"OGG_بدون_إعادة_ترميز_إن_أمكن","type":"boolean","default":false},{"key":"جودة_تحويل_MP4_CRF","type":"slider","default":20,"min":18,"max":32,"step":1},{"key":"مكان_الحفظ","type":"choice","default":"Google Drive","choices":["Google Drive","Telegram","Colab فقط"]},{"key":"عرض_Telegram","type":"choice","default":"▶️ معاينة ومشغّل (عند دعم الصيغة)","choices":["▶️ معاينة ومشغّل (عند دعم الصيغة)","📄 ملف Document بدون معاينة"]},{"key":"مجلد_فرعي","type":"string","default":""},{"key":"دخول_Telegram","type":"choice","default":"QR بدون كود","choices":["QR بدون كود","كود داخل Telegram"]},{"key":"استخراج_متقدم_لروابط_Awesome","type":"boolean","default":true},{"key":"تحديث_yt_dlp","type":"boolean","default":false}],"gemini":[{"key":"العملية","type":"choice","default":"👁️ معاينة فقط","choices":["👁️ معاينة فقط","▶ تجهيز ورفع إلى Drive"]},{"key":"المصدر","type":"choice","default":"📣 Telegram — قناة Media Lite","choices":["📣 Telegram — قناة Media Lite","📁 Google Drive Folder","🔗 Google Drive Links","🌐 Internet URLs"]},{"key":"روابط_المصدر","type":"string","default":""},{"key":"اسم_الدفعة","type":"string","default":""},{"key":"عدد_الملفات","type":"integer","default":10},{"key":"شامل_مجلدات_Drive_الفرعية","type":"boolean","default":true},{"key":"وضع_الصوت","type":"choice","default":"محاضرات واضحة (24 kbps)","choices":["محاضرات واضحة (24 kbps)","وضوح أعلى (32 kbps)","أصغر حجم (8 kbps)","موسيقى / صوت غني (96 kbps)"]},{"key":"اقصى_حجم_للجزء_MB","type":"number","default":9},{"key":"اقصى_مدة_للجزء_بالدقائق","type":"integer","default":0},{"key":"اختيار_ملفات_Telegram","type":"choice","default":"الملفات الجديدة غير المعالجة","choices":["الملفات الجديدة غير المعالجة","أحدث عدد من الملفات"]},{"key":"حذف_رسائل_Telegram_بعد_التحقق","type":"boolean","default":true},{"key":"طريقة_دخول_Telegram","type":"choice","default":"QR بدون كود","choices":["QR بدون كود","كود داخل Telegram"]},{"key":"إعادة_معالجة_المكتمل","type":"boolean","default":false},{"key":"تفعيل_Advanced_Audio","type":"boolean","default":false},{"key":"صيغة_الصوت","type":"choice","default":"Opus / OGG","choices":["Opus / OGG","AAC / M4A","MP3"]},{"key":"Audio_Bitrate_kbps","type":"choice","default":"24","choices":["8","12","16","24","32","48","64","96","128","160","192"]},{"key":"قنوات_الصوت","type":"choice","default":"Mono","choices":["Mono","Stereo"]},{"key":"Audio_Sample_Rate_Hz","type":"choice","default":"24000","choices":["auto","12000","16000","24000","48000"]},{"key":"إزالة_الضوضاء","type":"choice","default":"Off","choices":["Off","Light"]}]}''')
+FIELD_SCHEMA = json.loads(r'''{"compress":[{"key":"العملية","type":"choice","default":"▶ تشغيل الضغط","choices":["▶ تشغيل الضغط","💾 Save as Default — حفظ فقط","👁️ معاينة الإعدادات فقط"]},{"key":"مصدر_الإعدادات","type":"choice","default":"📝 تطبيق حقول الفورم الظاهرة","choices":["📝 تطبيق حقول الفورم الظاهرة","☁️ استرجاع آخر تشغيل (يتجاهل الحقول الظاهرة)","⭐ استرجاع الافتراضي المثبّت (يتجاهل الحقول الظاهرة)"]},{"key":"نوع_المحتوى","type":"choice","default":"تلقائي — حسب الملف","choices":["تلقائي — حسب الملف","🎧 صوت فقط — حتى الفيديو يتحول لصوت","🎬 فيديو — احتفظ بالصورة"]},{"key":"وضع_الصوت","type":"choice","default":"محاضرات واضحة (24 kbps)","choices":["محاضرات واضحة (24 kbps)","وضوح أعلى (32 kbps)","أصغر حجم (8 kbps)","موسيقى / صوت غني (96 kbps)"]},{"key":"وضع_الفيديو","type":"choice","default":"متوازن","choices":["متوازن","شرح وكتابة أوضح","أصغر حجم","أسرع معالجة"]},{"key":"تخطي_الملف_بدون_توفير_مفيد","type":"boolean","default":true},{"key":"تفعيل_Advanced_للصوت","type":"boolean","default":false},{"key":"صيغة_الصوت","type":"choice","default":"Opus / OGG","choices":["Opus / OGG","AAC / M4A","MP3"]},{"key":"جودة_الصوت_kbps","type":"choice","default":"24","choices":["8","12","16","24","32","48","64","96","128","160","192"]},{"key":"قنوات_الصوت","type":"choice","default":"Mono","choices":["Mono","Stereo"]},{"key":"Sample_Rate_Hz","type":"choice","default":"24000","choices":["auto","12000","16000","24000","48000"]},{"key":"إزالة_الضوضاء","type":"choice","default":"Off","choices":["Off","Light"]},{"key":"تفعيل_Advanced_للفيديو","type":"boolean","default":false},{"key":"صيغة_الفيديو","type":"choice","default":"H.264 (الأكثر توافقًا)","choices":["H.264 (الأكثر توافقًا)","H.265 (HEVC)"]},{"key":"دقة_الفيديو","type":"choice","default":"720","choices":["source","480","540","720","1080"]},{"key":"فريمات_الفيديو","type":"choice","default":"auto","choices":["auto","source","12","15","24","30"]},{"key":"نوع_التحكم_في_الجودة","type":"choice","default":"جودة CRF","choices":["جودة CRF","Bitrate يدوي","حجم مستهدف"]},{"key":"جودة_CRF","type":"slider","default":28,"min":18,"max":35,"step":1},{"key":"Video_Bitrate_kbps","type":"integer","default":1400},{"key":"الحجم_المستهدف_MiB","type":"integer","default":80},{"key":"سرعة_ترميز_الفيديو","type":"choice","default":"متوازن","choices":["سريع","متوازن","أبطأ / ملف أصغر غالبًا"]},{"key":"صوت_الفيديو_kbps","type":"choice","default":"64","choices":["32","40","48","64","96","128","160","192"]}],"drive_tg":[{"key":"رابط_Drive","type":"string","default":""},{"key":"هاشتاج_الملفات","type":"string","default":""},{"key":"عدد_الملفات","type":"integer","default":0},{"key":"ارقام_الملفات_لإعادة_الرفع","type":"string","default":""},{"key":"شامل_المجلدات_الفرعية","type":"boolean","default":true},{"key":"طريقة_الدخول","type":"choice","default":"QR بدون كود","choices":["QR بدون كود","كود داخل Telegram"]},{"key":"التشغيل","type":"choice","default":"معاينة فقط","choices":["معاينة فقط","تنفيذ النقل","إعادة رفع المحدد"]}],"tg_drive":[{"key":"قناة_Telegram_المصدر","type":"string","default":""},{"key":"فولدر_Drive_للحفظ","type":"string","default":""},{"key":"اسم_الفولدر_الفرعي","type":"string","default":""},{"key":"اعادة_نسخ_المنقول_سابقا","type":"boolean","default":false},{"key":"حذف_رسائل_Telegram_بعد_التحقق","type":"boolean","default":true},{"key":"عدد_الملفات","type":"integer","default":0},{"key":"طريقة_الدخول","type":"choice","default":"QR بدون كود","choices":["QR بدون كود","كود داخل Telegram"]},{"key":"التشغيل","type":"choice","default":"معاينة فقط","choices":["معاينة فقط","تنفيذ النقل"]}],"web":[{"key":"روابط_الفيديو","type":"string","default":""},{"key":"جودة_الفيديو","type":"choice","default":"الأصلية","choices":["الأصلية","1080p","720p","480p"]},{"key":"صيغة_الناتج","type":"choice","default":"🎬 فيديو MP4 (H.264/AAC — Telegram Preview)","choices":["🎬 فيديو MP4 (H.264/AAC — Telegram Preview)","🎞️ فيديو WebM (VP9/Opus)","🎵 صوت MP3","🎵 صوت M4A (AAC)","🎵 صوت OGG (Opus)","📦 أرشيف ZIP للملف الأصلي","📄 الملف الأصلي بدون تحويل"]},{"key":"Bitrate_الصوت_kbps","type":"choice","default":"96","choices":["24","32","48","64","96","128","160","192"]},{"key":"OGG_بدون_إعادة_ترميز_إن_أمكن","type":"boolean","default":false},{"key":"جودة_تحويل_MP4_CRF","type":"slider","default":20,"min":18,"max":32,"step":1},{"key":"مكان_الحفظ","type":"choice","default":"Google Drive","choices":["Google Drive","Telegram","Colab فقط"]},{"key":"عرض_Telegram","type":"choice","default":"▶️ معاينة ومشغّل (عند دعم الصيغة)","choices":["▶️ معاينة ومشغّل (عند دعم الصيغة)","📄 ملف Document بدون معاينة"]},{"key":"مجلد_فرعي","type":"string","default":""},{"key":"دخول_Telegram","type":"choice","default":"QR بدون كود","choices":["QR بدون كود","كود داخل Telegram"]},{"key":"استخراج_متقدم_لروابط_Awesome","type":"boolean","default":true},{"key":"تحديث_yt_dlp","type":"boolean","default":false}],"gemini":[{"key":"العملية","type":"choice","default":"👁️ معاينة فقط","choices":["👁️ معاينة فقط","▶ تجهيز ورفع إلى Drive"]},{"key":"المصدر","type":"choice","default":"📣 Telegram — قناة Media Lite","choices":["📣 Telegram — قناة Media Lite","📁 Google Drive Folder","🔗 Google Drive Links","🌐 Internet URLs"]},{"key":"روابط_المصدر","type":"string","default":""},{"key":"اسم_الدفعة","type":"string","default":""},{"key":"عدد_الملفات","type":"integer","default":10},{"key":"شامل_مجلدات_Drive_الفرعية","type":"boolean","default":true},{"key":"وضع_تجهيز_الصوت","type":"choice","default":"ذكي — تجنب الضغط غير الضروري","choices":["ذكي — تجنب الضغط غير الضروري","الحفاظ على الجودة — تجنب الضغط قدر الإمكان","ضغط دائم — النظام القديم"]},{"key":"وضع_الصوت","type":"choice","default":"محاضرات واضحة (24 kbps)","choices":["محاضرات واضحة (24 kbps)","وضوح أعلى (32 kbps)","أصغر حجم (8 kbps)","موسيقى / صوت غني (96 kbps)"]},{"key":"اقصى_حجم_للجزء_MB","type":"number","default":9},{"key":"اقصى_مدة_للجزء_بالدقائق","type":"integer","default":0},{"key":"اختيار_ملفات_Telegram","type":"choice","default":"الملفات الجديدة غير المعالجة","choices":["الملفات الجديدة غير المعالجة","أحدث عدد من الملفات"]},{"key":"حذف_رسائل_Telegram_بعد_التحقق","type":"boolean","default":true},{"key":"طريقة_دخول_Telegram","type":"choice","default":"QR بدون كود","choices":["QR بدون كود","كود داخل Telegram"]},{"key":"إعادة_معالجة_المكتمل","type":"boolean","default":false},{"key":"تفعيل_Advanced_Audio","type":"boolean","default":false},{"key":"صيغة_الصوت","type":"choice","default":"Opus / OGG","choices":["Opus / OGG","AAC / M4A","MP3"]},{"key":"Audio_Bitrate_kbps","type":"choice","default":"24","choices":["8","12","16","24","32","48","64","96","128","160","192"]},{"key":"قنوات_الصوت","type":"choice","default":"Mono","choices":["Mono","Stereo"]},{"key":"Audio_Sample_Rate_Hz","type":"choice","default":"24000","choices":["auto","12000","16000","24000","48000"]},{"key":"إزالة_الضوضاء","type":"choice","default":"Off","choices":["Off","Light"]}]}''')
 REPO = "abdullahsamirashour/gpt"
 REL = "telegram-smart-compressor"
 TABS = ("compress", "drive_tg", "tg_drive", "web", "gemini")
@@ -63,7 +63,7 @@ GROUPS = {
     ],
     "gemini": [
         ("Quick Settings", ["العملية", "المصدر", "روابط_المصدر", "عدد_الملفات",
-                            "وضع_الصوت", "اقصى_حجم_للجزء_MB"]),
+                            "وضع_تجهيز_الصوت", "وضع_الصوت", "اقصى_حجم_للجزء_MB"]),
         ("📁 Batch & Limits", ["اسم_الدفعة", "اقصى_مدة_للجزء_بالدقائق",
                               "شامل_مجلدات_Drive_الفرعية"]),
         ("📣 Telegram Options", ["اختيار_ملفات_Telegram",
@@ -80,6 +80,7 @@ FRIENDLY = {
     "مصدر_الإعدادات": "مصدر إعدادات الضغط",
     "نوع_المحتوى": "نوع المحتوى",
     "وضع_الصوت": "وضع الصوت",
+    "وضع_تجهيز_الصوت": "تجهيز الصوت — هل نضغطه؟",
     "وضع_الفيديو": "وضع الفيديو",
     "تخطي_الملف_بدون_توفير_مفيد": "تخطي الملفات لو مفيش توفير مفيد",
     "تفعيل_Advanced_للصوت": "تفعيل تخصيص الصوت بدل Preset",
@@ -217,15 +218,18 @@ HELP = {
     "web": ("Batch يدعم حتى 100 رابط. جودة المصدر مختلفة عن CRF للتحويل. "
             "Audio Bitrate يظهر فقط للصيغ الصوتية، وMP4 CRF يظهر فقط لتحويل MP4. "
             "خيارات Telegram تظهر عند اختيار Telegram فقط."),
-    "gemini": ("يجهّز التسجيلات من Telegram أو Drive أو الإنترنت ويقسم الأجزاء عند الحاجة "
-               "لأقل من حجم MB المحدد، ويحفظ على Drive. اختر Preview قبل التنفيذ. "
-               "الحذف يخص Telegram فقط وبعد التحقق."),
+    "gemini": ("Smart (موصى به): لو الصوت جاهز هنحتفظ بالأصل أو نقسمه بدون ضغط؛ "
+               "الفيديو ممكن نستخرج صوته بسرعة، والملفات غير المناسبة بنضغطها. "
+               "Preserve Quality يتجنب الضغط حتى في الملفات الكبيرة جدًا. "
+               "Always Compress يعمل بنفس الطريقة القديمة. "
+               "الـAudio Preset يتطبق وقت الضغط فقط؛ تفعيل Advanced Audio يفرض التحويل اليدوي. "
+               "الحجم أقل من 9 MB لكل جزء افتراضيًا، وحذف Telegram بعد الرفع والتحقق فقط."),
 }
 
 
 def validate_schema():
     """A regression guard against dropping any of the original 68 controls."""
-    expected = {"compress": 22, "drive_tg": 7, "tg_drive": 8, "web": 12, "gemini": 19}
+    expected = {"compress": 22, "drive_tg": 7, "tg_drive": 8, "web": 12, "gemini": 20}
     for tab, count in expected.items():
         keys = [entry["key"] for entry in FIELD_SCHEMA[tab]]
         declared = [key for _, group in GROUPS[tab] for key in group]
@@ -438,7 +442,8 @@ class SmartTabs:
             "tg_drive": ["اعادة_نسخ_المنقول_سابقا",
                          "حذف_رسائل_Telegram_بعد_التحقق", "التشغيل"],
             "web": ["صيغة_الناتج", "مكان_الحفظ"],
-            "gemini": ["المصدر", "العملية"],
+            "gemini": ["المصدر", "العملية", "وضع_تجهيز_الصوت",
+                       "تفعيل_Advanced_Audio"],
         }.items():
             for key in keys:
                 watch(tab, key)
@@ -515,9 +520,13 @@ class SmartTabs:
                 gemini_hint = "⚠️ التنفيذ سيحذف رسائل Telegram بعد حفظ جميع الأجزاء والتحقق منها."
             else:
                 gemini_hint = "▶ التنفيذ سيجهّز التسجيلات ويرفعها على Drive؛ لا حذف من المصادر الأخرى."
+            mode_desc = self.val("gemini", "وضع_تجهيز_الصوت")
+            advanced = self.val("gemini", "تفعيل_Advanced_Audio")
+            if advanced:
+                mode_desc += " • Advanced Audio هيطبّق التحويل اليدوي"
             self.status["gemini"].value = (
-                '<div dir="rtl" style="font-size:12px;color:#64748b">' +
-                escape(gemini_hint) + '</div>'
+                '<div dir="rtl" style="font-size:13px;color:#475569;line-height:1.65">'
+                + escape(mode_desc) + '<div>' + escape(gemini_hint) + '</div></div>'
             )
         except Exception as exc:
             raise RuntimeError("تعذر تحديث Smart UI: " + str(exc)) from exc
@@ -644,6 +653,11 @@ class SmartTabs:
                 max_part_mb=v["اقصى_حجم_للجزء_MB"],
                 max_minutes=v["اقصى_مدة_للجزء_بالدقائق"],
                 force_reprocess=v["إعادة_معالجة_المكتمل"], repo_commit=commit,
+                preparation_mode={
+                    "ذكي — تجنب الضغط غير الضروري": "smart",
+                    "الحفاظ على الجودة — تجنب الضغط قدر الإمكان": "preserve",
+                    "ضغط دائم — النظام القديم": "always",
+                }[v["وضع_تجهيز_الصوت"]],
             )
         print("ℹ️ انتهى تشغيل الأداة؛ راجع ملخص النتائج وأي أخطاء أعلاه.")
         return result
