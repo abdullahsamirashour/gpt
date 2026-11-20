@@ -6,10 +6,10 @@
 
 ## الاستخدام — Smart Tabs
 
-1. افتح الـNotebook واضغط **▶ خلية ①** لعرض الواجهة التفاعلية (5 Tabs).
-2. اختار **Compressor / Drive → Telegram / Telegram → Drive / Downloader / Gemini Ready** واضبط Quick Settings، وافتح Advanced وقت الحاجة.
-3. اضغط **▶ خلية ②** لتنفيذ الأداة المختارة؛ شريط التقدم والنتيجة يظهران في الـOutput. للإيقاف استخدم زر Stop الأصلي في Colab.
-4. **Undo:** النسخة السابقة محفوظة في [فرع GitHub Backup](https://github.com/abdullahsamirashour/gpt/tree/backup/media-lite-pre-tabs-2026-11-20/telegram-smart-compressor)، ويمكن استرجاعها بالكامل.
+1. شغّل **▶ خلية ①** لفتح Smart UI. على الكمبيوتر تظهر 5 Tabs؛ وعلى الشاشة الضيقة تظهر **قائمة منسدلة لاختيار الأداة** تلقائيًا.
+2. اضبط Quick Settings، وافتح Advanced حسب الحاجة. الشرح وروابط Undo داخل **Help · Undo · إعدادات العرض** المقفول افتراضيًا. لو كشف الشاشة مش مناسب، اختر يدويًا **قائمة الموبايل** أو **تابات الكمبيوتر** من هناك.
+3. اضغط **▶ خلية ②** للتنفيذ. الـProgress وسجلات المحركات الأصلية تظل في Output خلية التشغيل، وللإيقاف استخدم زر Stop الأصلي في Colab.
+4. **Undo:** النسخة السابقة لتعديل الموبايل محفوظة في [فرع GitHub Backup](https://github.com/abdullahsamirashour/gpt/tree/backup/media-lite-pre-mobile-first-2026-11-20/telegram-smart-compressor)؛ و[الواجهة الكلاسيكية القديمة](https://colab.research.google.com/github/abdullahsamirashour/gpt/blob/backup/media-lite-pre-tabs-2026-11-20/telegram-smart-compressor/Smart_Compressor.ipynb) تظل بديلًا إن فشلت Widgets على جهازك.
 
 **أمان:** Telegram → Drive يحتفظ بحقل اسم الفولدر الفرعي، وخيار حذف رسائل Telegram بعد التحقق ظاهر ومفعّل افتراضيًا بناءً على طلب المستخدم. لكن **وضع المعاينة هو الافتراضي ولا يحذف أي رسالة**. التنفيذ الفعلي هو فقط ما قد يحذف، بعد التحقق.
 
