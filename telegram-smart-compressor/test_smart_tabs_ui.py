@@ -48,6 +48,49 @@ class WidgetTests(unittest.TestCase):
         self.assertIsNone(self.ui._commit)
         self.assertEqual(len(self.ui.tab.children), 5)
 
+    def test_mobile_navigation_is_synced_with_tabs_and_execution(self):
+        self.assertEqual(self.ui.mobile_nav.value, 0)
+        self.ui.mobile_nav.value = 3
+        self.assertEqual(self.ui.tab.selected_index, 3)
+        self.assertEqual(self.ui.snapshot()[0], "web")
+        self.assertIn("Internet Downloader", self.ui.help_text.value)
+
+        self.ui.tab.selected_index = 4
+        self.assertEqual(self.ui.mobile_nav.value, 4)
+        self.assertEqual(self.ui.snapshot()[0], "gemini")
+        self.assertIn("Gemini Ready", self.ui.help_text.value)
+
+    def test_manual_display_modes_and_auto_reset(self):
+        self.assertEqual(self.ui.view_mode.value, "auto")
+        self.ui.view_mode.value = "compact"
+        self.assertIn("ml-force-compact", self.ui.main._dom_classes)
+        self.assertNotIn("ml-force-tabs", self.ui.main._dom_classes)
+        self.ui.view_mode.value = "tabs"
+        self.assertIn("ml-force-tabs", self.ui.main._dom_classes)
+        self.assertNotIn("ml-force-compact", self.ui.main._dom_classes)
+        self.ui.view_mode.value = "auto"
+        self.assertNotIn("ml-force-tabs", self.ui.main._dom_classes)
+        self.assertNotIn("ml-force-compact", self.ui.main._dom_classes)
+
+    def test_mobile_touch_fields_and_short_video_preset_labels(self):
+        self.assertIn("@media (max-width:760px)", smart.RESPONSIVE_CSS)
+        self.assertIn("font-size:16px", smart.RESPONSIVE_CSS)
+        self.assertIn("min-height:44px", smart.RESPONSIVE_CSS)
+        self.assertEqual(self.ui.help_panel.selected_index, None)
+        self.assertEqual(len(self.ui.mobile_nav.options), 5)
+        video = self.ui.controls["compress"]["وضع_الفيديو"]
+        self.assertEqual(video.layout.min_height, "44px")
+        labels = [label for label, value in video.options]
+        self.assertTrue(any("1080p" in x for x in labels))
+        self.assertTrue(all(len(x) < 30 for x in labels))
+        self.assertEqual(len(self.ui.tab.children), 5)
+
+    def test_collapsed_help_contains_undo_and_classic_fallback(self):
+        self.assertIn("نسخة احتياطية", self.ui.help_text.value)
+        self.assertIn(smart.CLASSIC_COLAB, self.ui.help_text.value)
+        self.assertIn(smart.UNDO_BACKUP, self.ui.help_text.value)
+        self.assertIn("Help", self.ui.help_panel.get_title(0))
+
     def test_dynamic_compressor_and_presets(self):
         self.ui.controls["compress"]["نوع_المحتوى"].value = "🎧 صوت فقط — حتى الفيديو يتحول لصوت"
         self.assertEqual(self.ui.rows["compress"]["وضع_الفيديو"].layout.display, "none")
