@@ -735,6 +735,16 @@ def _done(state: dict, job: dict, setting_id: str) -> bool:
     return bool(state["items"].get(uid, {}).get("done"))
 
 
+def _done_in_any_mode(state: dict, job: dict) -> bool:
+    """Telegram 'new' means new source, not new compression settings.
+
+    Switching the default to Smart must not accidentally reprocess or delete
+    the existing Telegram archive that was completed with the old mode.
+    """
+    return any(record.get("done") and record.get("source_key") == job["key"]
+               for record in state.get("items", {}).values())
+
+
 def _delete_allowed(channel) -> bool:
     rights = getattr(channel, "admin_rights", None)
     return bool(getattr(channel, "creator", False) or getattr(rights, "delete_messages", False))
@@ -768,7 +778,7 @@ async def _telegram_run(transfer, web, engine, service, state, state_file, confi
                 messages.append(msg)
         jobs = _telegram_jobs(messages, channel.id)
         if config["tg_mode"] == "new" and not config["force"]:
-            jobs = [j for j in jobs if not _done(state, j, config["setting_id"])
+            jobs = [j for j in jobs if not _done_in_any_mode(state, j)
                     or state["items"].get(_hash(j["key"] + ":" + config["setting_id"]), {}).get("delete_pending")]
         elif config["tg_mode"] not in {"new", "recent"}:
             raise ValueError("Telegram mode غير معروف.")
