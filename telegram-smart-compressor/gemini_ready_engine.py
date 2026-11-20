@@ -846,7 +846,7 @@ async def _process_many(jobs, transfer, engine, web, service, state, state_file,
                     print(f"📁 فولدر النتائج: {_drive_link(new_folder[0])}")
                 folder_id, folder_name = new_folder
             folder_ids.add(folder_id)
-            print("⬇️ Fetch → Compress → Split → Drive")
+            print("⬇️ Fetch → Smart Prepare → Split if needed → Drive")
             if job["kind"] == "telegram":
                 source = await download_tg(job, stage)
             else:
@@ -865,6 +865,8 @@ async def _process_many(jobs, transfer, engine, web, service, state, state_file,
                 _process, job, transfer, engine, web, service, state, state_file,
                 config["settings"], config["setting_id"], config["max_bytes"],
                 config["max_minutes"], folder_id, folder_name, stem, source,
+                config.get("preparation_mode", "always"),
+                config.get("advanced_audio", False),
             )
             ok += 1
             if job["kind"] == "telegram" and config["delete_tg"]:
@@ -914,10 +916,13 @@ def run(source: str = "telegram", links: str = "", action: str = "preview", batc
         login_method: str = "qr", preset: str = "speech", advanced_audio: bool = False,
         audio_codec: str = "opus", audio_kbps: int = 24, channels: str = "mono",
         sample_rate: str = "24000", noise: str = "off", max_part_mb: float = 9.0,
-        max_minutes: int = 0, force_reprocess: bool = False, repo_commit: str = "") -> dict:
+        max_minutes: int = 0, force_reprocess: bool = False, repo_commit: str = "",
+        preparation_mode: str = "smart") -> dict:
     """Top-level Colab Forms API. Preview is read-only regarding source/output files."""
     if source not in {"telegram", "drive_folder", "drive_links", "internet"}:
         raise ValueError("مصدر غير معروف.")
+    if preparation_mode not in SMART_MODES:
+        raise ValueError("وضع تجهيز الصوت غير معروف.")
     if action not in {"preview", "process"}:
         raise ValueError("اختار معاينة أو تنفيذ.")
     if not 0 <= int(max_files) <= MAX_BATCH:
@@ -934,8 +939,11 @@ def run(source: str = "telegram", links: str = "", action: str = "preview", batc
     if not re.fullmatch(r"[0-9a-f]{40}", repo_commit):
         raise ValueError("تعذر تحديد GitHub commit لمكونات التشغيل.")
     transfer = _component(repo_commit, "transfer_engine.py")
+    # Exact studio preferences still need engine; no web/FFmpeg startup for Drive Preview.
     engine = _component(repo_commit, "engine.py")
-    web = _component(repo_commit, "web_video_downloader.py")
+    processing = action == "process"
+    web = (_component(repo_commit, "web_video_downloader.py")
+           if processing or source == "telegram" else None)
     if source == "telegram":
         transfer.ensure_dependencies()
     else:
@@ -943,17 +951,21 @@ def run(source: str = "telegram", links: str = "", action: str = "preview", batc
             import googleapiclient  # noqa: F401
         except ImportError:
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "google-api-python-client", "google-auth"], check=True)
-    # Colab keeps an IPython event loop alive even when the source is only Drive.
-    try:
-        import nest_asyncio
-    except ImportError:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "nest_asyncio"], check=True)
-        import nest_asyncio
-    nest_asyncio.apply()
-    web._ensure_ffmpeg()
+    # No FFmpeg check or event-loop patch for Drive/Internet previews.
+    if processing or source == "telegram":
+        try:
+            import nest_asyncio
+        except ImportError:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "nest_asyncio"], check=True)
+            import nest_asyncio
+        nest_asyncio.apply()
+    if processing:
+        web._ensure_ffmpeg()
     settings = _settings(engine, preset, advanced_audio, audio_codec, audio_kbps,
                          channels, sample_rate, noise)
-    config = {"settings": settings, "setting_id": _settings_signature(settings, max_part_mb, max_minutes),
+    config = {"settings": settings, "setting_id": _settings_signature(settings, max_part_mb, max_minutes,
+                                                                     preparation_mode, advanced_audio),
+              "preparation_mode": preparation_mode, "advanced_audio": bool(advanced_audio),
               "max_bytes": int(float(max_part_mb) * 1_000_000), "max_minutes": int(max_minutes),
               "max_files": int(max_files), "tg_mode": tg_mode, "delete_tg": bool(delete_telegram),
               "login_method": login_method, "preview": action == "preview", "force": force_reprocess,
@@ -961,7 +973,8 @@ def run(source: str = "telegram", links: str = "", action: str = "preview", batc
                                               "drive_links": "Drive_Links", "internet": "Internet"}[source]}
     service = transfer.connect_drive()
     state_file = _state_path(transfer)
-    print(f"🎧 Gemini Ready | {source} | {settings['audio_codec']} {settings['audio_kbps']} kbps")
+    print(f"🎧 Gemini Ready | {source} | {preparation_mode} | "
+          f"encode preset: {settings['audio_codec']} {settings['audio_kbps']} kbps")
     print(f"📏 الحد: أقل من {config['max_bytes'] / 1_000_000:g} MB" +
           (f" • مدة ≤ {max_minutes} دقيقة" if max_minutes else "") +
           f" • {'Preview' if config['preview'] else 'Process'}")
