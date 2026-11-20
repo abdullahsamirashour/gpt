@@ -17,8 +17,10 @@ class SchemaTests(unittest.TestCase):
     def test_original_fields_preserved(self):
         smart.validate_schema()
         counts = [len(smart.FIELD_SCHEMA[k]) for k in smart.TABS]
-        self.assertEqual(counts, [22, 7, 8, 12, 19])
-        self.assertEqual(sum(counts), 68)
+        self.assertEqual(counts, [22, 7, 8, 12, 20])
+        self.assertEqual(sum(counts), 69)
+        self.assertEqual(len([x for x in smart.FIELD_SCHEMA["gemini"]
+                              if x["key"] != "وضع_تجهيز_الصوت"]), 19)
 
     def test_video_presets_match_engine_factory(self):
         expected = {
@@ -178,6 +180,23 @@ class WidgetTests(unittest.TestCase):
         self.assertEqual(received["destination"], "Google Drive")
         self.assertEqual(received["audio_kbps"], 96)
 
+    def test_gemini_mode_choices_are_explicit_and_preserve_legacy(self):
+        received = {}
+        self.ui.tab.selected_index = 4
+        mode = self.ui.controls["gemini"]["وضع_تجهيز_الصوت"]
+        self.assertEqual(len(mode.options), 3)
+        self.assertEqual(mode.value, "ذكي — تجنب الضغط غير الضروري")
+        self.ui._component = lambda *args, **kwargs: SimpleNamespace(
+            run=lambda **kw: received.update(kw))
+        for label, backend in [
+            ("ذكي — تجنب الضغط غير الضروري", "smart"),
+            ("الحفاظ على الجودة — تجنب الضغط قدر الإمكان", "preserve"),
+            ("ضغط دائم — النظام القديم", "always"),
+        ]:
+            mode.value = label
+            self.ui.execute_selected()
+            self.assertEqual(received["preparation_mode"], backend)
+
     def test_gemini_preserves_preview_and_deletion(self):
         received = {}
         self.ui.tab.selected_index = 4
@@ -188,6 +207,8 @@ class WidgetTests(unittest.TestCase):
         self.assertTrue(received["delete_telegram"])
         self.assertEqual(received["source"], "telegram")
         self.assertEqual(received["max_part_mb"], 9.0)
+        self.assertEqual(received["preparation_mode"], "smart")
+        self.assertFalse(received["advanced_audio"])
 
 
 if __name__ == "__main__":

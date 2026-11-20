@@ -36,6 +36,20 @@ MIN_HEADROOM = 80_000
 MAX_BATCH = 200
 MAX_LINKS = 100
 STATE_VERSION = 1
+# Fast paths require validated codec and container. The established encoder
+# handles any unsupported, ambiguous or uninspectable media.
+SMART_DIRECT_CODECS = {
+    ".mp3": {"mp3"},
+    ".ogg": {"opus", "vorbis"},
+    ".m4a": {"aac"},
+    ".wav": {"pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le"},
+    ".flac": {"flac"},
+    ".aiff": {"pcm_s16be", "pcm_s24be"},
+}
+SMART_SPLIT_SUFFIXES = {".mp3", ".ogg", ".m4a"}
+SMART_MAX_COPY_PARTS = 12
+SMART_MODES = {"smart", "preserve", "always"}
+
 
 
 def _hash(value: str, size: int = 24) -> str:
@@ -492,8 +506,9 @@ def _download_job(job: dict, stage: Path, transfer, service, web,
     return dest
 
 
-def _output_names(stem: str, codec: str, count: int) -> list[str]:
-    suffix = OUTPUT_SUFFIXES[codec]
+def _output_names(stem: str, codec: str, count: int,
+                  output_suffix: str = "") -> list[str]:
+    suffix = output_suffix or OUTPUT_SUFFIXES[codec]
     stem = _clean_name(stem)
     if count == 1:
         return [stem + suffix]
@@ -501,43 +516,175 @@ def _output_names(stem: str, codec: str, count: int) -> list[str]:
     return [f"{stem}-pt{i:0{width}d}{suffix}" for i in range(1, count + 1)]
 
 
-def _settings_signature(settings: dict, max_mb: float, max_minutes: int) -> str:
+def _settings_signature(settings: dict, max_mb: float, max_minutes: int,
+                        mode: str = "always", advanced_audio: bool = False) -> str:
     keys = ("audio_preset", "audio_codec", "audio_kbps", "audio_channels", "audio_sample_rate", "audio_noise")
     details = {key: settings[key] for key in keys}
     details["max_bytes"] = int(float(max_mb) * 1_000_000)
     details["max_minutes"] = int(max_minutes)
+    # Modes have different output semantics; never reuse the wrong receipts.
+    details["preparation_mode"] = mode
+    details["advanced_audio"] = bool(advanced_audio)
+    details["policy_version"] = 2
     return _hash(json.dumps(details, sort_keys=True, ensure_ascii=True))
+
+
+
+def _media_probe(path: Path) -> dict:
+    """Probe the real codec, number of streams and total duration."""
+    cmd = ["ffprobe", "-v", "error", "-show_entries",
+           "stream=index,codec_name,codec_type:format=duration",
+           "-of", "json", str(path)]
+    result = subprocess.run(cmd, text=True, capture_output=True,
+                            check=True, timeout=45)
+    data = json.loads(result.stdout)
+    streams = data.get("streams") or []
+    audio = [item for item in streams if item.get("codec_type") == "audio"]
+    video = [item for item in streams if item.get("codec_type") == "video"]
+    seconds = float((data.get("format") or {}).get("duration") or 0)
+    if len(audio) != 1 or not math.isfinite(seconds) or seconds <= 0:
+        return {"valid": False}
+    return {"valid": True, "codec": audio[0].get("codec_name", "").lower(),
+            "audio_index": int(audio[0]["index"]),
+            "video": bool(video), "duration": seconds}
+
+
+def _copy_container_for_codec(codec: str) -> tuple[str, str] | None:
+    return {"mp3": (".mp3", "mp3"), "aac": (".m4a", "ipod"),
+            "opus": (".ogg", "ogg"), "vorbis": (".ogg", "ogg")}.get(codec)
+
+
+def _fast_prepare_audio(source: Path, stage: Path, max_bytes: int,
+                        max_minutes: int, mode: str, advanced_audio: bool,
+                        output_kbps: int) -> tuple[Path | None, str]:
+    """Select source/pass-through/remux without any lossy encoding.
+
+    Advanced Audio explicitly requests format/bitrate; it takes precedence.
+    """
+    if mode == "always":
+        return None, "Always Compress محدد"
+    if advanced_audio:
+        return None, "Advanced Audio محدد؛ نحترم إعدادات التحويل اليدوية"
+    try:
+        info = _media_probe(source)
+    except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None, "تعذر التحقق من صيغة/مدة الصوت"
+    if not info.get("valid"):
+        return None, "صوت غير مؤهل للمسار السريع أو متعدد المسارات"
+    codec = info["codec"]
+    suffix = source.suffix.lower()
+    duration = info["duration"]
+    need_split = (source.stat().st_size >= max_bytes
+                  or (max_minutes > 0 and duration > max_minutes * 60))
+    direct = not info["video"] and codec in SMART_DIRECT_CODECS.get(suffix, set())
+    can_split_direct = suffix in SMART_SPLIT_SUFFIXES
+    target_path = source
+
+    if not direct or (need_split and not can_split_direct):
+        # Copy only a single verified compatible audio stream. If there are
+        # multiple audio streams, rely on the original encoder stream selector.
+        container = _copy_container_for_codec(codec)
+        if container is None:
+            return None, "الصيغة لا تسمح بالاستخراج السريع المتوافق"
+        ext, fmt = container
+        dst = stage / ("extracted" + ext)
+        temp = stage / ("extract_pending" + ext)
+        temp.unlink(missing_ok=True)
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+               "-i", str(source), "-map", f"0:{info['audio_index']}",
+               "-vn", "-sn", "-dn", "-c:a", "copy", "-f", fmt, str(temp)]
+        try:
+            proc = subprocess.run(cmd, text=True, capture_output=True, timeout=300)
+            if proc.returncode or not temp.is_file() or not temp.stat().st_size:
+                return None, "Stream Copy غير متاح؛ هنستخدم الضغط المعتاد"
+            remuxed = _media_probe(temp)
+            if (not remuxed.get("valid") or remuxed["video"]
+                    or remuxed["codec"] != codec
+                    or abs(remuxed["duration"] - duration) > max(1.5, duration * 0.01)):
+                return None, "فشل التحقق من استخراج الصوت بدون ضغط"
+            os.replace(temp, dst)
+            target_path = dst
+        except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError):
+            return None, "تعذر استخراج الصوت بدون ضغط"
+        finally:
+            temp.unlink(missing_ok=True)
+
+    estimated_parts = _required_part_count(
+        target_path.stat().st_size, max_bytes, duration, max_minutes * 60)
+    bitrate_kbps = (target_path.stat().st_size * 8) / (1000 * duration)
+    if (mode == "smart" and estimated_parts > SMART_MAX_COPY_PARTS
+            and bitrate_kbps > max(64, output_kbps * 1.7)):
+        return None, f"{estimated_parts} أجزاء متوقعة؛ ضغط واحد أنسب للدفعة الكبيرة"
+    return target_path, ("الصوت الأصلي جاهز" if target_path == source
+                         else "استخراج صوت سريع بدون إعادة ترميز")
 
 
 def _process(job: dict, transfer, engine, web, service, state: dict, state_file: Path,
              settings: dict, setting_id: str, max_bytes: int, max_minutes: int,
-             folder_id: str, folder_name: str, stem: str, source_path: Path) -> dict:
+             folder_id: str, folder_name: str, stem: str, source_path: Path,
+             mode: str = "always", advanced_audio: bool = False) -> dict:
+    if mode not in SMART_MODES:
+        raise ValueError("Audio Preparation Mode غير معروف.")
     uid = _hash(job["key"] + ":" + setting_id)
     record = state["items"].setdefault(uid, {})
     record.update({"source_key": job["key"], "name": job["name"], "folder_id": folder_id,
-                   "folder_name": folder_name, "stem": stem, "settings": setting_id, "done": False})
+                   "folder_name": folder_name, "stem": stem, "settings": setting_id,
+                   "preparation_mode": mode, "done": False})
     _save_state(state_file, state)
     stage = source_path.parent
-    output = stage / ("compressed" + OUTPUT_SUFFIXES[settings["audio_codec"]])
-    if output.exists() and output.stat().st_size:
-        try:
-            engine.ffprobe(output)
-        except Exception:
-            output.unlink(missing_ok=True)
-    if not output.exists():
-        info = engine.ffprobe(source_path)
-        if not info.has_audio or info.duration <= 0:
-            raise RuntimeError("الملف المصدر لا يحتوي مسار صوت صالحًا.")
-        print(f"🎚️ Compress: {settings['audio_codec'].upper()} {settings['audio_kbps']} kbps")
-        incomplete = stage / ("pending" + output.suffix)
-        incomplete.unlink(missing_ok=True)
-        engine.encode_audio(source_path, incomplete, info, settings=settings)
-        if incomplete.stat().st_size == 0:
-            raise RuntimeError("فشل إنشاء ملف صوتي مضغوط.")
-        os.replace(incomplete, output)
-    parts = split_audio(output, stage / "segments", max_bytes, max_minutes)
-    names = _output_names(stem, settings["audio_codec"], len(parts))
+    chosen, reason = _fast_prepare_audio(
+        source_path, stage, max_bytes, max_minutes, mode,
+        advanced_audio, int(settings["audio_kbps"]))
+
+    def encode() -> Path:
+        output = stage / ("compressed" + OUTPUT_SUFFIXES[settings["audio_codec"]])
+        if output.exists() and output.stat().st_size:
+            try:
+                info = engine.ffprobe(output)
+                if not info.has_audio or info.duration <= 0:
+                    raise ValueError("invalid cached compressed file")
+            except Exception:
+                output.unlink(missing_ok=True)
+        if not output.exists():
+            info = engine.ffprobe(source_path)
+            if not info.has_audio or info.duration <= 0:
+                raise RuntimeError("الملف المصدر لا يحتوي مسار صوت صالحًا.")
+            print(f"🎚️ Encode: {settings['audio_codec'].upper()} {settings['audio_kbps']} kbps")
+            pending = stage / ("pending" + output.suffix)
+            pending.unlink(missing_ok=True)
+            try:
+                engine.encode_audio(source_path, pending, info, settings=settings)
+                if not pending.is_file() or pending.stat().st_size == 0:
+                    raise RuntimeError("فشل إنشاء ملف صوتي مضغوط.")
+                os.replace(pending, output)
+            finally:
+                pending.unlink(missing_ok=True)
+        return output
+
+    if chosen is None:
+        print(f"🎚️ {reason} → Encode")
+        output = encode()
+        preparation = "encoded"
+    else:
+        output = chosen
+        preparation = "kept" if output == source_path else "remuxed"
+        print(f"⚡ {reason}: {output.stat().st_size / 1_000_000:.2f} MB")
+
+    try:
+        parts = split_audio(output, stage / "segments", max_bytes, max_minutes)
+    except (RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        # A copy-only split may fail for unusual packet timestamps; fall back
+        # to the established encoder rather than silently dropping a lecture.
+        if preparation == "encoded":
+            raise
+        print(f"↪️ تقسيم بدون ضغط لم ينجح ({type(exc).__name__})؛ إعادة ترميز آمنة.")
+        output = encode()
+        preparation = "encoded"
+        parts = split_audio(output, stage / "segments", max_bytes, max_minutes)
+
+    names = _output_names(stem, settings["audio_codec"], len(parts), output.suffix.lower())
     print(f"✂️ ناتج {output.stat().st_size / 1_000_000:.2f} MB → {len(parts)} ملف")
+    record["preparation"] = preparation
     receipts = []
     for i, (part, name) in enumerate(zip(parts, names), 1):
         key = f"GR{uid}P{i:04d}"
@@ -588,6 +735,16 @@ def _done(state: dict, job: dict, setting_id: str) -> bool:
     return bool(state["items"].get(uid, {}).get("done"))
 
 
+def _done_in_any_mode(state: dict, job: dict) -> bool:
+    """Telegram 'new' means new source, not new compression settings.
+
+    Switching the default to Smart must not accidentally reprocess or delete
+    the existing Telegram archive that was completed with the old mode.
+    """
+    return any(record.get("done") and record.get("source_key") == job["key"]
+               for record in state.get("items", {}).values())
+
+
 def _delete_allowed(channel) -> bool:
     rights = getattr(channel, "admin_rights", None)
     return bool(getattr(channel, "creator", False) or getattr(rights, "delete_messages", False))
@@ -621,7 +778,7 @@ async def _telegram_run(transfer, web, engine, service, state, state_file, confi
                 messages.append(msg)
         jobs = _telegram_jobs(messages, channel.id)
         if config["tg_mode"] == "new" and not config["force"]:
-            jobs = [j for j in jobs if not _done(state, j, config["setting_id"])
+            jobs = [j for j in jobs if not _done_in_any_mode(state, j)
                     or state["items"].get(_hash(j["key"] + ":" + config["setting_id"]), {}).get("delete_pending")]
         elif config["tg_mode"] not in {"new", "recent"}:
             raise ValueError("Telegram mode غير معروف.")
@@ -699,7 +856,7 @@ async def _process_many(jobs, transfer, engine, web, service, state, state_file,
                     print(f"📁 فولدر النتائج: {_drive_link(new_folder[0])}")
                 folder_id, folder_name = new_folder
             folder_ids.add(folder_id)
-            print("⬇️ Fetch → Compress → Split → Drive")
+            print("⬇️ Fetch → Smart Prepare → Split if needed → Drive")
             if job["kind"] == "telegram":
                 source = await download_tg(job, stage)
             else:
@@ -718,6 +875,8 @@ async def _process_many(jobs, transfer, engine, web, service, state, state_file,
                 _process, job, transfer, engine, web, service, state, state_file,
                 config["settings"], config["setting_id"], config["max_bytes"],
                 config["max_minutes"], folder_id, folder_name, stem, source,
+                config.get("preparation_mode", "always"),
+                config.get("advanced_audio", False),
             )
             ok += 1
             if job["kind"] == "telegram" and config["delete_tg"]:
@@ -767,10 +926,13 @@ def run(source: str = "telegram", links: str = "", action: str = "preview", batc
         login_method: str = "qr", preset: str = "speech", advanced_audio: bool = False,
         audio_codec: str = "opus", audio_kbps: int = 24, channels: str = "mono",
         sample_rate: str = "24000", noise: str = "off", max_part_mb: float = 9.0,
-        max_minutes: int = 0, force_reprocess: bool = False, repo_commit: str = "") -> dict:
+        max_minutes: int = 0, force_reprocess: bool = False, repo_commit: str = "",
+        preparation_mode: str = "smart") -> dict:
     """Top-level Colab Forms API. Preview is read-only regarding source/output files."""
     if source not in {"telegram", "drive_folder", "drive_links", "internet"}:
         raise ValueError("مصدر غير معروف.")
+    if preparation_mode not in SMART_MODES:
+        raise ValueError("وضع تجهيز الصوت غير معروف.")
     if action not in {"preview", "process"}:
         raise ValueError("اختار معاينة أو تنفيذ.")
     if not 0 <= int(max_files) <= MAX_BATCH:
@@ -787,8 +949,11 @@ def run(source: str = "telegram", links: str = "", action: str = "preview", batc
     if not re.fullmatch(r"[0-9a-f]{40}", repo_commit):
         raise ValueError("تعذر تحديد GitHub commit لمكونات التشغيل.")
     transfer = _component(repo_commit, "transfer_engine.py")
+    # Exact studio preferences still need engine; no web/FFmpeg startup for Drive Preview.
     engine = _component(repo_commit, "engine.py")
-    web = _component(repo_commit, "web_video_downloader.py")
+    processing = action == "process"
+    web = (_component(repo_commit, "web_video_downloader.py")
+           if processing or source == "telegram" else None)
     if source == "telegram":
         transfer.ensure_dependencies()
     else:
@@ -796,17 +961,21 @@ def run(source: str = "telegram", links: str = "", action: str = "preview", batc
             import googleapiclient  # noqa: F401
         except ImportError:
             subprocess.run([sys.executable, "-m", "pip", "install", "-q", "google-api-python-client", "google-auth"], check=True)
-    # Colab keeps an IPython event loop alive even when the source is only Drive.
-    try:
-        import nest_asyncio
-    except ImportError:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "nest_asyncio"], check=True)
-        import nest_asyncio
-    nest_asyncio.apply()
-    web._ensure_ffmpeg()
+    # No FFmpeg check or event-loop patch for Drive/Internet previews.
+    if processing or source == "telegram":
+        try:
+            import nest_asyncio
+        except ImportError:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "nest_asyncio"], check=True)
+            import nest_asyncio
+        nest_asyncio.apply()
+    if processing:
+        web._ensure_ffmpeg()
     settings = _settings(engine, preset, advanced_audio, audio_codec, audio_kbps,
                          channels, sample_rate, noise)
-    config = {"settings": settings, "setting_id": _settings_signature(settings, max_part_mb, max_minutes),
+    config = {"settings": settings, "setting_id": _settings_signature(settings, max_part_mb, max_minutes,
+                                                                     preparation_mode, advanced_audio),
+              "preparation_mode": preparation_mode, "advanced_audio": bool(advanced_audio),
               "max_bytes": int(float(max_part_mb) * 1_000_000), "max_minutes": int(max_minutes),
               "max_files": int(max_files), "tg_mode": tg_mode, "delete_tg": bool(delete_telegram),
               "login_method": login_method, "preview": action == "preview", "force": force_reprocess,
@@ -814,7 +983,8 @@ def run(source: str = "telegram", links: str = "", action: str = "preview", batc
                                               "drive_links": "Drive_Links", "internet": "Internet"}[source]}
     service = transfer.connect_drive()
     state_file = _state_path(transfer)
-    print(f"🎧 Gemini Ready | {source} | {settings['audio_codec']} {settings['audio_kbps']} kbps")
+    print(f"🎧 Gemini Ready | {source} | {preparation_mode} | "
+          f"encode preset: {settings['audio_codec']} {settings['audio_kbps']} kbps")
     print(f"📏 الحد: أقل من {config['max_bytes'] / 1_000_000:g} MB" +
           (f" • مدة ≤ {max_minutes} دقيقة" if max_minutes else "") +
           f" • {'Preview' if config['preview'] else 'Process'}")
