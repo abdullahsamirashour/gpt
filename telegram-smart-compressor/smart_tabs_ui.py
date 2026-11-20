@@ -325,10 +325,16 @@ class SmartTabs:
             self._show("compress", "جودة_CRF", mode == "جودة CRF")
             self._show("compress", "Video_Bitrate_kbps", mode == "Bitrate يدوي")
             self._show("compress", "الحجم_المستهدف_MiB", mode == "حجم مستهدف")
+            source_label = self.val("compress", "مصدر_الإعدادات")
+            if not source_label.startswith("📝"):
+                info = "☁️ سيُستخدم إعداد Drive المحفوظ بدل قيم Quick/Advanced الظاهرة."
+            elif audio_only:
+                info = "🎧 الناتج صوت فقط؛ إعدادات الفيديو لن تُطبق."
+            else:
+                info = VIDEO_HINTS.get(self.val("compress", "وضع_الفيديو"), "")
             self.status["compress"].value = (
-                '<div dir="rtl" style="font-size:12px;color:#475569">🎬 ' +
-                escape(VIDEO_HINTS.get(self.val("compress", "وضع_الفيديو"), "")) +
-                '<br>☁️ الإعدادات المحفوظة لا تغيّر حقول الفورم الظاهرة تلقائيًا.</div>'
+                '<div dir="rtl" style="font-size:12px;color:#475569">' +
+                escape(info) + '</div>'
             )
             self._show("drive_tg", "ارقام_الملفات_لإعادة_الرفع",
                        self.val("drive_tg", "التشغيل") == "إعادة رفع المحدد")
@@ -366,9 +372,17 @@ class SmartTabs:
             self._set_sections("gemini", {"📁 Batch & Limits", "🎧 Advanced Audio",
                                            "♻️ Reprocessing"} |
                               ({"📣 Telegram Options"} if is_telegram else set()))
+            gemini_preview = self.val("gemini", "العملية") == "👁️ معاينة فقط"
+            gemini_delete = self.val("gemini", "حذف_رسائل_Telegram_بعد_التحقق")
+            if gemini_preview:
+                gemini_hint = "👁️ المعاينة لا تضغط ولا ترفع ولا تحذف ملفات."
+            elif is_telegram and gemini_delete:
+                gemini_hint = "⚠️ التنفيذ سيحذف رسائل Telegram بعد حفظ جميع الأجزاء والتحقق منها."
+            else:
+                gemini_hint = "▶ التنفيذ سيجهّز التسجيلات ويرفعها على Drive؛ لا حذف من المصادر الأخرى."
             self.status["gemini"].value = (
-                '<div dir="rtl" style="font-size:12px;color:#64748b">'
-                '👁️ المعاينة لا تضغط ولا ترفع ولا تحذف ملفات.</div>'
+                '<div dir="rtl" style="font-size:12px;color:#64748b">' +
+                escape(gemini_hint) + '</div>'
             )
         except Exception as exc:
             raise RuntimeError("تعذر تحديث Smart UI: " + str(exc)) from exc
