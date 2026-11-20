@@ -1144,22 +1144,18 @@ class CustomTransferOptionsTests(unittest.TestCase):
                     self.assertTrue(message.message.endswith("#إعادة_الرفع"))
                     self.assertIn("MLTX:", message.message)
 
-    def test_new_form_parameters_pass_optional_settings_without_touching_compressor(self):
+    def test_smart_tabs_preserve_optional_transfer_settings(self):
         nb = json.loads(Path(__file__).with_name("Smart_Compressor.ipynb").read_text(
             encoding="utf-8"))
-        self.assertEqual(len(nb["cells"]), 6)
-        first = "".join(nb["cells"][1]["source"])
-        from_drive = "".join(nb["cells"][3]["source"])
-        to_drive = "".join(nb["cells"][5]["source"])
-        self.assertIn('ENGINE_REL = "telegram-smart-compressor/engine.py"', first)
-        self.assertIn("هاشتاج_الملفات", from_drive)
-        self.assertIn("telegram_hashtag=هاشتاج_الملفات.strip()", from_drive)
-        self.assertIn("اسم_الفولدر_الفرعي", to_drive)
-        self.assertIn("drive_subfolder=اسم_الفولدر_الفرعي.strip()", to_drive)
-        compile(from_drive, "drive-to-telegram-colab", "exec")
-        compile(to_drive, "telegram-to-drive-colab", "exec")
-
-
+        self.assertEqual(len(nb["cells"]), 4)
+        run_cell = "".join(nb["cells"][2]["source"])
+        smart_code = Path(__file__).with_name("smart_tabs_ui.py").read_text("utf-8")
+        self.assertIn("MEDIA_LITE_UI.execute_selected()", run_cell)
+        self.assertIn("telegram_hashtag=v[\"هاشتاج_الملفات\"].strip()", smart_code)
+        self.assertIn("drive_subfolder=v[\"اسم_الفولدر_الفرعي\"].strip()", smart_code)
+        self.assertIn('direction="drive_to_telegram"', smart_code)
+        self.assertIn('direction="telegram_to_drive"', smart_code)
+        compile(smart_code, "smart-tab-ui", "exec")
 
 
 class TelegramSafeDeleteTests(unittest.TestCase):
@@ -1426,19 +1422,20 @@ class TelegramSafeDeleteTests(unittest.TestCase):
                     "destination-folder", record,
                 ))
 
-    def test_new_form_checkbox_defaults_false_and_wires_exactly_to_transfer(self):
-        nb = json.loads(Path(__file__).with_name("Smart_Compressor.ipynb").read_text("utf-8"))
-        self.assertEqual(len(nb["cells"]), 6)
-        first = "".join(nb["cells"][1]["source"])
-        to_telegram = "".join(nb["cells"][3]["source"])
-        to_drive = "".join(nb["cells"][5]["source"])
-        self.assertIn('FORM_REL = "telegram-smart-compressor/studio_form_controls.py"', first)
-        self.assertNotIn("delete_after_transfer=", to_telegram)
-        self.assertIn('حذف_رسائل_Telegram_بعد_التحقق = False #@param {type:"boolean"}', to_drive)
-        self.assertIn("delete_after_transfer=حذف_رسائل_Telegram_بعد_التحقق", to_drive)
-        compile(to_drive, "telegram-to-drive-colab-form", "exec")
-
-
+    def test_smart_tab_deletion_explicitly_on_and_wired_to_transfer(self):
+        # Requested default changed from False to True; Preview stays read-only.
+        from importlib import util
+        module_file = Path(__file__).with_name("smart_tabs_ui.py")
+        spec = util.spec_from_file_location("ml_ui_delete_schema", module_file)
+        module = util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        fields = {x["key"]: x["default"] for x in module.FIELD_SCHEMA["tg_drive"]}
+        self.assertIs(fields["حذف_رسائل_Telegram_بعد_التحقق"], True)
+        self.assertEqual(fields["التشغيل"], "معاينة فقط")
+        code = module_file.read_text("utf-8")
+        self.assertIn('delete_after_transfer=v["حذف_رسائل_Telegram_بعد_التحقق"]', code)
+        self.assertIn('preview=v["التشغيل"] == "معاينة فقط"', code)
+        compile(code, "telegram-to-drive-smart-tabs", "exec")
 
 
 class GlobalTelegramHistoryRegressionTests(unittest.TestCase):
@@ -1597,20 +1594,15 @@ class GlobalTelegramHistoryRegressionTests(unittest.TestCase):
                 direction="telegram_to_drive",
                 delete_after_transfer=True, recopy_previously_transferred=True)
 
-    def test_colab_form_new_only_is_default_and_existing_cells_are_untouched(self):
+    def test_smart_tab_new_only_and_recopy_remain_available(self):
         nb = json.loads(Path(__file__).with_name("Smart_Compressor.ipynb").read_text("utf-8"))
-        self.assertEqual(len(nb["cells"]), 6)
-        source = "".join(nb["cells"][1]["source"])
-        reverse = "".join(nb["cells"][3]["source"])
-        forward = "".join(nb["cells"][5]["source"])
-        self.assertIn('FORM_REL = "telegram-smart-compressor/studio_form_controls.py"', source)
-        self.assertIn('telegram_hashtag=هاشتاج_الملفات.strip()', reverse)
-        self.assertIn('اعادة_نسخ_المنقول_سابقا = False #@param {type:"boolean"}', forward)
-        self.assertIn('recopy_previously_transferred=اعادة_نسخ_المنقول_سابقا', forward)
-        self.assertIn('حذف_رسائل_Telegram_بعد_التحقق = False #@param {type:"boolean"}', forward)
-        self.assertIn('delete_after_transfer=حذف_رسائل_Telegram_بعد_التحقق', forward)
-        compile(forward, "telegram-to-drive-smart-form", "exec")
-
+        self.assertEqual(len(nb["cells"]), 4)
+        code = Path(__file__).with_name("smart_tabs_ui.py").read_text("utf-8")
+        self.assertIn("telegram_hashtag=v[\"هاشتاج_الملفات\"].strip()", code)
+        self.assertIn('recopy_previously_transferred=v["اعادة_نسخ_المنقول_سابقا"]', code)
+        self.assertIn('delete_after_transfer=v["حذف_رسائل_Telegram_بعد_التحقق"]', code)
+        self.assertIn("run_transfer(", code)
+        compile(code, "telegram-to-drive-smart-tabs", "exec")
 
 
 if __name__ == "__main__":
