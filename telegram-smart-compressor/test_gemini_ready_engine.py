@@ -246,6 +246,11 @@ def test_telegram_classifies_voice_and_unknown_extension():
 
 
 def _smart_options(settings, max_bytes, mode="smart", max_minutes=0, advanced=False):
+    settings = {
+        "audio_preset": "speech", "audio_codec": "opus", "audio_kbps": 24,
+        "audio_channels": "mono", "audio_sample_rate": "24000",
+        "audio_noise": "off", **settings,
+    }
     return {
         "settings": settings, "setting_id": gr._settings_signature(
             settings, max_bytes / 1_000_000, max_minutes, mode, advanced),
