@@ -369,6 +369,11 @@ jobs:
                       return self.by_id.get(ids)
                   return self.messages[:limit] if limit else self.messages
 
+              async def iter_messages(self, _channel, min_id=0, limit=None):
+                  for message in self.messages:
+                      if message.id > min_id:
+                          yield message
+
           async def queue_test():
               messages = [
                   Msg(1, "video"),
@@ -387,7 +392,7 @@ jobs:
                   "command_ids": [],
                   "lineage": {},
               }
-              jobs = await engine.collect_queue(FakeClient(messages), Obj(id=123), state)
+              jobs, _newest_id = await engine.collect_queue(FakeClient(messages), Obj(id=123), state)
               compact = [(j["source"].id, j["rerun"], j["profile"]) for j in jobs]
               assert compact == [
                   (2, True, "VIDEO_SMALLEST"),
