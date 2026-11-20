@@ -133,12 +133,78 @@ FRIENDLY = {
     "طريقة_دخول_Telegram": "Telegram Login",
     "إعادة_معالجة_المكتمل": "إعادة معالجة المكتمل",
 }
+VIDEO_SHORT = {
+    "متوازن": "⚖️ متوازن · 720p",
+    "شرح وكتابة أوضح": "📝 شرح أوضح · 1080p",
+    "أصغر حجم": "🪶 أصغر حجم · 540p",
+    "أسرع معالجة": "⚡ أسرع · 720p",
+}
 VIDEO_HINTS = {
     "متوازن": "⚖️ متوازن · 720p · CRF 28 · FPS تلقائي",
     "شرح وكتابة أوضح": "📝 شرح وكتابة أوضح · 1080p · CRF 24 · 15 FPS",
     "أصغر حجم": "🪶 أصغر حجم · 540p · CRF 32 · 12 FPS",
     "أسرع معالجة": "⚡ أسرع معالجة · 720p · CRF 30 · 24 FPS",
 }
+# Classic Colab Forms stay available as a no-widget fallback.
+CLASSIC_COLAB = (
+    "https://colab.research.google.com/github/abdullahsamirashour/gpt/"
+    "blob/backup/media-lite-pre-tabs-2026-11-20/"
+    "telegram-smart-compressor/Smart_Compressor.ipynb"
+)
+UNDO_BACKUP = (
+    "https://github.com/abdullahsamirashour/gpt/tree/"
+    "backup/media-lite-pre-mobile-first-2026-11-20/telegram-smart-compressor"
+)
+DOCS_URL = "https://github.com/abdullahsamirashour/gpt/blob/main/telegram-smart-compressor/README.md"
+
+# Scoped responsive CSS; auto mobile navigation, with manual mode override.
+# If styling is blocked in the notebook output, both controls remain usable.
+RESPONSIVE_CSS = """<style>
+.ml-smart-ui { width:100%; max-width:900px; min-width:0; margin:0 auto; }
+.ml-smart-ui .ml-mobile-nav { display:none; }
+.ml-smart-ui .ml-tabbed,
+.ml-smart-ui .widget-vbox,
+.ml-smart-ui .widget-box { min-width:0; max-width:100%; }
+.ml-smart-ui .ml-tabbed .p-TabBar,
+.ml-smart-ui .ml-tabbed .lm-TabBar {
+    max-width:100%; overflow-x:auto; overflow-y:hidden;
+    -webkit-overflow-scrolling:touch;
+}
+.ml-smart-ui .ml-tabbed .p-TabBar-content,
+.ml-smart-ui .ml-tabbed .lm-TabBar-content {
+    white-space:nowrap; flex-wrap:nowrap;
+}
+.ml-smart-ui input,
+.ml-smart-ui textarea,
+.ml-smart-ui select {
+    box-sizing:border-box; min-height:44px; max-width:100%;
+    font-size:16px !important;
+}
+.ml-smart-ui textarea { min-height:88px; }
+.ml-smart-ui .widget-checkbox { min-height:44px; height:auto; }
+.ml-smart-ui .widget-checkbox label,
+.ml-smart-ui .widget-checkbox .widget-label {
+    white-space:normal !important; overflow-wrap:anywhere;
+    line-height:1.5; padding-top:5px; padding-bottom:5px;
+}
+.ml-smart-ui .widget-accordion .p-AccordionPanel-tab,
+.ml-smart-ui .widget-accordion .lm-AccordionPanel-tab {
+    min-height:42px; display:flex; align-items:center;
+}
+.ml-smart-ui .ml-mobile-nav select { min-height:48px; }
+.ml-smart-ui.ml-force-compact .ml-mobile-nav { display:block !important; }
+.ml-smart-ui.ml-force-compact .ml-tabbed .p-TabBar,
+.ml-smart-ui.ml-force-compact .ml-tabbed .lm-TabBar { display:none !important; }
+.ml-smart-ui.ml-force-tabs .ml-mobile-nav { display:none !important; }
+@media (max-width:760px) {
+    .ml-smart-ui:not(.ml-force-tabs) .ml-mobile-nav { display:block !important; }
+    .ml-smart-ui:not(.ml-force-tabs) .ml-tabbed .p-TabBar,
+    .ml-smart-ui:not(.ml-force-tabs) .ml-tabbed .lm-TabBar { display:none !important; }
+    .ml-smart-ui .ml-widget-panel { padding:6px 2px !important; }
+    .ml-smart-ui .ml-header { padding:11px 12px !important; }
+}
+</style>"""
+
 HELP = {
     "compress": ("الـPreset يحدد الإعدادات تلقائيًا. فعّل Advanced Audio أو Advanced Video "
                  "من قسمه فقط لو هتغير Codec/Bitrate/CRF. القيم المتقدمة لا تتطبق "
@@ -176,7 +242,8 @@ class SmartTabs:
         self.rows = {}
         self.advanced = {}
         self.status = {}
-        self.tab = w.Tab(layout=w.Layout(width="100%"))
+        self.tab = w.Tab(layout=w.Layout(width="100%", min_width="0"))
+        self.tab.add_class("ml-tabbed")
         panels = []
         for tab in TABS:
             controls = {}
@@ -188,7 +255,7 @@ class SmartTabs:
                 controls[field["key"]] = control
                 rows[field["key"]] = self._row(field["key"], control)
             basic = GROUPS[tab][0][1]
-            quick = [self._title("Quick Settings", HELP[tab], compact=True)]
+            quick = [self._title("Quick Settings", "", compact=True)]
             quick.extend(rows[key] for key in basic)
             extra = []
             for title, names in GROUPS[tab][1:]:
@@ -201,53 +268,120 @@ class SmartTabs:
             self.advanced[tab] = (accordion, extra)
             status = w.HTML(layout=w.Layout(width="100%"))
             self.status[tab] = status
-            help_box = w.Accordion(
-                children=[w.HTML('<div dir="rtl" style="padding:10px;line-height:1.75">' +
-                                 escape(HELP[tab]) + '</div>')],
-                selected_index=None,
-                layout=w.Layout(width="100%"),
-            )
-            help_box.set_title(0, "📖 Help — شرح مختصر")
             panel = w.VBox(
-                [self._title(LABELS[tab], "عدّل الاختيارات ثم اضغط ▶ على خلية التشغيل أسفل الواجهة"),
-                 *quick, accordion, status, help_box],
-                layout=w.Layout(width="100%", padding="10px 6px"),
+                [*quick, status, accordion],
+                layout=w.Layout(width="100%", padding="8px 4px"),
             )
+            panel.add_class("ml-widget-panel")
             panels.append(panel)
         self.tab.children = tuple(panels)
         for index, title in enumerate(("🗜️ Compress", "☁️ Drive→TG", "📥 TG→Drive",
                                        "🌐 Download", "🎧 Gemini")):
             self.tab.set_title(index, title)
+        self.mobile_nav = w.Dropdown(
+            options=[(LABELS[tool], index) for index, tool in enumerate(TABS)],
+            value=0, description="",
+            layout=w.Layout(width="100%", min_height="48px"),
+        )
+        self.mobile_nav.add_class("ml-mobile-nav")
+        self.view_mode = w.Dropdown(
+            options=[
+                ("تلقائي حسب الشاشة", "auto"),
+                ("📱 قائمة الموبايل", "compact"),
+                ("🖥️ تابات الكمبيوتر", "tabs"),
+            ],
+            value="auto",
+            layout=w.Layout(width="100%", min_height="44px"),
+        )
+        self.help_text = w.HTML(layout=w.Layout(width="100%"))
+        self.help_panel = w.Accordion(
+            children=[w.VBox([
+                self.help_text,
+                self._title("طريقة عرض الأدوات", "لو شاشة جهازك مش مكتشفة صح، غيّر طريقة العرض يدويًا."),
+                self.view_mode,
+            ], layout=w.Layout(width="100%", padding="8px"))],
+            selected_index=None, layout=w.Layout(width="100%")
+        )
+        self.help_panel.set_title(0, "⚙️ Help · Undo · إعدادات العرض")
+        header = w.HTML(
+            '<div class="ml-header" dir="rtl" style="background:#142d55;'
+            'color:white;padding:13px 15px;border-radius:12px;'
+            'font-family:Arial,Tahoma,sans-serif">'
+            '<b style="font-size:19px">🗜️ Media Lite</b>'
+            '<div style="font-size:13px;opacity:.9;line-height:1.5">'
+            'اختار الأداة، ظبط الإعدادات، ثم شغّل خلية ▶ ②</div></div>'
+        )
+        self.main = w.VBox([
+            w.HTML(RESPONSIVE_CSS),
+            header,
+            self.mobile_nav,
+            self.tab,
+            self.help_panel,
+        ], layout=w.Layout(width="100%", max_width="900px", min_width="0"))
+        self.main.add_class("ml-smart-ui")
+        self.tab.selected_index = 0
+        self.mobile_nav.observe(self._from_mobile_nav, names="value")
+        self.tab.observe(self._from_tab_nav, names="selected_index")
+        self.view_mode.observe(self._from_view_mode, names="value")
+        self._set_help(0)
         self._bind_dynamic()
         self._refresh()
-        self.main = w.VBox([
-            w.HTML('<div dir="rtl" style="background:#142d55;color:white;padding:16px;'
-                   'border-radius:12px;font-family:Arial,sans-serif">'
-                   '<b style="font-size:20px">🗜️ Media Lite — Smart Control Center</b>'
-                   '<div style="font-size:12px;opacity:.9;margin-top:5px">'
-                   '5 أدوات مستقلة · Quick + Advanced · جميع الإعدادات محفوظة</div></div>'),
-            self.tab,
-            w.HTML('<div dir="rtl" style="font-size:12px;color:#687589;padding:8px">'
-                   '▶ التشغيل والإيقاف من خلية Colab الأصلية اللي تحت. '
-                   'الـTabs لا تنقل ولا تضغط ولا تحذف ملفات بمجرد تغيير الاختيارات.</div>'),
-        ], layout=w.Layout(width="100%", max_width="900px"))
         self._commit = None
 
+    def _from_mobile_nav(self, change):
+        index = change["new"]
+        if index is not None and self.tab.selected_index != index:
+            self.tab.selected_index = index
+        self._set_help(index)
+
+    def _from_tab_nav(self, change):
+        index = change["new"]
+        if index is not None and self.mobile_nav.value != index:
+            self.mobile_nav.value = index
+        self._set_help(index)
+
+    def _from_view_mode(self, change):
+        for name in ("ml-force-compact", "ml-force-tabs"):
+            self.main.remove_class(name)
+        if change["new"] == "compact":
+            self.main.add_class("ml-force-compact")
+        elif change["new"] == "tabs":
+            self.main.add_class("ml-force-tabs")
+
+    def _set_help(self, index):
+        index = 0 if index is None else index
+        tab = TABS[index]
+        self.help_text.value = (
+            '<div dir="rtl" style="font:14px/1.7 Arial,Tahoma,sans-serif;'
+            'padding:8px 2px;overflow-wrap:anywhere">'
+            '<b>' + escape(LABELS[tab]) + '</b><p>' +
+            escape(HELP[tab]) + '</p>'
+            '<p>↩ <a href="' + escape(UNDO_BACKUP) + '" target="_blank">'
+            'نسخة احتياطية قبل تعديل الموبايل</a>'
+            ' · <a href="' + escape(CLASSIC_COLAB) + '" target="_blank">'
+            'فتح الواجهة الكلاسيكية</a>'
+            ' · <a href="' + escape(DOCS_URL) + '" target="_blank">'
+            'دليل الاستخدام</a></p>'
+            '<p style="color:#64748b">الإعدادات وحدها لا تشغّل أو تحذف أي ملفات. '
+            'اضغط ▶ ② للتنفيذ، و⏹ Colab للإيقاف.</p></div>'
+        )
+
     def _title(self, title, subtitle, compact=False):
-        size = 14 if compact else 17
+        size = 15 if compact else 17
+        note = ('<div style="color:#64748b;font-size:13px;line-height:1.6">' +
+                escape(subtitle) + '</div>') if subtitle else ''
         return self.w.HTML(
             '<div dir="rtl" style="font-family:Arial,Tahoma,sans-serif;padding:6px 0">'
-            '<b style="font-size:' + str(size) + 'px">' + escape(title) + '</b>'
-            '<div style="color:#64748b;font-size:12px;line-height:1.55">' +
-            escape(subtitle) + '</div></div>'
+            '<b style="font-size:' + str(size) + 'px">' + escape(title) + '</b>' +
+            note + '</div>'
         )
 
     def _control(self, tab, spec):
         w = self.w
         key, kind, value = spec["key"], spec["type"], spec["default"]
-        layout = w.Layout(width="100%", margin="0 0 5px 0")
+        layout = w.Layout(width="100%", min_height="44px", margin="0 0 5px 0")
         if kind == "choice":
-            options = [(VIDEO_HINTS.get(item, item) if tab == "compress" and key == "وضع_الفيديو"
+            options = [(VIDEO_SHORT.get(item, item) if tab == "compress" and key == "وضع_الفيديو"
                         else str(item), item) for item in spec["choices"]]
             return w.Dropdown(options=options, value=value, layout=layout)
         if kind == "boolean":
@@ -272,10 +406,11 @@ class SmartTabs:
             return control
         label = FRIENDLY.get(key, key.replace("_", " "))
         return self.w.VBox([
-            self.w.HTML('<div dir="rtl" style="font:600 12px Arial,Tahoma;'
-                        'color:#334155;margin:3px 0">' + escape(label) + '</div>'),
+            self.w.HTML('<div dir="rtl" style="font:600 14px/1.5 Arial,Tahoma;'
+                        'color:#334155;margin:4px 0;overflow-wrap:anywhere">' +
+                        escape(label) + '</div>'),
             control,
-        ], layout=self.w.Layout(width="100%", margin="0 0 7px 0"))
+        ], layout=self.w.Layout(width="100%", min_width="0", margin="0 0 9px 0"))
 
     def val(self, tab, key):
         return self.controls[tab][key].value

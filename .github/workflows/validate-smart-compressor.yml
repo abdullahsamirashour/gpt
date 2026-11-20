@@ -95,7 +95,8 @@ jobs:
                   assert 'MEDIA_LITE_UI = _ui_module.launch()' in setup
                   assert "MEDIA_LITE_UI.execute_selected()" in execute
                   assert "Stop" in execute
-                  assert "backup/media-lite-pre-tabs-2026-11-20" in md
+                  assert "backup/media-lite-pre-tabs-2026-11-20" in "".join(markdown_cells[-1].get("source", []))
+                  assert "Mobile Lite" not in md  # intro remains intentionally empty
                   for c in code_cells:
                       assert c.get("metadata", {}).get("cellView") == "form"
                       compile("".join(c.get("source", [])), "Smart Tabs cell", "exec")
