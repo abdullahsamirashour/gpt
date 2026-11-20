@@ -30,10 +30,11 @@ engine = load_module("tsc_native_form_engine", ROOT / "engine.py")
 forms = load_module("tsc_native_form_controls", ROOT / "studio_form_controls.py")
 with (ROOT / "Smart_Compressor.ipynb").open(encoding="utf-8") as handle:
     NOTEBOOK = json.load(handle)
-CODE = "".join(NOTEBOOK["cells"][1]["source"])
-PARAM_CODE = CODE[:CODE.index("\nimport os\n")]
-form_defaults = {}
-exec(compile(PARAM_CODE, "native-form-fields", "exec"), form_defaults)
+# Smart Tabs keep identical field values in a schema instead of #@param lines.
+smart_ui = load_module("tsc_smart_tabs_schema", ROOT / "smart_tabs_ui.py")
+CODE = (ROOT / "smart_tabs_ui.py").read_text(encoding="utf-8")
+form_defaults = {entry["key"]: entry["default"]
+                 for entry in smart_ui.FIELD_SCHEMA["compress"]}
 
 FORM = {
     "content_kind": form_defaults["نوع_المحتوى"],
@@ -76,25 +77,22 @@ class NativeStudioFormTests(unittest.TestCase):
         engine.reset_stop()
         self.tmp.cleanup()
 
-    def test_first_cell_is_native_form_without_widget_dashboard(self):
-        self.assertEqual(len(NOTEBOOK["cells"]), 6)
+    def test_smart_tabs_keep_form_backend_and_native_colab_run(self):
+        self.assertEqual(len(NOTEBOOK["cells"]), 4)
         self.assertEqual(NOTEBOOK["cells"][1]["metadata"]["cellView"], "form")
-        self.assertGreaterEqual(CODE.count("#@param"), 20)
-        self.assertIn("FORM_REL = ", CODE)
-        self.assertIn('form.perform_form_action(engine, actions[العملية]', CODE)
-        self.assertNotIn("ui.show_studio(engine)", CODE)
-        self.assertNotIn('UI_REL = ', CODE)
-        self.assertNotIn("ipywidgets", CODE)
-        self.assertIn("media_studio_ui.py", (ROOT / "media_studio_ui.py").name)
-        compile(CODE, "native-colab-form-cell", "exec")
+        self.assertEqual(NOTEBOOK["cells"][2]["metadata"]["cellView"], "form")
+        self.assertIn("FIELD_SCHEMA", CODE)
+        self.assertIn("form.perform_form_action(engine, actions[v", CODE)
+        self.assertIn('engine.py', CODE)
+        self.assertIn('studio_form_controls.py', CODE)
+        self.assertIn('MEDIA_LITE_UI.execute_selected()', "".join(NOTEBOOK["cells"][2]["source"]))
+        compile(CODE, "smart-tab-ui", "exec")
         self.assertTrue(
             "▶ تشغيل الضغط" in form_defaults["العملية"] and
             "تطبيق حقول الفورم الظاهرة" in form_defaults["مصدر_الإعدادات"]
         )
-        drive = "".join(NOTEBOOK["cells"][3]["source"])
-        telegram = "".join(NOTEBOOK["cells"][5]["source"])
-        self.assertIn('direction="drive_to_telegram"', drive)
-        self.assertIn('direction="telegram_to_drive"', telegram)
+        self.assertIn("direction=\"drive_to_telegram\"", CODE)
+        self.assertIn("direction=\"telegram_to_drive\"", CODE)
 
     def test_audio_only_choice_for_video_is_explicit_and_preserves_old_labels(self):
         self.assertIn("🎧 صوت فقط — حتى الفيديو يتحول لصوت", CODE)
@@ -204,12 +202,16 @@ class NativeStudioFormTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             engine.delivery_filename("lecture.mp4", ".exe")
 
-    def test_form_hourly_size_table_uses_kilobits_not_kilobytes(self):
-        self.assertIn("📊 حجم ساعة واحدة من الصوت", CODE)
-        for kbps in (8, 16, 24, 32, 48, 64, 96, 128, 192):
-            decimal_mb = kbps * 3600 / 8 / 1000
-            line = f"#@markdown | {kbps} kbps | {decimal_mb:.1f} MB |"
-            self.assertIn(line, CODE)
+    def test_audio_size_estimate_uses_kilobits_not_kilobytes(self):
+        # The large per-hour markdown table was intentionally moved out of
+        # the UI. The existing backend still prints the correct quick estimate.
+        import contextlib
+        from io import StringIO
+        capture = StringIO()
+        with contextlib.redirect_stdout(capture):
+            forms.show_settings(forms.collect_form_settings(engine, FORM), "fields")
+        self.assertIn("10.8 MB", capture.getvalue())
+        self.assertEqual(24 * 3600 / 8 / 1000, 10.8)
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"),
                          "Real FFmpeg is required")
