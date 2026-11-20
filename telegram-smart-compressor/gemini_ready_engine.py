@@ -36,6 +36,20 @@ MIN_HEADROOM = 80_000
 MAX_BATCH = 200
 MAX_LINKS = 100
 STATE_VERSION = 1
+# Fast paths require validated codec and container. The established encoder
+# handles any unsupported, ambiguous or uninspectable media.
+SMART_DIRECT_CODECS = {
+    ".mp3": {"mp3"},
+    ".ogg": {"opus", "vorbis"},
+    ".m4a": {"aac"},
+    ".wav": {"pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le"},
+    ".flac": {"flac"},
+    ".aiff": {"pcm_s16be", "pcm_s24be"},
+}
+SMART_SPLIT_SUFFIXES = {".mp3", ".ogg", ".m4a"}
+SMART_MAX_COPY_PARTS = 12
+SMART_MODES = {"smart", "preserve", "always"}
+
 
 
 def _hash(value: str, size: int = 24) -> str:
@@ -492,8 +506,9 @@ def _download_job(job: dict, stage: Path, transfer, service, web,
     return dest
 
 
-def _output_names(stem: str, codec: str, count: int) -> list[str]:
-    suffix = OUTPUT_SUFFIXES[codec]
+def _output_names(stem: str, codec: str, count: int,
+                  output_suffix: str = "") -> list[str]:
+    suffix = output_suffix or OUTPUT_SUFFIXES[codec]
     stem = _clean_name(stem)
     if count == 1:
         return [stem + suffix]
@@ -501,12 +516,107 @@ def _output_names(stem: str, codec: str, count: int) -> list[str]:
     return [f"{stem}-pt{i:0{width}d}{suffix}" for i in range(1, count + 1)]
 
 
-def _settings_signature(settings: dict, max_mb: float, max_minutes: int) -> str:
+def _settings_signature(settings: dict, max_mb: float, max_minutes: int,
+                        mode: str = "always", advanced_audio: bool = False) -> str:
     keys = ("audio_preset", "audio_codec", "audio_kbps", "audio_channels", "audio_sample_rate", "audio_noise")
     details = {key: settings[key] for key in keys}
     details["max_bytes"] = int(float(max_mb) * 1_000_000)
     details["max_minutes"] = int(max_minutes)
+    # Modes have different output semantics; never reuse the wrong receipts.
+    details["preparation_mode"] = mode
+    details["advanced_audio"] = bool(advanced_audio)
+    details["policy_version"] = 2
     return _hash(json.dumps(details, sort_keys=True, ensure_ascii=True))
+
+
+
+def _media_probe(path: Path) -> dict:
+    """Probe the real codec, number of streams and total duration."""
+    cmd = ["ffprobe", "-v", "error", "-show_entries",
+           "stream=index,codec_name,codec_type:format=duration",
+           "-of", "json", str(path)]
+    result = subprocess.run(cmd, text=True, capture_output=True,
+                            check=True, timeout=45)
+    data = json.loads(result.stdout)
+    streams = data.get("streams") or []
+    audio = [item for item in streams if item.get("codec_type") == "audio"]
+    video = [item for item in streams if item.get("codec_type") == "video"]
+    seconds = float((data.get("format") or {}).get("duration") or 0)
+    if len(audio) != 1 or not math.isfinite(seconds) or seconds <= 0:
+        return {"valid": False}
+    return {"valid": True, "codec": audio[0].get("codec_name", "").lower(),
+            "audio_index": int(audio[0]["index"]),
+            "video": bool(video), "duration": seconds}
+
+
+def _copy_container_for_codec(codec: str) -> tuple[str, str] | None:
+    return {"mp3": (".mp3", "mp3"), "aac": (".m4a", "ipod"),
+            "opus": (".ogg", "ogg"), "vorbis": (".ogg", "ogg")}.get(codec)
+
+
+def _fast_prepare_audio(source: Path, stage: Path, max_bytes: int,
+                        max_minutes: int, mode: str, advanced_audio: bool,
+                        output_kbps: int) -> tuple[Path | None, str]:
+    """Select source/pass-through/remux without any lossy encoding.
+
+    Advanced Audio explicitly requests format/bitrate; it takes precedence.
+    """
+    if mode == "always":
+        return None, "Always Compress محدد"
+    if advanced_audio:
+        return None, "Advanced Audio محدد؛ نحترم إعدادات التحويل اليدوية"
+    try:
+        info = _media_probe(source)
+    except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None, "تعذر التحقق من صيغة/مدة الصوت"
+    if not info.get("valid"):
+        return None, "صوت غير مؤهل للمسار السريع أو متعدد المسارات"
+    codec = info["codec"]
+    suffix = source.suffix.lower()
+    duration = info["duration"]
+    need_split = (source.stat().st_size >= max_bytes
+                  or (max_minutes > 0 and duration > max_minutes * 60))
+    direct = not info["video"] and codec in SMART_DIRECT_CODECS.get(suffix, set())
+    can_split_direct = suffix in SMART_SPLIT_SUFFIXES
+    target_path = source
+
+    if not direct or (need_split and not can_split_direct):
+        # Copy only a single verified compatible audio stream. If there are
+        # multiple audio streams, rely on the original encoder stream selector.
+        container = _copy_container_for_codec(codec)
+        if container is None:
+            return None, "الصيغة لا تسمح بالاستخراج السريع المتوافق"
+        ext, fmt = container
+        dst = stage / ("extracted" + ext)
+        temp = stage / ("extract_pending" + ext)
+        temp.unlink(missing_ok=True)
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+               "-i", str(source), "-map", f"0:{info['audio_index']}",
+               "-vn", "-sn", "-dn", "-c:a", "copy", "-f", fmt, str(temp)]
+        try:
+            proc = subprocess.run(cmd, text=True, capture_output=True, timeout=300)
+            if proc.returncode or not temp.is_file() or not temp.stat().st_size:
+                return None, "Stream Copy غير متاح؛ هنستخدم الضغط المعتاد"
+            remuxed = _media_probe(temp)
+            if (not remuxed.get("valid") or remuxed["video"]
+                    or remuxed["codec"] != codec
+                    or abs(remuxed["duration"] - duration) > max(1.5, duration * 0.01)):
+                return None, "فشل التحقق من استخراج الصوت بدون ضغط"
+            os.replace(temp, dst)
+            target_path = dst
+        except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError):
+            return None, "تعذر استخراج الصوت بدون ضغط"
+        finally:
+            temp.unlink(missing_ok=True)
+
+    estimated_parts = _required_part_count(
+        target_path.stat().st_size, max_bytes, duration, max_minutes * 60)
+    bitrate_kbps = (target_path.stat().st_size * 8) / (1000 * duration)
+    if (mode == "smart" and estimated_parts > SMART_MAX_COPY_PARTS
+            and bitrate_kbps > max(64, output_kbps * 1.7)):
+        return None, f"{estimated_parts} أجزاء متوقعة؛ ضغط واحد أنسب للدفعة الكبيرة"
+    return target_path, ("الصوت الأصلي جاهز" if target_path == source
+                         else "استخراج صوت سريع بدون إعادة ترميز")
 
 
 def _process(job: dict, transfer, engine, web, service, state: dict, state_file: Path,
