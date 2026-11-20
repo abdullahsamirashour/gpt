@@ -68,7 +68,8 @@ jobs:
 
               assert code_cell.get("metadata", {}).get("cellView") == "form"
               assert "#@title" in code
-              assert code.count("#@param") >= (1 if path.name == "Smart_Compressor.ipynb" else 2)
+              if path.name != "Smart_Compressor.ipynb":
+                  assert code.count("#@param") >= 2
               assert "\\n" not in md
               assert "re.search(r'ENGINE_BUNDLE_VERSION" not in code
               if path.name == "launcher-beta.ipynb":
@@ -83,43 +84,21 @@ jobs:
                   assert code.count("#@param") >= 5
               compile(code, str(path), "exec")
               if path.name == "Smart_Compressor.ipynb":
-                  assert len(code_cells) == 3
-                  assert len(markdown_cells) == 3
-                  drive_code = "".join(code_cells[1].get("source", []))
-                  telegram_code = "".join(code_cells[2].get("source", []))
-                  assert 'ENGINE_REL = "telegram-smart-compressor/engine.py"' in code
-                  assert 'FORM_REL = "telegram-smart-compressor/studio_form_controls.py"' in code
-                  assert 'form.perform_form_action(engine, actions[العملية]' in code
-                  assert 'ui.show_studio(engine)' not in code
-                  assert 'UI_REL = ' not in code
-                  assert 'TSC_UI_ONLY' in code
-                  assert code.count('#@param') >= 20
-                  assert '💾 Save as Default' in code
-                  assert 'مصدر_الإعدادات' in code
-                  assert 'direction="drive_to_telegram"' in drive_code
-                  assert 'source=رابط_Drive.strip()' in drive_code
-                  assert 'destination=""' in drive_code
-                  assert 'direction="telegram_to_drive"' in telegram_code
-                  assert 'source=قناة_Telegram_المصدر.strip()' in telegram_code
-                  assert 'destination=فولدر_Drive_للحفظ.strip()' in telegram_code
-                  assert 'عدد_الملفات = 0 #@param' in drive_code
-                  assert 'عدد_الملفات = 0 #@param' in telegram_code
-                  assert 'ارقام_الملفات_لإعادة_الرفع = "" #@param' in drive_code
-                  assert '"إعادة رفع المحدد"' in drive_code
-                  assert 'reupload_selected=التشغيل == "إعادة رفع المحدد"' in drive_code
-                  assert 'selected_numbers=ارقام_الملفات_لإعادة_الرفع.strip()' in drive_code
-                  assert 'reupload_selected=' not in telegram_code
-                  for transfer_code in (drive_code, telegram_code):
-                      assert 'طريقة_الدخول = "QR بدون كود" #@param' in transfer_code
-                      assert 'login_method="qr" if طريقة_الدخول' in transfer_code
-                      assert 'transfer_engine.py' in transfer_code
-                      assert '_transfer_module.run_transfer(' in transfer_code
-                      assert '"main"' in transfer_code
-                      assert 'preview=التشغيل == "معاينة فقط"' in transfer_code
-                      assert code.count("#@param") >= 1
-                      compile(transfer_code, "Media-Lite transfer cell", "exec")
-                  assert 'telegram_to_drive' not in drive_code
-                  assert 'drive_to_telegram' not in telegram_code
+                  # Smart Tabs deliberately replace the five independent Forms
+                  # with one tabbed setup cell + one native Colab execution cell.
+                  assert len(code_cells) == 2, len(code_cells)
+                  assert len(markdown_cells) == 2, len(markdown_cells)
+                  setup = "".join(code_cells[0].get("source", []))
+                  execute = "".join(code_cells[1].get("source", []))
+                  assert 'smart_tabs_ui.py' in setup
+                  assert '_UI_REF = "main"' in setup
+                  assert 'MEDIA_LITE_UI = _ui_module.launch()' in setup
+                  assert "MEDIA_LITE_UI.execute_selected()" in execute
+                  assert "Stop" in execute
+                  assert "backup/media-lite-pre-tabs-2026-11-20" in md
+                  for c in code_cells:
+                      assert c.get("metadata", {}).get("cellView") == "form"
+                      compile("".join(c.get("source", [])), "Smart Tabs cell", "exec")
               print("OK notebook:", path)
 
           assert found >= 1
